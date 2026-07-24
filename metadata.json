@@ -1,0 +1,6 @@
+{
+  "name": "QuestCast VR",
+  "description": "Low-latency VR screen casting from Meta Quest 3 to Android mobile receivers with hardware encoding, single eye cropping, and LAN auto-discovery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

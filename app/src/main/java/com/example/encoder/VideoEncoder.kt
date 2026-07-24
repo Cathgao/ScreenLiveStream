@@ -1,0 +1,298 @@
+package com.example.encoder
+
+import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.os.Bundle
+import android.view.Surface
+import com.example.log.AppLogger
+import com.example.model.BitrateMode
+import com.example.model.StreamConfig
+import com.example.net.UdpStreamer
+import java.nio.ByteBuffer
+import kotlin.concurrent.thread
+
+class VideoEncoder(
+    private val config: StreamConfig,
+    private val udpStreamer: UdpStreamer,
+    private val overrideWidth: Int = 0,
+    private val overrideHeight: Int = 0,
+    private val overrideFps: Int = 0,
+    private val context: Context? = null,
+    private var muxerManager: MuxerManager? = null
+) {
+    private var codec: MediaCodec? = null
+    private var renderer: SurfaceCropRenderer? = null
+    @Volatile
+    private var isEncoding = false
+    private var encoderThread: Thread? = null
+    @Volatile
+    private var lastCodecConfigData: ByteArray? = null
+
+    val inputSurface: Surface?
+        get() = renderer?.inputSurface
+
+    fun setMuxerManager(muxer: MuxerManager?) {
+        this.muxerManager = muxer
+    }
+
+    fun start() {
+        try {
+            logSystemEncoders()
+
+            val width = if (overrideWidth > 0) overrideWidth else if (config.resolution.width > 0) config.resolution.width else 1920
+            val height = if (overrideHeight > 0) overrideHeight else if (config.resolution.height > 0) config.resolution.height else 1080
+            val frameRate = if (overrideFps > 0) overrideFps else if (config.frameRate > 0) config.frameRate else 90
+            val mimeType = config.codec.mimeType
+
+            AppLogger.i(TAG, "Starting VideoEncoder: $width x $height @ $frameRate fps, bitrate: ${config.bitrateKbps} Kbps, Codec: ${config.codec.displayName}")
+
+            val format = MediaFormat.createVideoFormat(mimeType, width, height)
+            format.setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            format.setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1000)
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // Keyframe every 1s
+            format.setInteger(
+                MediaFormat.KEY_BITRATE_MODE,
+                config.bitrateMode.modeInt
+            )
+            if (config.bitrateMode == BitrateMode.CQ) {
+                // Set high quality target for CQ mode (typically 0-100, 80 is very high quality with great compression ratio)
+                format.setInteger(MediaFormat.KEY_QUALITY, 80)
+            }
+
+            // Low-latency priority hint
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+
+            AppLogger.i(TAG, "Configuring MediaCodec with format: $format")
+
+            val mc = if (config.bitrateMode == BitrateMode.CQ) {
+                val cqCodecName = findCqEncoder(mimeType)
+                if (cqCodecName != null) {
+                    AppLogger.i(TAG, "Found dedicated CQ hardware encoder: $cqCodecName, instantiating...")
+                    try {
+                        MediaCodec.createByCodecName(cqCodecName)
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "Failed to create by codec name $cqCodecName, falling back to type: ${e.message}")
+                        MediaCodec.createEncoderByType(mimeType)
+                    }
+                } else {
+                    MediaCodec.createEncoderByType(mimeType)
+                }
+            } else {
+                MediaCodec.createEncoderByType(mimeType)
+            }
+            AppLogger.i(TAG, "Created encoder instance: ${mc.name} for MIME: $mimeType")
+
+            mc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+
+            val codecSurface = mc.createInputSurface()
+            mc.start()
+            codec = mc
+
+            renderer = SurfaceCropRenderer(
+                codecInputSurface = codecSurface,
+                width = width,
+                height = height,
+                eyeCrop = config.eyeCrop
+            )
+
+            isEncoding = true
+            startEncodeLoop()
+            AppLogger.i(TAG, "VideoEncoder loop started successfully using ${mc.name}")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to initialize VideoEncoder", e)
+            stop()
+        }
+    }
+
+    private fun findCqEncoder(mimeType: String): String? {
+        try {
+            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            for (info in codecList.codecInfos) {
+                if (!info.isEncoder) continue
+                if (info.name.endsWith(".cq", ignoreCase = true)) {
+                    for (type in info.supportedTypes) {
+                        if (type.equals(mimeType, ignoreCase = true)) {
+                            return info.name
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error searching for CQ encoder", e)
+        }
+        return null
+    }
+
+    private fun logSystemEncoders() {
+        try {
+            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            val infos = codecList.codecInfos
+            AppLogger.i(TAG, "=== System Video Encoders Inventory (${infos.size} total codecs) ===")
+            for (info in infos) {
+                if (!info.isEncoder) continue
+                val types = info.supportedTypes
+                val isH264 = types.any { it.equals("video/avc", ignoreCase = true) }
+                val isH265 = types.any { it.equals("video/hevc", ignoreCase = true) }
+                if (isH264 || isH265) {
+                    val isHW = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        info.isHardwareAccelerated
+                    } else {
+                        !info.name.startsWith("OMX.google.", ignoreCase = true) && !info.name.startsWith("c2.android.", ignoreCase = true)
+                    }
+                    val isSW = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        info.isSoftwareOnly
+                    } else {
+                        info.name.startsWith("OMX.google.", ignoreCase = true) || info.name.startsWith("c2.android.", ignoreCase = true)
+                    }
+                    AppLogger.i(TAG, "Codec: ${info.name} | HW=$isHW | SW=$isSW | Types=${types.joinToString()}")
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error enumerating system encoders", e)
+        }
+    }
+
+    private fun startEncodeLoop() {
+        encoderThread = thread(start = true, name = "QuestVideoEncoderThread") {
+            val bufferInfo = MediaCodec.BufferInfo()
+            var tempBuffer = ByteArray(512 * 1024)
+            var lastKeyframeReqTime = 0L
+            var totalOutputFrames = 0
+            var lastLogTime = System.currentTimeMillis()
+
+            AppLogger.i(TAG, "Encoder loop thread running...")
+
+            while (isEncoding) {
+                try {
+                    // Periodically request keyframe (every 1.5s) to guarantee receivers recover fast
+                    val now = System.currentTimeMillis()
+                    if (now - lastKeyframeReqTime > 1500) {
+                        lastKeyframeReqTime = now
+                        val params = Bundle().apply {
+                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                        }
+                        codec?.setParameters(params)
+                    }
+
+                    // Draw frame via GL Renderer
+                    renderer?.drawFrame()
+
+                    val mc = codec ?: break
+                    var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 5000)
+
+                    while (outputIndex >= 0 || outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            val newFormat = mc.outputFormat
+                            AppLogger.i(TAG, "Encoder output format changed: $newFormat")
+                            muxerManager?.setVideoFormat(newFormat)
+                        } else {
+                            totalOutputFrames++
+                            val outputBuffer: ByteBuffer? = mc.getOutputBuffer(outputIndex)
+                            if (outputBuffer != null && bufferInfo.size > 0) {
+                                val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+
+                                // Write sample to MP4 via MuxerManager
+                                if (!isCodecConfig) {
+                                    muxerManager?.writeVideoSample(outputBuffer, bufferInfo)
+                                }
+
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+
+                                val dataSize = bufferInfo.size
+                                if (tempBuffer.size < dataSize) {
+                                    tempBuffer = ByteArray(dataSize * 2)
+                                }
+                                outputBuffer.get(tempBuffer, 0, dataSize)
+
+                                val timestampMs = System.currentTimeMillis()
+
+                                if (isCodecConfig) {
+                                    lastCodecConfigData = tempBuffer.copyOf(dataSize)
+                                    AppLogger.i(TAG, "Encoder produced CodecConfig (SPS/PPS), size: $dataSize bytes")
+                                } else if (isKeyframe) {
+                                    AppLogger.d(TAG, "Encoder produced Keyframe #$totalOutputFrames, size: $dataSize bytes")
+                                    val configBytes = lastCodecConfigData
+                                    if (configBytes != null) {
+                                        udpStreamer.sendFrame(
+                                            frameData = configBytes,
+                                            offset = 0,
+                                            size = configBytes.size,
+                                            timestampMs = timestampMs,
+                                            isKeyframe = false,
+                                            isCodecConfig = true,
+                                            codec = config.codec
+                                        )
+                                    }
+                                }
+
+                                udpStreamer.sendFrame(
+                                    frameData = tempBuffer,
+                                    offset = 0,
+                                    size = dataSize,
+                                    timestampMs = timestampMs,
+                                    isKeyframe = isKeyframe,
+                                    isCodecConfig = isCodecConfig,
+                                    codec = config.codec
+                                )
+                            }
+                            mc.releaseOutputBuffer(outputIndex, false)
+
+                            // Periodic logging every 60 frames or 3 seconds
+                            if (totalOutputFrames % 60 == 0 || now - lastLogTime > 3000) {
+                                lastLogTime = now
+                                AppLogger.i(TAG, "Encoder Stats: Total Encoded Frames=$totalOutputFrames | Muxer Video Frames=${muxerManager?.videoFramesWritten ?: 0} | Audio Frames=${muxerManager?.audioFramesWritten ?: 0}")
+                            }
+                        }
+
+                        outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
+                    }
+
+                    if (outputIndex < 0 && outputIndex != MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        // Yield CPU when no buffer is ready
+                        Thread.sleep(2)
+                    }
+                } catch (e: Exception) {
+                    if (isEncoding) {
+                        AppLogger.e(TAG, "Error in encode loop", e)
+                    }
+                }
+            }
+            AppLogger.i(TAG, "Encoder loop thread exited. Final total frames encoded: $totalOutputFrames")
+        }
+    }
+
+    fun stop() {
+        AppLogger.i(TAG, "Stopping VideoEncoder...")
+        isEncoding = false
+
+        try {
+            codec?.stop()
+            codec?.release()
+            AppLogger.i(TAG, "MediaCodec stopped and released.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing MediaCodec", e)
+        }
+        codec = null
+
+        try {
+            renderer?.release()
+            AppLogger.i(TAG, "SurfaceCropRenderer released.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing SurfaceCropRenderer", e)
+        }
+        renderer = null
+    }
+
+    companion object {
+        private const val TAG = "VideoEncoder"
+    }
+}

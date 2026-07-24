@@ -1,0 +1,343 @@
+package com.example.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.view.Display
+import androidx.core.app.NotificationCompat
+import com.example.MainActivity
+import com.example.encoder.AudioEncoder
+import com.example.encoder.MuxerManager
+import com.example.encoder.VideoEncoder
+import com.example.log.AppLogger
+import com.example.model.BitrateMode
+import com.example.model.EyeCrop
+import com.example.model.StreamConfig
+import com.example.model.StreamStats
+import com.example.model.VideoCodec
+import com.example.model.VideoResolution
+import com.example.net.UdpStreamer
+
+class QuestSenderService : Service() {
+
+    private val binder = LocalBinder()
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var encoder: VideoEncoder? = null
+    private var audioEncoder: AudioEncoder? = null
+    private var muxerManager: MuxerManager? = null
+    private val udpStreamer = UdpStreamer()
+
+    @Volatile
+    var isStreaming = false
+        private set
+
+    var onStatsUpdate: ((StreamStats) -> Unit)? = null
+
+    inner class LocalBinder : Binder() {
+        fun getService(): QuestSenderService = this@QuestSenderService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        AppLogger.i(TAG, "QuestSenderService created.")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            AppLogger.i(TAG, "Received ACTION_STOP command in QuestSenderService.")
+            stopStreaming()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
+        val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA)
+        }
+
+        val resWidth = intent?.getIntExtra(EXTRA_RES_WIDTH, 0) ?: 0
+        val resHeight = intent?.getIntExtra(EXTRA_RES_HEIGHT, 0) ?: 0
+        val eyeCropName = intent?.getStringExtra(EXTRA_EYE_CROP) ?: EyeCrop.LEFT_EYE.name
+        val codecName = intent?.getStringExtra(EXTRA_CODEC) ?: VideoCodec.H265.name
+        val bitrateModeName = intent?.getStringExtra(EXTRA_BITRATE_MODE) ?: BitrateMode.VBR.name
+
+        val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.LEFT_EYE }
+        val codec = try { VideoCodec.valueOf(codecName) } catch (e: Exception) { VideoCodec.H265 }
+        val bitrateMode = try { BitrateMode.valueOf(bitrateModeName) } catch (e: Exception) { BitrateMode.VBR }
+        val resEnum = if (resWidth == 0 || resHeight == 0) {
+            VideoResolution.DEFAULT
+        } else {
+            VideoResolution("${resWidth}x${resHeight}", resWidth, resHeight)
+        }
+
+        val config = StreamConfig(
+            targetIp = intent?.getStringExtra(EXTRA_TARGET_IP) ?: "192.168.1.100",
+            targetPort = intent?.getIntExtra(EXTRA_TARGET_PORT, 8888) ?: 8888,
+            bitrateKbps = intent?.getIntExtra(EXTRA_BITRATE, 16000) ?: 16000,
+            bitrateMode = bitrateMode,
+            frameRate = intent?.getIntExtra(EXTRA_FRAMERATE, 0) ?: 0,
+            resolution = resEnum,
+            eyeCrop = crop,
+            codec = codec
+        )
+
+        AppLogger.i(TAG, "onStartCommand: resultCode=$resultCode, Target=${config.targetIp}:${config.targetPort}, Bitrate=${config.bitrateKbps}K, Codec=${config.codec.name}")
+
+        if (resultCode != 0 && resultData != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, createNotification())
+            }
+            startStreaming(resultCode, resultData, config)
+        } else {
+            AppLogger.e(TAG, "Cannot start streaming: Invalid resultCode ($resultCode) or null resultData")
+        }
+
+        return START_STICKY
+    }
+
+    private fun startStreaming(resultCode: Int, resultData: Intent, config: StreamConfig) {
+        stopStreaming()
+
+        AppLogger.i(TAG, "Requesting MediaProjection from projectionManager...")
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        if (projection == null) {
+            AppLogger.e(TAG, "MediaProjection is null! Permission denied or token expired.")
+            return
+        }
+        mediaProjection = projection
+
+        // Register callback for projection stop
+        projection.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                AppLogger.w(TAG, "MediaProjection onStop triggered by system or user.")
+                stopStreaming()
+            }
+        }, null)
+
+        udpStreamer.start(config.targetIp, config.targetPort)
+
+        // Dynamically compute native width, height, refresh rate if Native Match (0) is specified
+        val metrics = resources.displayMetrics
+        var effWidth = if (config.resolution.width > 0) {
+            config.resolution.width
+        } else {
+            ((metrics.widthPixels / 16) * 16).coerceAtLeast(640)
+        }
+
+        var effHeight = if (config.resolution.height > 0) {
+            config.resolution.height
+        } else {
+            ((metrics.heightPixels / 16) * 16).coerceAtLeast(480)
+        }
+
+        // Query capabilities and clamp dynamically to avoid crash (e.g. CQ mode limits)
+        val caps = com.example.model.EncoderCapabilities.query(config.codec, config.bitrateMode)
+        if (effWidth > caps.maxWidth) {
+            val clampedWidth = (caps.maxWidth / 16) * 16
+            AppLogger.w(TAG, "Width $effWidth exceeds encoder capability maximum ${caps.maxWidth}, clamping to $clampedWidth")
+            effWidth = clampedWidth
+        }
+        if (effHeight > caps.maxHeight) {
+            val clampedHeight = (caps.maxHeight / 16) * 16
+            AppLogger.w(TAG, "Height $effHeight exceeds encoder capability maximum ${caps.maxHeight}, clamping to $clampedHeight")
+            effHeight = clampedHeight
+        }
+
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        val effFps = if (config.frameRate > 0) {
+            config.frameRate
+        } else {
+            defaultDisplay?.refreshRate?.toInt() ?: 90
+        }
+
+        AppLogger.i(TAG, "Dynamic Native Match parameters: $effWidth x $effHeight @ $effFps FPS (Metrics: ${metrics.widthPixels}x${metrics.heightPixels}, Density: ${metrics.densityDpi})")
+
+        val mux = MuxerManager(
+            context = applicationContext,
+            codecName = config.codec.name,
+            expectAudio = true
+        )
+        muxerManager = mux
+
+        val enc = VideoEncoder(
+            config = config,
+            udpStreamer = udpStreamer,
+            overrideWidth = effWidth,
+            overrideHeight = effHeight,
+            overrideFps = effFps,
+            context = this,
+            muxerManager = mux
+        )
+        enc.start()
+        encoder = enc
+
+        // Start System Internal Audio Encoder (AudioPlaybackCaptureConfiguration)
+        try {
+            val audioEnc = AudioEncoder(
+                mediaProjection = projection,
+                udpStreamer = udpStreamer,
+                muxerManager = mux
+            )
+            audioEnc.start()
+            audioEncoder = audioEnc
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to start internal AudioEncoder", e)
+        }
+
+        val surface = enc.inputSurface
+        if (surface == null) {
+            AppLogger.e(TAG, "Encoder inputSurface is null! Cannot create VirtualDisplay.")
+            return
+        }
+
+        AppLogger.i(TAG, "Creating VirtualDisplay with resolution $effWidth x $effHeight, DPI ${metrics.densityDpi}")
+        virtualDisplay = projection.createVirtualDisplay(
+            "Quest3ScreenCast",
+            effWidth,
+            effHeight,
+            metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+            surface,
+            null,
+            null
+        )
+
+        isStreaming = true
+        AppLogger.i(TAG, "QuestSenderService streaming started successfully.")
+    }
+
+    fun stopStreaming() {
+        AppLogger.i(TAG, "stopStreaming requested.")
+        isStreaming = false
+        try {
+            virtualDisplay?.release()
+            AppLogger.i(TAG, "VirtualDisplay released.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing VirtualDisplay", e)
+        }
+        virtualDisplay = null
+
+        try {
+            audioEncoder?.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping audioEncoder", e)
+        }
+        audioEncoder = null
+
+        try {
+            encoder?.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping encoder", e)
+        }
+        encoder = null
+
+        try {
+            muxerManager?.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping muxerManager", e)
+        }
+        muxerManager = null
+
+        try {
+            udpStreamer.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping udpStreamer", e)
+        }
+
+        try {
+            mediaProjection?.stop()
+            AppLogger.i(TAG, "MediaProjection stopped.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping MediaProjection", e)
+        }
+        mediaProjection = null
+        AppLogger.i(TAG, "QuestSenderService streaming stopped completed.")
+    }
+
+    override fun onDestroy() {
+        stopStreaming()
+        super.onDestroy()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "QuestCast Screen Sender Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotification(): Notification {
+        val stopIntent = Intent(this, QuestSenderService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val mainIntent = Intent(this, MainActivity::class.java)
+        val mainPendingIntent = PendingIntent.getActivity(
+            this, 0, mainIntent, PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Quest 3 画面投屏中")
+            .setContentText("正在低延迟推流画面至接收端...")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentIntent(mainPendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止投屏", stopPendingIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    companion object {
+        private const val TAG = "QuestSenderService"
+        private const val CHANNEL_ID = "quest_sender_channel"
+        private const val NOTIFICATION_ID = 1001
+
+        const val ACTION_STOP = "com.example.service.ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+        const val EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA"
+        const val EXTRA_TARGET_IP = "EXTRA_TARGET_IP"
+        const val EXTRA_TARGET_PORT = "EXTRA_TARGET_PORT"
+        const val EXTRA_BITRATE = "EXTRA_BITRATE"
+        const val EXTRA_FRAMERATE = "EXTRA_FRAMERATE"
+        const val EXTRA_RES_WIDTH = "EXTRA_RES_WIDTH"
+        const val EXTRA_RES_HEIGHT = "EXTRA_RES_HEIGHT"
+        const val EXTRA_EYE_CROP = "EXTRA_EYE_CROP"
+        const val EXTRA_CODEC = "EXTRA_CODEC"
+        const val EXTRA_BITRATE_MODE = "EXTRA_BITRATE_MODE"
+    }
+}
