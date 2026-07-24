@@ -56,10 +56,6 @@ object AppLogger {
         return logQueue.toList()
     }
 
-    fun exportLogsToMovies(context: Context): String {
-        return exportLogs(context)
-    }
-
     fun exportLogs(context: Context): String {
         val fileNameFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
         val fileName = "screen_cast_log_${fileNameFormat.format(Date())}.txt"

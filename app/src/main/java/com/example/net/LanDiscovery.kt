@@ -37,7 +37,6 @@ class LanDiscovery {
                 val buffer = ByteArray(1024)
                 val packet = DatagramPacket(buffer, buffer.size)
 
-                val startTime = System.currentTimeMillis()
                 while (isScanning && !ds.isClosed) {
                     val now = System.currentTimeMillis()
                     if (now - lastPingTime >= 2000) {

@@ -101,38 +101,40 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     containerColor = DarkObsidian,
                     bottomBar = {
-                        NavigationBar(
-                            containerColor = DarkCyberSurface,
-                            contentColor = TextPrimary,
-                            modifier = Modifier.testTag("app_navigation_bar")
-                        ) {
-                            NavigationBarItem(
-                                selected = currentMode == AppMode.QUEST_SENDER,
-                                onClick = { viewModel.setAppMode(AppMode.QUEST_SENDER) },
-                                icon = { Icon(Icons.Default.Cast, contentDescription = "Sender") },
-                                label = { Text("Quest 3 发送端", fontWeight = FontWeight.Bold) },
-                                colors = NavigationBarItemDefaults.colors(
-                                    selectedIconColor = Color.Black,
-                                    selectedTextColor = NeonCyan,
-                                    indicatorColor = NeonCyan,
-                                    unselectedIconColor = TextSecondary,
-                                    unselectedTextColor = TextSecondary
+                        if (!(currentMode == AppMode.MOBILE_RECEIVER && isReceiverListeningState)) {
+                            NavigationBar(
+                                containerColor = DarkCyberSurface,
+                                contentColor = TextPrimary,
+                                modifier = Modifier.testTag("app_navigation_bar")
+                            ) {
+                                NavigationBarItem(
+                                    selected = currentMode == AppMode.QUEST_SENDER,
+                                    onClick = { viewModel.setAppMode(AppMode.QUEST_SENDER) },
+                                    icon = { Icon(Icons.Default.Cast, contentDescription = "Sender") },
+                                    label = { Text("Quest 3 发送端", fontWeight = FontWeight.Bold) },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = Color.Black,
+                                        selectedTextColor = NeonCyan,
+                                        indicatorColor = NeonCyan,
+                                        unselectedIconColor = TextSecondary,
+                                        unselectedTextColor = TextSecondary
+                                    )
                                 )
-                            )
 
-                            NavigationBarItem(
-                                selected = currentMode == AppMode.MOBILE_RECEIVER,
-                                onClick = { viewModel.setAppMode(AppMode.MOBILE_RECEIVER) },
-                                icon = { Icon(Icons.Default.PhoneAndroid, contentDescription = "Receiver") },
-                                label = { Text("手机接收端", fontWeight = FontWeight.Bold) },
-                                colors = NavigationBarItemDefaults.colors(
-                                    selectedIconColor = Color.Black,
-                                    selectedTextColor = LiveGreen,
-                                    indicatorColor = LiveGreen,
-                                    unselectedIconColor = TextSecondary,
-                                    unselectedTextColor = TextSecondary
+                                NavigationBarItem(
+                                    selected = currentMode == AppMode.MOBILE_RECEIVER,
+                                    onClick = { viewModel.setAppMode(AppMode.MOBILE_RECEIVER) },
+                                    icon = { Icon(Icons.Default.PhoneAndroid, contentDescription = "Receiver") },
+                                    label = { Text("手机接收端", fontWeight = FontWeight.Bold) },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = Color.Black,
+                                        selectedTextColor = LiveGreen,
+                                        indicatorColor = LiveGreen,
+                                        unselectedIconColor = TextSecondary,
+                                        unselectedTextColor = TextSecondary
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 ) { innerPadding ->

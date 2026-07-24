@@ -13,6 +13,7 @@ object PacketProtocol {
     const val FLAG_KEYFRAME: Byte = 0x01
     const val FLAG_CODEC_CONFIG: Byte = 0x02
     const val FLAG_CODEC_HEVC: Byte = 0x04
+    const val FLAG_AUDIO: Byte = 0x08
 
     // Discovery UDP Constants
     const val DISCOVERY_PORT = 9998
@@ -30,7 +31,8 @@ object PacketProtocol {
         totalPackets: Short,
         isKeyframe: Boolean,
         isCodecConfig: Boolean,
-        isHevc: Boolean
+        isHevc: Boolean,
+        isAudio: Boolean = false
     ): ByteArray {
         val totalLength = HEADER_SIZE + payloadSize
         val packet = ByteArray(totalLength)
@@ -44,6 +46,7 @@ object PacketProtocol {
         if (isKeyframe) flags = (flags.toInt() or FLAG_KEYFRAME.toInt()).toByte()
         if (isCodecConfig) flags = (flags.toInt() or FLAG_CODEC_CONFIG.toInt()).toByte()
         if (isHevc) flags = (flags.toInt() or FLAG_CODEC_HEVC.toInt()).toByte()
+        if (isAudio) flags = (flags.toInt() or FLAG_AUDIO.toInt()).toByte()
         bb.put(flags)
 
         bb.putInt(frameSeq)
@@ -64,6 +67,7 @@ object PacketProtocol {
         val isKeyframe: Boolean,
         val isCodecConfig: Boolean,
         val isHevc: Boolean,
+        val isAudio: Boolean,
         val payload: ByteArray
     )
 
@@ -78,6 +82,7 @@ object PacketProtocol {
         val isKeyframe = (flags and FLAG_KEYFRAME.toInt()) != 0
         val isCodecConfig = (flags and FLAG_CODEC_CONFIG.toInt()) != 0
         val isHevc = (flags and FLAG_CODEC_HEVC.toInt()) != 0
+        val isAudio = (flags and FLAG_AUDIO.toInt()) != 0
 
         val frameSeq = bb.int
         val timestampMs = bb.long
@@ -98,6 +103,7 @@ object PacketProtocol {
             isKeyframe = isKeyframe,
             isCodecConfig = isCodecConfig,
             isHevc = isHevc,
+            isAudio = isAudio,
             payload = payload
         )
     }

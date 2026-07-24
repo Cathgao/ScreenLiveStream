@@ -31,6 +31,9 @@ class QuestReceiverService : Service() {
     var isListening = false
         private set
 
+    @Volatile
+    var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
+
     var currentSurface: Surface? = null
         private set
 
@@ -46,6 +49,10 @@ class QuestReceiverService : Service() {
 
         udpReceiver.onFrameAssembled = { frameBytes, isKeyframe, isCodecConfig, isHevc ->
             videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc)
+        }
+
+        videoDecoder.onVideoSizeChanged = { w, h ->
+            onVideoSizeChanged?.invoke(w, h)
         }
     }
 

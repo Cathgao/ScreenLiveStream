@@ -16,6 +16,8 @@ class VideoDecoder {
     @Volatile
     private var targetSurface: Surface? = null
 
+    var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
+
     fun setSurface(surface: Surface?) {
         if (targetSurface != surface) {
             targetSurface = surface
@@ -94,9 +96,21 @@ class VideoDecoder {
             val bufferInfo = MediaCodec.BufferInfo()
             var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
 
-            while (outputIndex >= 0) {
-                // Immediate render to surface with render=true
-                mc.releaseOutputBuffer(outputIndex, true)
+            while (outputIndex != MediaCodec.INFO_TRY_AGAIN_LATER) {
+                if (outputIndex >= 0) {
+                    // Immediate render to surface with render=true
+                    mc.releaseOutputBuffer(outputIndex, true)
+                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    try {
+                        val format = mc.outputFormat
+                        val w = format.getInteger(MediaFormat.KEY_WIDTH)
+                        val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+                        Log.i(TAG, "Video format changed: $w x $h")
+                        onVideoSizeChanged?.invoke(w, h)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error getting video format", e)
+                    }
+                }
                 outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
             }
         } catch (e: Exception) {

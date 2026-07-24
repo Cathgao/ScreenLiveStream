@@ -44,6 +44,14 @@ class QuestSenderService : Service() {
     var isStreaming = false
         private set
 
+    private var savedResultCode: Int = 0
+    private var savedResultData: Intent? = null
+    private var savedConfig: StreamConfig? = null
+
+    private var lastWidth = 0
+    private var lastHeight = 0
+    private var displayListener: DisplayManager.DisplayListener? = null
+
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
 
     inner class LocalBinder : Binder() {
@@ -123,6 +131,13 @@ class QuestSenderService : Service() {
 
     private fun startStreaming(resultCode: Int, resultData: Intent, config: StreamConfig) {
         stopStreaming()
+
+        savedResultCode = resultCode
+        savedResultData = resultData
+        savedConfig = config
+
+        lastWidth = resources.displayMetrics.widthPixels
+        lastHeight = resources.displayMetrics.heightPixels
 
         AppLogger.i(TAG, "Requesting MediaProjection from projectionManager...")
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -230,6 +245,20 @@ class QuestSenderService : Service() {
             null
         )
 
+        // Register DisplayListener for orientation/resolution change sensing
+        val dispMgr = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId == Display.DEFAULT_DISPLAY) {
+                    checkScreenSizeChange()
+                }
+            }
+        }
+        dispMgr?.registerDisplayListener(listener, android.os.Handler(android.os.Looper.getMainLooper()))
+        displayListener = listener
+
         isStreaming = true
         AppLogger.i(TAG, "QuestSenderService streaming started successfully.")
     }
@@ -237,6 +266,17 @@ class QuestSenderService : Service() {
     fun stopStreaming() {
         AppLogger.i(TAG, "stopStreaming requested.")
         isStreaming = false
+
+        displayListener?.let { listener ->
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            try {
+                displayManager?.unregisterDisplayListener(listener)
+                AppLogger.i(TAG, "Display listener unregistered.")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error unregistering display listener", e)
+            }
+        }
+        displayListener = null
         try {
             virtualDisplay?.release()
             AppLogger.i(TAG, "VirtualDisplay released.")
@@ -280,6 +320,138 @@ class QuestSenderService : Service() {
         }
         mediaProjection = null
         AppLogger.i(TAG, "QuestSenderService streaming stopped completed.")
+    }
+
+    private fun checkScreenSizeChange() {
+        if (!isStreaming) return
+        val config = savedConfig ?: return
+
+        val metrics = resources.displayMetrics
+        val currentScreenWidth = metrics.widthPixels
+        val currentScreenHeight = metrics.heightPixels
+
+        if (currentScreenWidth != lastWidth || currentScreenHeight != lastHeight) {
+            AppLogger.i(TAG, "Screen rotation/size change detected: from ${lastWidth}x${lastHeight} to ${currentScreenWidth}x${currentScreenHeight}")
+            lastWidth = currentScreenWidth
+            lastHeight = currentScreenHeight
+
+            recreateEncoderAndVirtualDisplay(currentScreenWidth, currentScreenHeight)
+        }
+    }
+
+    private fun recreateEncoderAndVirtualDisplay(screenWidth: Int, screenHeight: Int) {
+        val config = savedConfig ?: return
+        val projection = mediaProjection ?: return
+        val mux = muxerManager ?: return
+
+        AppLogger.i(TAG, "Recreating VideoEncoder and VirtualDisplay...")
+
+        // 1. Release existing VirtualDisplay
+        try {
+            virtualDisplay?.release()
+            AppLogger.i(TAG, "Old VirtualDisplay released.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing old VirtualDisplay", e)
+        }
+        virtualDisplay = null
+
+        // 2. Stop and release old VideoEncoder
+        try {
+            encoder?.stop()
+            AppLogger.i(TAG, "Old VideoEncoder stopped.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping old VideoEncoder", e)
+        }
+        encoder = null
+
+        // 3. Compute new effective width and height, preserving original aspect ratio/orientation
+        val rawWidth = if (config.resolution.width > 0) config.resolution.width else screenWidth
+        val rawHeight = if (config.resolution.height > 0) config.resolution.height else screenHeight
+
+        val isPhysicalLandscape = screenWidth >= screenHeight
+        var effWidth = if (isPhysicalLandscape) {
+            maxOf(rawWidth, rawHeight)
+        } else {
+            minOf(rawWidth, rawHeight)
+        }
+        var effHeight = if (isPhysicalLandscape) {
+            minOf(rawWidth, rawHeight)
+        } else {
+            maxOf(rawWidth, rawHeight)
+        }
+
+        // Align to 16 pixels
+        effWidth = ((effWidth / 16) * 16).coerceAtLeast(16)
+        effHeight = ((effHeight / 16) * 16).coerceAtLeast(16)
+
+        // Query capabilities & clamp dynamically
+        val caps = com.example.model.EncoderCapabilities.query(config.codec, config.bitrateMode)
+        if (effWidth > caps.maxWidth) {
+            val clampedWidth = (caps.maxWidth / 16) * 16
+            AppLogger.w(TAG, "Width $effWidth exceeds encoder maximum ${caps.maxWidth}, clamping to $clampedWidth")
+            effWidth = clampedWidth
+        }
+        if (effHeight > caps.maxHeight) {
+            val clampedHeight = (caps.maxHeight / 16) * 16
+            AppLogger.w(TAG, "Height $effHeight exceeds encoder maximum ${caps.maxHeight}, clamping to $clampedHeight")
+            effHeight = clampedHeight
+        }
+
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        val effFps = if (config.frameRate > 0) {
+            config.frameRate
+        } else {
+            defaultDisplay?.refreshRate?.toInt() ?: 90
+        }
+
+        AppLogger.i(TAG, "Recreating stream parameters: $effWidth x $effHeight @ $effFps FPS, BitrateMode: ${config.bitrateMode.name}, Bitrate: ${config.bitrateKbps}Kbps")
+
+        // 4. Initialize and start new VideoEncoder with the current configurations
+        val enc = VideoEncoder(
+            config = config,
+            udpStreamer = udpStreamer,
+            overrideWidth = effWidth,
+            overrideHeight = effHeight,
+            overrideFps = effFps,
+            context = this,
+            muxerManager = mux
+        )
+        try {
+            enc.start()
+            encoder = enc
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to start new VideoEncoder", e)
+            stopStreaming()
+            return
+        }
+
+        // 5. Create new VirtualDisplay targeting the new encoder surface
+        val surface = enc.inputSurface
+        if (surface == null) {
+            AppLogger.e(TAG, "New Encoder inputSurface is null! Cannot recreate VirtualDisplay.")
+            stopStreaming()
+            return
+        }
+
+        val metrics = resources.displayMetrics
+        virtualDisplay = projection.createVirtualDisplay(
+            "Quest3ScreenCast",
+            effWidth,
+            effHeight,
+            metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+            surface,
+            null,
+            null
+        )
+        AppLogger.i(TAG, "New VirtualDisplay created successfully with size: $effWidth x $effHeight.")
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        AppLogger.i(TAG, "onConfigurationChanged triggered.")
+        checkScreenSizeChange()
     }
 
     override fun onDestroy() {

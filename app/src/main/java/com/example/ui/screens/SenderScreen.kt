@@ -9,7 +9,6 @@ import android.media.projection.MediaProjectionManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,7 +27,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.log.AppLogger
@@ -106,57 +104,176 @@ fun SenderScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Top Header Banner
+        // Target Receiver IP & LAN Auto-Discovery (Moved here above Start button)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
             shape = RoundedCornerShape(16.dp)
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(if (isStreaming) LiveGreen.copy(alpha = 0.2f) else NeonCyan.copy(alpha = 0.15f)),
-                    contentAlignment = Alignment.Center
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = if (isStreaming) Icons.Default.Videocam else Icons.Default.Cast,
-                        contentDescription = "Sender Status Icon",
-                        tint = if (isStreaming) LiveGreen else NeonCyan,
-                        modifier = Modifier.size(28.dp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Wifi,
+                            contentDescription = null,
+                            tint = LiveGreen,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "接收端目标 IP",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = TextPrimary
+                        )
+                    }
+
+                    IconButton(onClick = { viewModel.startLanScan() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Scan LAN", tint = NeonCyan)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = config.targetIp,
+                        onValueChange = { viewModel.updateTargetIp(it) },
+                        label = { Text("目标 IP 地址") },
+                        modifier = Modifier.weight(2f),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = NeonCyan,
+                            unfocusedBorderColor = BorderCyan,
+                            focusedLabelColor = NeonCyan,
+                            unfocusedLabelColor = TextSecondary
+                        )
+                    )
+
+                    OutlinedTextField(
+                        value = config.targetPort.toString(),
+                        onValueChange = { viewModel.updateTargetPort(it.toIntOrNull() ?: 8888) },
+                        label = { Text("端口") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = NeonCyan,
+                            unfocusedBorderColor = BorderCyan,
+                            focusedLabelColor = NeonCyan,
+                            unfocusedLabelColor = TextSecondary
+                        )
                     )
                 }
-                Spacer(modifier = Modifier.width(16.dp))
-                Column(modifier = Modifier.weight(1f)) {
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = "局域网自动发现的接收端 (${discoveredDevices.size})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (discoveredDevices.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(64.dp)
+                            .background(DarkCyberCard, shape = RoundedCornerShape(12.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "正在扫描局域网接收端...或在上方手动输入 IP",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                } else {
                     Text(
-                        text = if (isStreaming) "VR 画面正在推流中" else "Quest 3 屏幕发送端",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = TextPrimary
-                    )
-                    Text(
-                        text = "本设备 IP: $localIp",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary
-                    )
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(if (isStreaming) LiveGreen else Color.Gray.copy(alpha = 0.3f))
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = if (isStreaming) "LIVE" else "OFFLINE",
-                        color = if (isStreaming) Color.Black else TextPrimary,
+                        text = "💡 点击下方接收端卡片选择，或直接点击『一键投屏』开始",
                         fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
+                        color = TextSecondary,
+                        modifier = Modifier.padding(bottom = 6.dp)
                     )
+                    discoveredDevices.forEach { dev ->
+                        val isSelected = dev.ipAddress == config.targetIp
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (isSelected) NeonCyan.copy(alpha = 0.15f) else DarkCyberCard)
+                                .border(
+                                    width = if (isSelected) 1.5.dp else 0.dp,
+                                    color = if (isSelected) NeonCyan else Color.Transparent,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .clickable {
+                                    viewModel.selectDiscoveredDevice(dev)
+                                }
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = dev.deviceName,
+                                        fontWeight = FontWeight.Bold,
+                                        color = TextPrimary,
+                                        fontSize = 14.sp
+                                    )
+                                    if (isSelected) {
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Surface(
+                                            color = LiveGreen,
+                                            shape = RoundedCornerShape(4.dp)
+                                        ) {
+                                            Text(
+                                                text = "已选中",
+                                                color = Color.Black,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "${dev.ipAddress}:${dev.port} • 延迟: ${dev.pingMs}ms",
+                                    fontSize = 12.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    viewModel.selectDiscoveredDevice(dev)
+                                    if (!isStreaming) {
+                                        startProjectionWithPermissionCheck()
+                                    } else {
+                                        onStopStreamRequested()
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (isSelected && isStreaming) ErrorRed else LiveGreen
+                                ),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = if (isSelected && isStreaming) "停止投屏" else "一键投屏",
+                                    color = if (isSelected && isStreaming) Color.White else Color.Black,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -164,8 +281,8 @@ fun SenderScreen(
         // Action Button: Start / Stop Stream
         val buttonText = when {
             isStreaming -> "停止推流"
-            config.targetIp.isNotEmpty() -> "启动 Quest 3 画面投屏 (发往 ${config.targetIp})"
-            else -> "请在下方选择或输入接收端 IP"
+            config.targetIp.isNotEmpty() -> "启动 Quest 3 画面投屏"
+            else -> "请在上方选择或输入接收端 IP"
         }
 
         Button(
@@ -511,199 +628,7 @@ fun SenderScreen(
             }
         }
 
-        // Target Receiver IP & LAN Auto-Discovery
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Wifi,
-                            contentDescription = null,
-                            tint = LiveGreen,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "接收端目标 IP",
-                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                            color = TextPrimary
-                        )
-                    }
 
-                    IconButton(onClick = { viewModel.startLanScan() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Scan LAN", tint = NeonCyan)
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = config.targetIp,
-                        onValueChange = { viewModel.updateTargetIp(it) },
-                        label = { Text("目标 IP 地址") },
-                        modifier = Modifier.weight(2f),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = NeonCyan,
-                            unfocusedBorderColor = BorderCyan,
-                            focusedLabelColor = NeonCyan,
-                            unfocusedLabelColor = TextSecondary
-                        )
-                    )
-
-                    OutlinedTextField(
-                        value = config.targetPort.toString(),
-                        onValueChange = { viewModel.updateTargetPort(it.toIntOrNull() ?: 8888) },
-                        label = { Text("端口") },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = NeonCyan,
-                            unfocusedBorderColor = BorderCyan,
-                            focusedLabelColor = NeonCyan,
-                            unfocusedLabelColor = TextSecondary
-                        )
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Text(
-                    text = "局域网自动发现的接收端 (${discoveredDevices.size})",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                if (discoveredDevices.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(64.dp)
-                            .background(DarkCyberCard, shape = RoundedCornerShape(12.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "正在扫描局域网接收端...或在上方手动输入 IP",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary
-                        )
-                    }
-                } else {
-                    Text(
-                        text = "💡 点击下方接收端卡片选择，或直接点击『一键投屏』开始",
-                        fontSize = 11.sp,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(bottom = 6.dp)
-                    )
-                    discoveredDevices.forEach { dev ->
-                        val isSelected = dev.ipAddress == config.targetIp
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(if (isSelected) NeonCyan.copy(alpha = 0.15f) else DarkCyberCard)
-                                .border(
-                                    width = if (isSelected) 1.5.dp else 0.dp,
-                                    color = if (isSelected) NeonCyan else Color.Transparent,
-                                    shape = RoundedCornerShape(12.dp)
-                                )
-                                .clickable {
-                                    viewModel.selectDiscoveredDevice(dev)
-                                }
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = dev.deviceName,
-                                        fontWeight = FontWeight.Bold,
-                                        color = TextPrimary,
-                                        fontSize = 14.sp
-                                    )
-                                    if (isSelected) {
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Surface(
-                                            color = LiveGreen,
-                                            shape = RoundedCornerShape(4.dp)
-                                        ) {
-                                            Text(
-                                                text = "已选中",
-                                                color = Color.Black,
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = "${dev.ipAddress}:${dev.port} • 延迟: ${dev.pingMs}ms",
-                                    fontSize = 12.sp,
-                                    color = TextSecondary
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Button(
-                                onClick = {
-                                    viewModel.selectDiscoveredDevice(dev)
-                                    if (!isStreaming) {
-                                        startProjectionWithPermissionCheck()
-                                    } else {
-                                        onStopStreamRequested()
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isSelected && isStreaming) ErrorRed else LiveGreen
-                                ),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Text(
-                                    text = if (isSelected && isStreaming) "停止投屏" else "一键投屏",
-                                    color = if (isSelected && isStreaming) Color.White else Color.Black,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Low Memory / Zero Copy OOM Safety Banner
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = DarkCyberCard),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(Icons.Default.Memory, contentDescription = null, tint = LiveGreen)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "已启用 Quest 3 防 OOM 零拷贝架构：Surface 直通 GPU 裁剪硬件编码，内存占用低于 15MB。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
-            }
-        }
 
         // Diagnostics & Log Export Card
         Card(
