@@ -21,8 +21,8 @@ data class VideoResolution(val displayName: String, val width: Int, val height: 
 
 enum class BitrateMode(val displayName: String, val modeInt: Int) {
     VBR("VBR 动态码率 (最省资源 & 自动降码率)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR),
-    CBR("CBR 恒定码率 (网络推流高平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR),
-    CQ("CQ 恒定质量 (高清晰度省空间)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
+    CBR("CBR 恒定码率 (网络流量平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR),
+    CQ("CQ 恒定质量 (画质平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
 }
 
 data class StreamConfig(

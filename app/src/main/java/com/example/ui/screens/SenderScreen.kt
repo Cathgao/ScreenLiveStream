@@ -53,6 +53,21 @@ fun SenderScreen(
     val localIp by viewModel.localIpAddress.collectAsState()
     var logExportResult by remember { mutableStateOf<String?>(null) }
 
+    var ipInput by remember { mutableStateOf(config.targetIp) }
+    var portInput by remember { mutableStateOf(config.targetPort.toString()) }
+
+    LaunchedEffect(config.targetIp) {
+        if (ipInput != config.targetIp) {
+            ipInput = config.targetIp
+        }
+    }
+    LaunchedEffect(config.targetPort) {
+        val portStr = config.targetPort.toString()
+        if (portInput != portStr) {
+            portInput = portStr
+        }
+    }
+
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -138,31 +153,57 @@ fun SenderScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
+                val isIpError = ipInput.isNotEmpty() && !isValidIp(ipInput)
+                val isPortError = portInput.isNotEmpty() && !isValidPort(portInput)
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = config.targetIp,
-                        onValueChange = { viewModel.updateTargetIp(it) },
+                        value = ipInput,
+                        onValueChange = {
+                            ipInput = it
+                            if (isValidIp(it)) {
+                                viewModel.updateTargetIp(it)
+                            }
+                        },
+                        isError = isIpError,
                         label = { Text("目标 IP 地址") },
+                        supportingText = {
+                            if (isIpError) {
+                                Text("请输入合法的 IPv4 地址", color = MaterialTheme.colorScheme.error)
+                            }
+                        },
                         modifier = Modifier.weight(2f),
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = NeonCyan,
-                            unfocusedBorderColor = BorderCyan,
-                            focusedLabelColor = NeonCyan,
+                            focusedBorderColor = if (isIpError) MaterialTheme.colorScheme.error else NeonCyan,
+                            unfocusedBorderColor = if (isIpError) MaterialTheme.colorScheme.error else BorderCyan,
+                            focusedLabelColor = if (isIpError) MaterialTheme.colorScheme.error else NeonCyan,
                             unfocusedLabelColor = TextSecondary
                         )
                     )
 
                     OutlinedTextField(
-                        value = config.targetPort.toString(),
-                        onValueChange = { viewModel.updateTargetPort(it.toIntOrNull() ?: 8888) },
+                        value = portInput,
+                        onValueChange = {
+                            portInput = it
+                            val portInt = it.toIntOrNull()
+                            if (portInt != null && portInt in 1..65535) {
+                                viewModel.updateTargetPort(portInt)
+                            }
+                        },
+                        isError = isPortError,
                         label = { Text("端口") },
+                        supportingText = {
+                            if (isPortError) {
+                                Text("1-65535", color = MaterialTheme.colorScheme.error)
+                            }
+                        },
                         modifier = Modifier.weight(1f),
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = NeonCyan,
-                            unfocusedBorderColor = BorderCyan,
-                            focusedLabelColor = NeonCyan,
+                            focusedBorderColor = if (isPortError) MaterialTheme.colorScheme.error else NeonCyan,
+                            unfocusedBorderColor = if (isPortError) MaterialTheme.colorScheme.error else BorderCyan,
+                            focusedLabelColor = if (isPortError) MaterialTheme.colorScheme.error else NeonCyan,
                             unfocusedLabelColor = TextSecondary
                         )
                     )
@@ -278,9 +319,12 @@ fun SenderScreen(
             }
         }
 
+        val isInputValid = isValidIp(ipInput) && isValidPort(portInput)
+
         // Action Button: Start / Stop Stream
         val buttonText = when {
             isStreaming -> "停止推流"
+            !isInputValid -> "请在上方输入合法的接收端 IP 及端口"
             config.targetIp.isNotEmpty() -> "启动 Quest 3 画面投屏"
             else -> "请在上方选择或输入接收端 IP"
         }
@@ -293,13 +337,16 @@ fun SenderScreen(
                     startProjectionWithPermissionCheck()
                 }
             },
+            enabled = isStreaming || isInputValid,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
                 .testTag("sender_toggle_button"),
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (isStreaming) ErrorRed else NeonCyan,
-                contentColor = Color.Black
+                contentColor = Color.Black,
+                disabledContainerColor = DarkCyberCard,
+                disabledContentColor = TextSecondary
             ),
             shape = RoundedCornerShape(16.dp)
         ) {
@@ -710,3 +757,13 @@ fun SenderScreen(
 
 private val ButtonDefaults.outlinedToolboxBorder: androidx.compose.foundation.BorderStroke
     get() = androidx.compose.foundation.BorderStroke(1.dp, BorderCyan)
+
+private fun isValidIp(ip: String): Boolean {
+    val regex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$".toRegex()
+    return ip.matches(regex)
+}
+
+private fun isValidPort(port: String): Boolean {
+    val num = port.toIntOrNull() ?: return false
+    return num in 1..65535
+}
