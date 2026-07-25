@@ -63,22 +63,12 @@ class UdpStreamer {
                 var remaining = size
                 var currOffset = offset
 
-                // Mild intra-frame pacing: the protocol doesn't change, but we
-                // briefly yield between fragments so a single large frame
-                // (codec-config + keyframe in particular) doesn't fire tens of
-                // MTU-sized packets back-to-back and overflow the receiver's
-                // reassembly buffers or the kernel send queue. The delay is
-                // calibrated so a ~150 KB keyframe at 1300 B MTU (~115
-                // fragments) costs <15 ms total — negligible vs the ~11 ms
-                // frame interval — but enough to spread load when the executor
-                // is busy with several concurrent frames.
-                val pacedPackets = totalPackets > PACKET_PACING_THRESHOLD
-                val pacingDelayNs = if (pacedPackets) PACKET_PACING_DELAY_NS else 0L
-
-                // Coarse-grained pacing: only sleep after every 10 packets of a large frame.
-                // This prevents hundreds of microsecond-level sleeps (which Android scales to 1-2ms)
-                // from backing up the sender queue while still spreading the load of huge keyframes.
-                val batchSize = 10
+                // Packets are sent back-to-back without inter-packet delays.
+                // The previous LOCK_SUPPORT-parkNanos pacing was a defensive "spread the burst"
+                // measure, but on a LAN/Wi-Fi link the worst case is a ~200 KB keyframe at 1300 B
+                // (≈150 packets) sent over a 1ms–5ms window — well within the 4 MB receive buffer
+                // of UdpReceiver and the kernel SO_SNDBUF default. The pacing only added 5–15 ms
+                // of end-to-end latency while not actually preventing drops, so it has been removed.
                 for (idx in 0 until totalPackets) {
                     val chunkSize = remaining.coerceAtMost(maxPayload)
                     val packetBytes = PacketProtocol.buildPacket(
@@ -99,10 +89,6 @@ class UdpStreamer {
 
                     currOffset += chunkSize
                     remaining -= chunkSize
-
-                    if (pacingDelayNs > 0 && (idx + 1) % batchSize == 0 && idx + 1 < totalPackets) {
-                        java.util.concurrent.locks.LockSupport.parkNanos(pacingDelayNs)
-                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending UDP packet", e)
@@ -120,6 +106,32 @@ class UdpStreamer {
         }
         socket = null
         targetAddress = null
+    }
+
+    /**
+     * Broadcast a one-way stats beacon carrying the sender's rolling
+     * RTT / network-loss numbers. The receiver reads it via
+     * [PacketProtocol.readPingStatsPayload] and feeds it into the HUD.
+     * Beacons share the same UDP socket as video so no extra port is
+     * needed and no firewall changes are required.
+     */
+    fun sendStatsBeacon(rttMs: Int, lossPercent: Float) {
+        if (!isConnected) return
+        val currentSocket = socket ?: return
+        val address = targetAddress ?: return
+        // lossPercent is a Float in [0..100]. Convert to basis-points
+        // (×100) so we keep two decimal digits of precision inside an
+        // int field, clamped to [0..10000] = 0.00%..100.00%.
+        val lossBp = (lossPercent * 100f).toInt().coerceIn(0, 10000)
+        executor.execute {
+            try {
+                val packetBytes = PacketProtocol.buildPingStatsPacket(rttMs, lossBp)
+                currentSocket.send(DatagramPacket(packetBytes, packetBytes.size, address, targetPort))
+            } catch (e: Exception) {
+                // Stats beacons are best-effort. Dropping one is harmless.
+                SessionLog.w(TAG, "sendStatsBeacon failed: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -150,15 +162,8 @@ class UdpStreamer {
                 var remaining = size
                 var currOffset = 0
 
-                // Same intra-frame pacing as the video path. Audio chunks
-                // are small enough that this is normally a no-op; the
-                // threshold keeps us from adding latency on tiny single-packet
-                // AAC frames.
-                val pacedPackets = totalPackets > PACKET_PACING_THRESHOLD
-                val pacingDelayNs = if (pacedPackets) PACKET_PACING_DELAY_NS else 0L
-
-                // Coarse-grained pacing: only sleep after every 10 packets of a large frame.
-                val batchSize = 10
+                // Audio chunks are tiny (~250 B at 128 kbps × 16 ms) and almost always fit
+                // in a single packet, so no pacing is required. Sent back-to-back, same as video.
                 for (idx in 0 until totalPackets) {
                     val chunkSize = remaining.coerceAtMost(maxPayload)
                     val packetBytes = PacketProtocol.buildPacket(
@@ -180,10 +185,6 @@ class UdpStreamer {
 
                     currOffset += chunkSize
                     remaining -= chunkSize
-
-                    if (pacingDelayNs > 0 && (idx + 1) % batchSize == 0 && idx + 1 < totalPackets) {
-                        java.util.concurrent.locks.LockSupport.parkNanos(pacingDelayNs)
-                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending UDP audio packet", e)
@@ -194,12 +195,5 @@ class UdpStreamer {
 
     companion object {
         private const val TAG = "UdpStreamer"
-
-        // Frames with more than this many fragments get intra-frame pacing.
-        // We set this to 15 (approx. 20KB frame size) so that small or medium P-frames (even with motion)
-        // are sent immediately with zero added transmission latency.
-        private const val PACKET_PACING_THRESHOLD = 15
-        // ~100 µs pacing delay between 10-packet batches for giant Keyframes.
-        private const val PACKET_PACING_DELAY_NS = 100_000L
     }
 }

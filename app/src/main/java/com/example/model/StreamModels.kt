@@ -192,7 +192,31 @@ data class StreamStats(
     val codecName: String = "",
     val totalFrames: Long = 0,
     val droppedFrames: Long = 0,
-    val packetLossPercent: Float = 0f
+    val packetLossPercent: Float = 0f,
+    // ---- Phase-3 loss / RTT diagnostics (additive; legacy fields preserved) ----
+    /** Frames we gave up on after STALE_FRAME_TIMEOUT_MS with parts missing. */
+    val lossTimeoutPercent: Float = 0f,
+    /** Frames we proactively dropped to stay under the byte budget. */
+    val lossEvictedPercent: Float = 0f,
+    /**
+     * Network-layer loss estimate from sender-initiated RTT probes.
+     * This is the SOLE source of truth for link loss — the earlier
+     * frameSeq-gap heuristic was removed because a dispatcher /
+     * listener race produced phantom 95%+ values.
+     */
+    val lossNetworkPercent: Float = 0f,
+    /** Current sum of expected bytes for all unfinished assemblies. */
+    val inFlightBytes: Long = 0,
+    /** Wall-clock time at which this snapshot was created (UI uses to avoid stale overlays). */
+    val statsTimestampMs: Long = 0,
+    /**
+     * Latest rolling RTT in milliseconds from the sender-side
+     * UdpRttProbe. Mirrored to the receiver HUD via FLAG_PING_STATS
+     * beacons (one per second) so the receiver can show real link
+     * latency instead of the wall-clock delta that used to clamp at
+     * 1000 ms. 0 means "no beacon received yet".
+     */
+    val rttMs: Int = 0
 )
 
 data class DiscoveredDevice(

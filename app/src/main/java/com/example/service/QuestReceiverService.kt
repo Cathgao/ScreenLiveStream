@@ -65,7 +65,7 @@ class QuestReceiverService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val port = intent?.getIntExtra(EXTRA_LISTEN_PORT, 8888) ?: 8888
         val autoAnnounce = intent?.getBooleanExtra(EXTRA_AUTO_ANNOUNCE, true) ?: true
-        val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, 120) ?: 120
+        val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, 30) ?: 30
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -94,7 +94,7 @@ class QuestReceiverService : Service() {
         audioDecoder.stop()
     }
 
-    fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 120) {
+    fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 30) {
         stopListening()
         udpReceiver.jitterBufferMs = jitterBufferMs
         udpReceiver.start(port)

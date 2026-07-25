@@ -21,23 +21,64 @@ class UdpReceiver {
     // Callback for completed audio frames: (aacBytes, isCodecConfig, timestampMs)
     var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
     var onStatsUpdated: ((StreamStats) -> Unit)? = null
+    // Fired when the receiver side decodes a sender-originated probe's
+    // echo that somehow came back addressed to us (only meaningful when
+    // the receiver itself is also running a probe, e.g. for round-trip
+    // monitoring on the receive device). Optional; current sender uses
+    // its own ping/echo loop, so this is left unused.
+    var onProbeReply: ((probeSeq: Int, originalSendTimeNanos: Long) -> Unit)? = null
 
     private val videoFrameBuffers = ConcurrentHashMap<Int, FrameAssembly>()
     private val audioFrameBuffers = ConcurrentHashMap<Int, FrameAssembly>()
 
     // ---- Per-window stats (reset every STATS_WINDOW_MS) ----
     private var windowReceivedFrames = 0L
-    private var windowDroppedFrames = 0L
+    // Receiver-side loss counters. NOTE: we deliberately removed the
+    // earlier "networkDrops" estimate that was derived from frameSeq
+    // gaps — it suffered from a dispatcher / listener race that produced
+    // 95 %+ phantom loss on every test run. True network-layer loss
+    // now comes exclusively from UdpRttProbe on the sender side (and
+    // mirrored onto the receiver HUD via the sender's onStatsUpdate).
+    // What stays here are *receiver* events that are unambiguously
+    // observable inside one thread:
+    //   "windowTimeoutDrops": assemblies swept by STALE_FRAME_TIMEOUT_MS.
+    //   "windowEvictedDrops": assemblies we proactively dropped to keep
+    //                          the in-flight byte budget.
+    private var windowTimeoutDrops = 0L
+    private var windowEvictedDrops = 0L
     private var windowBytesReceived = 0L
     private var lastStatsResetTime = System.currentTimeMillis()
     private var currentFps = 0f
     private var currentBitrateMbps = 0f
-    private var currentLatencyMs = 0L
-    private var currentPacketLossPercent = 0f
+    // No longer used to publish link latency. Real RTT comes from
+    // UdpRttProbe on the sender side. Kept so legacy callers can still
+    // inspect the most recent sample if they ever want to.
+    private var currentWallClockDeltaMs = 0L
+
+    // Sender-side probe stats forwarded to the receiver by the service.
+    // Updated every time the probe publishes (≈ 1 s). The receiver's
+    // StreamStats is the union of receiver-side events and these two
+    // network-ground-truth values.
+    @Volatile
+    private var lastReportedNetworkLossPercent: Float = 0f
+    @Volatile
+    private var lastReportedRttMs: Int = 0
+
+    /**
+     * Receives the latest RTT probe sample from the sender (mirrored
+     * over the LAN via [setRttStats] on the receiver service). The
+     * probe is the only credible network-loss / latency source on this
+     * build; everything else here is receiver-side bookkeeping.
+     */
+    fun setRttStats(rttMs: Int, lossPercent: Float) {
+        lastReportedRttMs = rttMs
+        lastReportedNetworkLossPercent = lossPercent
+    }
 
     // ---- Cumulative stats since the receiver started ----
     private var totalReceivedFrames = 0L
-    private var totalDroppedFrames = 0L
+    private var totalTimeoutDrops = 0L
+    private var totalEvictedDrops = 0L
     private var totalBytesReceived = 0L
     private var totalMalformedPackets = 0L
     private val sessionStartTime = System.currentTimeMillis()
@@ -51,7 +92,10 @@ class UdpReceiver {
 
     // ---- Jitter Buffer Configurations ----
     @Volatile
-    var jitterBufferMs: Int = 120 // 0 means direct low-latency mode, >0 enables reordering buffer
+    var jitterBufferMs: Int = 30 // 0 means direct low-latency mode, >0 enables reordering buffer
+    // 30 ms is enough to absorb typical LAN/Wi-Fi jitter (5–20 ms) without adding perceptible
+    // end-to-end latency. If packet loss dominated, a longer buffer would not save us — the
+    // stream relies on the next IDR frame after a loss, so the buffer mainly smooths reorder.
 
     private val videoJitterQueue = java.util.TreeMap<Int, JitterFrame>()
     private val audioJitterQueue = java.util.TreeMap<Int, JitterFrame>()
@@ -168,6 +212,14 @@ class UdpReceiver {
         val packets = Array<ByteArray?>(totalPackets) { null }
         var receivedCount = 0
         var lastUpdateMs: Long = firstSeenMs
+        // Per-packet MTU is 1300 B, but it's an upper bound (last packet
+        // is typically shorter). Using totalPackets * MAX_PAYLOAD_SIZE
+        // over-estimates, so any in-flight byte count we derive is an
+        // upper bound and triggers evict *later* — which is safer than
+        // triggering it too eagerly. We track this so the periodic
+        // sweeper can drive a real byte budget instead of an arbitrary
+        // 20-slot cap.
+        val expectedBytes: Int = totalPackets * PacketProtocol.MAX_PAYLOAD_SIZE
 
         fun addPacket(idx: Int, payload: ByteArray): Boolean {
             if (idx in 0 until totalPackets && packets[idx] == null) {
@@ -233,6 +285,48 @@ class UdpReceiver {
                         continue
                     }
                     pktCounter++
+                    // Sender-broadcast stats beacon. These are FLAG_PING_STATS
+                    // packets carrying rolling RTT / network-loss-percent
+                    // numbers from the sender's UdpRttProbe. We pick them up
+                    // here so the HUD can show real link RTT instead of the
+                    // bogus wall-clock delta that used to clamp at 1000 ms.
+                    // Cheap (one int-pair parse) and never touches frame
+                    // assembly state.
+                    val statsBeacon = PacketProtocol.readPingStatsPayload(packet.data, packet.length)
+                    if (statsBeacon != null) {
+                        // readPingStatsPayload returns (rttMs, lossBp).
+                        // lossBp = lossPercent × 100.
+                        setRttStats(
+                            rttMs = statsBeacon.first,
+                            lossPercent = statsBeacon.second / 100f
+                        )
+                        continue
+                    }
+                    // Probe packets share the same magic+version but use
+                    // their own flag bits and a payload layout that the
+                    // media parser would otherwise see as malformed. We
+                    // sniff them out first and short-circuit.
+                    val probe = PacketProtocol.readProbeSequence(packet.data, packet.length)
+                    if (probe != null) {
+                        if (probe.isReply) {
+                            // Replies are echoed from us by the sender's
+                            // RTT probe; on the *receiver* side they're
+                            // meaningful only when we've been configured
+                            // as bidirectional. Hook here so future code
+                            // can react; today the receiver simply
+                            // echoes incoming probes back to the sender
+                            // if it ever receives one without a prior
+                            // outbound ping.
+                            if (onProbeReply != null) {
+                                try { onProbeReply!!.invoke(probe.seq, probe.echoedNanos) } catch (_: Exception) {}
+                            }
+                        } else {
+                            // Probe request from sender — bounce back
+                            // via the same socket.
+                            replyToProbe(packet.address, packet.port, probe)
+                        }
+                        continue
+                    }
                     val parsed = PacketProtocol.parsePacket(packet.data, packet.length)
                     if (parsed != null) {
                         // Group/packet coherence check: a packet whose declared
@@ -306,8 +400,13 @@ class UdpReceiver {
 
     private fun processParsedPacket(parsed: PacketProtocol.ParsedPacket) {
         val now = System.currentTimeMillis()
+        // The legacy "currentLatencyMs" derived from a wall-clock delta
+        // has been retired — sender and receiver may be on different
+        // clocks (no NTP across phones), so this number is meaningless.
+        // Real link RTT now comes from UdpRttProbe on the sender side.
+        // We keep a tiny trace for debug only.
         if (parsed.timestampMs > 0 && parsed.timestampMs <= now) {
-            currentLatencyMs = (now - parsed.timestampMs).coerceIn(1, 1000)
+            currentWallClockDeltaMs = now - parsed.timestampMs
         }
 
         // Stale frame eviction has been moved to tickPeriodicWork to keep the hot path lightweight.
@@ -337,21 +436,20 @@ class UdpReceiver {
             )
         }
 
+        // FrameSeq-gap network-loss estimation has been REMOVED: see the
+        // note on the receiver-side counters above. True link-layer loss
+        // now comes from UdpRttProbe.lossPercent only.
+
         if (assembly.addPacket(parsed.packetIndex, parsed.payload)) {
             val completeFrame = assembly.assemble()
             frameBuffers.remove(parsed.frameSeq)
             windowReceivedFrames++
             totalReceivedFrames++
 
-            // Clean up old incomplete frames to prevent memory leaks
-            if (frameBuffers.size > 20) {
-                val oldestKeys = frameBuffers.keys().toList().sorted().take(10)
-                for (k in oldestKeys) {
-                    frameBuffers.remove(k)
-                    windowDroppedFrames++
-                    totalDroppedFrames++
-                }
-            }
+            // Memory-pressure eviction is now driven by the periodic worker
+            // on a real byte budget (see evictIfOverBudget below); the
+            // receive path no longer thrashes the buffer on every complete
+            // frame.
 
             // First few frames: log a digest so we can correlate with
             // decoder behavior. Subsequent frames: only log periodic samples
@@ -449,8 +547,8 @@ class UdpReceiver {
                     val staleEntries = fb.entries.filter { now - it.value.lastUpdateMs > STALE_FRAME_TIMEOUT_MS }
                     for (entry in staleEntries) {
                         fb.remove(entry.key)
-                        windowDroppedFrames++
-                        totalDroppedFrames++
+                        windowTimeoutDrops++
+                        totalTimeoutDrops++
                         val ageMs = now - entry.value.firstSeenMs
                         SessionLog.w(
                             TAG,
@@ -462,6 +560,8 @@ class UdpReceiver {
                     }
                 }
             }
+            // Independent of timeouts, also enforce the byte-budget guard.
+            evictIfOverBudget()
         }
 
         val elapsed = now - lastStatsResetTime
@@ -469,42 +569,119 @@ class UdpReceiver {
             currentFps = (windowReceivedFrames * 1000f) / elapsed
             currentBitrateMbps = (windowBytesReceived * 8f) / (elapsed * 1000f)
 
-            val totalExpected = (windowReceivedFrames + windowDroppedFrames).coerceAtLeast(1)
-            currentPacketLossPercent = (windowDroppedFrames * 100f) / totalExpected
+            // Receiver-side loss reporting. Network-layer loss is *not*
+            // computed here — the only reliable signal we have is the
+            // sender's UdpRttProbe lossPercent which arrives via
+            // QuestReceiverService.setRttStats(). We zero lossNetworkPct
+            // from this side; the override below means "the last value
+            // sent by the probe" if the receiver service has set one.
+            val totalConsidered =
+                (windowReceivedFrames + windowTimeoutDrops + windowEvictedDrops)
+                    .coerceAtLeast(1)
+            val lossTimeoutPct = (windowTimeoutDrops * 100f) / totalConsidered
+            val lossEvictedPct = (windowEvictedDrops * 100f) / totalConsidered
+            val inFlightBytes = videoFrameBuffers.values.sumOf { it.expectedBytes.toLong() } +
+                audioFrameBuffers.values.sumOf { it.expectedBytes.toLong() }
+
+            // Drop counts are receiver-side facts; network loss is
+            // sender-side. Don't blend them into one number.
+            val composite = (lossTimeoutPct + lossEvictedPct * 2f) / 3f
 
             val stats = StreamStats(
                 isReceiving = true,
                 fps = currentFps,
                 bitrateMbps = currentBitrateMbps,
-                latencyMs = currentLatencyMs,
+                latencyMs = currentWallClockDeltaMs,
                 totalFrames = totalReceivedFrames,
-                droppedFrames = totalDroppedFrames,
-                packetLossPercent = currentPacketLossPercent
+                droppedFrames = totalTimeoutDrops + totalEvictedDrops,
+                packetLossPercent = composite,
+                lossTimeoutPercent = lossTimeoutPct,
+                lossEvictedPercent = lossEvictedPct,
+                // lossNetworkPercent / rttMs filled in by
+                // QuestReceiverService from the probe.
+                lossNetworkPercent = lastReportedNetworkLossPercent,
+                rttMs = lastReportedRttMs,
+                inFlightBytes = inFlightBytes,
+                statsTimestampMs = now
             )
 
             onStatsUpdated?.invoke(stats)
 
             // Reset the sliding window. Cumulative counters keep growing.
             windowReceivedFrames = 0
-            windowDroppedFrames = 0
+            windowTimeoutDrops = 0
+            windowEvictedDrops = 0
             windowBytesReceived = 0
             lastStatsResetTime = now
         } else if (forceStats) {
             // SoTimeout tick that didn't cross the window boundary yet —
-            // still publish so the UI sees a live latency reading even when
+            // still publish so the UI sees a live reading even when
             // no packets are arriving.
-            val totalExpected = (windowReceivedFrames + windowDroppedFrames).coerceAtLeast(1)
-            currentPacketLossPercent = (windowDroppedFrames * 100f) / totalExpected
+            val totalConsidered =
+                (windowReceivedFrames + windowTimeoutDrops + windowEvictedDrops)
+                    .coerceAtLeast(1)
+            val lossTimeoutPct = (windowTimeoutDrops * 100f) / totalConsidered
+            val lossEvictedPct = (windowEvictedDrops * 100f) / totalConsidered
+            val inFlightBytes = videoFrameBuffers.values.sumOf { it.expectedBytes.toLong() } +
+                audioFrameBuffers.values.sumOf { it.expectedBytes.toLong() }
+            val composite = (lossTimeoutPct + lossEvictedPct * 2f) / 3f
             onStatsUpdated?.invoke(
                 StreamStats(
                     isReceiving = isListening,
                     fps = currentFps,
                     bitrateMbps = currentBitrateMbps,
-                    latencyMs = currentLatencyMs,
+                    latencyMs = currentWallClockDeltaMs,
                     totalFrames = totalReceivedFrames,
-                    droppedFrames = totalDroppedFrames,
-                    packetLossPercent = currentPacketLossPercent
+                    droppedFrames = totalTimeoutDrops + totalEvictedDrops,
+                    packetLossPercent = composite,
+                    lossTimeoutPercent = lossTimeoutPct,
+                    lossEvictedPercent = lossEvictedPct,
+                    lossNetworkPercent = lastReportedNetworkLossPercent,
+                    rttMs = lastReportedRttMs,
+                    inFlightBytes = inFlightBytes,
+                    statsTimestampMs = now
                 )
+            )
+        }
+    }
+
+    /**
+     * If the assembly buffers grow past [IN_FLIGHT_BYTE_BUDGET], drop
+     * frames (oldest first) until we are at half the budget. Compared to
+     * the previous "20-slot" hard cap this is honest about variable frame
+     * sizes (a single 200 KB keyframe ~ 200 frames of static content).
+     *
+     * Drops are tallied into [windowEvictedDrops] / [totalEvictedDrops].
+     */
+    private fun evictIfOverBudget() {
+        val video = videoFrameBuffers
+        val audio = audioFrameBuffers
+        if (video.isEmpty() && audio.isEmpty()) return
+
+        val videoBytes = video.values.sumOf { it.expectedBytes.toLong() }
+        val audioBytes = audio.values.sumOf { it.expectedBytes.toLong() }
+        val inFlight = videoBytes + audioBytes
+        if (inFlight <= IN_FLIGHT_BYTE_BUDGET) return
+
+        // Drop oldest assemblies until we are back under the budget.
+        // We tolerate eviction-driven transient loss because it's strictly
+        // less catastrophic than OOM; the alternative is dropping at the
+        // kernel level.
+        var freed = 0L
+        val ordered = (video.entries + audio.entries).sortedBy { it.value.firstSeenMs }
+        for (entry in ordered) {
+            if (inFlight - freed <= IN_FLIGHT_BYTE_BUDGET / 2) break
+            val key = entry.key
+            val fa = entry.value
+            val target = if (video.containsKey(key)) video else audio
+            target.remove(key)
+            windowEvictedDrops++
+            totalEvictedDrops++
+            freed += fa.expectedBytes
+            SessionLog.w(
+                TAG,
+                "evicted assembly seq=${fa.frameSeq} got=${fa.receivedCount}/${fa.totalPackets} " +
+                    "size=${fa.expectedBytes}B budget=$IN_FLIGHT_BYTE_BUDGET freed=$freed"
             )
         }
     }
@@ -526,6 +703,35 @@ class UdpReceiver {
             videoJitterQueue.clear()
             audioJitterQueue.clear()
         }
+        // Reset cumulative counters so a re-start of the receiver shows
+        // fresh numbers instead of forever-increasing totals.
+        totalReceivedFrames = 0
+        totalTimeoutDrops = 0
+        totalEvictedDrops = 0
+        totalBytesReceived = 0
+        totalMalformedPackets = 0
+        windowReceivedFrames = 0
+        windowTimeoutDrops = 0
+        windowEvictedDrops = 0
+        windowBytesReceived = 0
+    }
+
+    /**
+     * Reply to a sender-initiated RTT probe by echoing the same payload
+     * bytes back through the local socket. This is invoked from the
+     * listener thread when we identify a packet carrying FLAG_PING.
+     * The reply uses FLAG_PING_REPLY so the sender can correlate the
+     * packet back to the in-flight probe.
+     */
+    private fun replyToProbe(source: java.net.InetAddress, sourcePort: Int, probe: PacketProtocol.ProbeType) {
+        if (probe.isReply) return // never bounce a reply
+        val socket = socket ?: return
+        try {
+            val bytes = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
+            socket.send(DatagramPacket(bytes, bytes.size, source, sourcePort))
+        } catch (e: Exception) {
+            SessionLog.w(TAG, "replyToProbe failed: ${e.message}")
+        }
     }
 
     companion object {
@@ -533,5 +739,10 @@ class UdpReceiver {
         private const val STALE_FRAME_TIMEOUT_MS = 500L
         private const val STATS_WINDOW_MS = 1000L
         private const val STATS_TICK_MS = 250L
+        // Hard cap on the total bytes we hold in unfinished assemblies.
+        // 8 MB is roughly two full HD-keyframes at 16 Mbps / 250 ms — a
+        // very generous buffer that still caps the worst case of a
+        // stalled network keeping large keyframes hanging around.
+        private const val IN_FLIGHT_BYTE_BUDGET = 8 * 1024 * 1024L
     }
 }

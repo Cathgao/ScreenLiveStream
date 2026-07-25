@@ -28,6 +28,7 @@ import com.example.model.StreamConfig
 import com.example.model.StreamStats
 import com.example.model.VideoCodec
 import com.example.model.VideoResolution
+import com.example.net.UdpRttProbe
 import com.example.net.UdpStreamer
 
 class QuestSenderService : Service() {
@@ -39,6 +40,13 @@ class QuestSenderService : Service() {
     private var audioEncoder: AudioEncoder? = null
     private var muxerManager: MuxerManager? = null
     private val udpStreamer = UdpStreamer()
+    // Independent ping/echo used to derive real link RTT and a true
+    // network-layer loss rate (the legacy latencyMs number was based on
+    // wall-clock delta with no NTP-equivalent between phones; it always
+    // read as the upper clamp). Hooked up in startStreaming/stopStreaming.
+    private val udpRttProbe = UdpRttProbe()
+    @Volatile
+    private var latestRttStats: UdpRttProbe.ProbeStats? = null
 
     @Volatile
     var isStreaming = false
@@ -157,6 +165,46 @@ class QuestSenderService : Service() {
         }, null)
 
         udpStreamer.start(config.targetIp, config.targetPort)
+        // RTT probe uses its own UDP socket (separate from udpStreamer
+        // so media traffic and probe traffic don't compete for buffers).
+        // Hits the same targetIp:port — receiver's PacketProtocol.read
+        // path sniffs the FLAG_PING bit and bounces it back.
+        udpRttProbe.onStats = { stats ->
+            latestRttStats = stats
+            // Periodic log dump so we can correlate RTT/loss with
+            // visible artifacts on the sender side. Tag is "RttProbe"
+            // so it can be filtered with `adb logcat -s RttProbe`.
+            AppLogger.i(
+                "RttProbe",
+                "rtt=${stats.lastRttMs}ms avg=${stats.avgRttMs}ms p95=${stats.p95RttMs}ms " +
+                    "jitter=${stats.jitterMs}ms loss=${"%.1f".format(stats.lossPercent)}% " +
+                    "(sent=${stats.sentCount} lost=${stats.lostCount})"
+            )
+            // Mirror RTT into the StreamStats callback so the sender UI
+            // (when it grows stats) can read the same field names.
+            // We publish avgRttMs (not lastRttMs) because the *last*
+            // sample is dominated by cold-start jitter for the first
+            // ~6 windows after start(); avgRttMs is the steady-state
+            // value the user actually wants to see on the HUD.
+            val publishedRttMs = if (stats.avgRttMs > 0) stats.avgRttMs else stats.lastRttMs
+            onStatsUpdate?.invoke(
+                StreamStats(
+                    isStreaming = true,
+                    isReceiving = stats.windowSize > 0,
+                    latencyMs = publishedRttMs.toLong(),
+                    lossNetworkPercent = stats.lossPercent,
+                    statsTimestampMs = System.currentTimeMillis()
+                )
+            )
+            // Broadcast the rolling RTT / loss-percent to the receiver
+            // over the media socket so the receiver HUD can show the
+            // *same* numbers we logged here. Without this the receiver
+            // would be guessing, and earlier designs fell back to a
+            // wall-clock delta that was always clamped to ~1000 ms.
+            // The beacon is sent best-effort: dropping one is harmless.
+            udpStreamer.sendStatsBeacon(publishedRttMs, stats.lossPercent)
+        }
+        udpRttProbe.start(config.targetIp, config.targetPort)
 
         // Dynamically compute native width, height, refresh rate if Native Match (0) is specified
         val metrics = resources.displayMetrics
@@ -310,6 +358,13 @@ class QuestSenderService : Service() {
             udpStreamer.stop()
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error stopping udpStreamer", e)
+        }
+
+        try {
+            udpRttProbe.stop()
+            AppLogger.i(TAG, "udpRttProbe stopped.")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping udpRttProbe", e)
         }
 
         try {

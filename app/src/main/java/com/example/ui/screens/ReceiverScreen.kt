@@ -126,29 +126,102 @@ fun ReceiverScreen(
         }
 
         if (isListening) {
-            // Floating HUD Overlay (Always Visible, Backgroundless, semi-transparent compact layout)
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // Floating HUD Overlay with 50% black background so the digits are
+            // always readable regardless of what's behind them. Three rows:
+            //   row 1 — link quality (RTT, network-loss, in-flight bytes)
+            //   row 2 — frame / codec telemetry (fps, bitrate, resolution)
+            //   row 3 — receiver-side frame-drop breakdown (timeout / evicted /
+            //           network-gap / in-flight bytes)
+            Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(16.dp)
-                    .background(Color.Transparent)
-                    .padding(4.dp)
+                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                CompactHudStatItem(label = "FPS:", value = String.format("%.1f", stats.fps), color = NeonCyan.copy(alpha = 0.8f))
-                Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-                CompactHudStatItem(label = "码率:", value = String.format("%.1fM", stats.bitrateMbps), color = NeonPurple.copy(alpha = 0.8f))
-                Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-                CompactHudStatItem(label = "延迟:", value = "${stats.latencyMs}ms", color = LiveGreen.copy(alpha = 0.8f))
-                Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-                CompactHudStatItem(label = "丢包:", value = String.format("%.1f%%", stats.packetLossPercent), color = TextSecondary.copy(alpha = 0.8f))
-                if (videoWidth > 0 && videoHeight > 0) {
-                    Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
+                // ---- Row 1: link latency / network loss / in-flight buffer ----
+                // Real link RTT comes from the sender's UdpRttProbe mirrored
+                // here via FLAG_PING_STATS beacons (≈ once per second). Until
+                // the first beacon lands we show "等待" so users stop reading
+                // the bogus wall-clock delta that used to clamp at 1029 ms.
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val rttText = if (stats.rttMs > 0) "${stats.rttMs}ms" else "等待"
+                    val rttColor = when {
+                        stats.rttMs <= 0 -> TextSecondary.copy(alpha = 0.7f)
+                        stats.rttMs < 50 -> LiveGreen.copy(alpha = 0.9f)
+                        stats.rttMs < 150 -> NeonCyan.copy(alpha = 0.9f)
+                        else -> ErrorRed.copy(alpha = 0.9f)
+                    }
                     CompactHudStatItem(
-                        label = "格式:",
-                        value = "${videoWidth}x${videoHeight} (${if (videoWidth > videoHeight) "横屏" else "竖屏"})",
-                        color = NeonCyan.copy(alpha = 0.8f)
+                        label = "延迟(链路):",
+                        value = rttText,
+                        color = rttColor
+                    )
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CompactHudStatItem(
+                        label = "网络丢包率:",
+                        value = String.format("%.1f%%", stats.lossNetworkPercent),
+                        color = if (stats.lossNetworkPercent < 1f) LiveGreen.copy(alpha = 0.9f) else ErrorRed.copy(alpha = 0.9f)
+                    )
+                    CompactHudStatItem(
+                        label = "在途字节:",
+                        value = "${stats.inFlightBytes / 1024}KB",
+                        color = TextSecondary.copy(alpha = 0.7f)
+                    )
+                }
+                // ---- Row 2: fps / bitrate / codec info ----
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CompactHudStatItem(label = "FPS:", value = String.format("%.1f", stats.fps), color = NeonCyan.copy(alpha = 0.9f))
+                    CompactHudStatItem(label = "码率:", value = String.format("%.1fM", stats.bitrateMbps), color = NeonPurple.copy(alpha = 0.9f))
+                    if (videoWidth > 0 && videoHeight > 0) {
+                        CompactHudStatItem(
+                            label = "分辨率:",
+                            value = "${videoWidth}x${videoHeight} ${if (videoWidth > videoHeight) "横" else "竖"}",
+                            color = NeonCyan.copy(alpha = 0.9f)
+                        )
+                    }
+                }
+                // ---- Row 3: receiver-side frame-drop breakdown ----
+                // Three independent counters, color-coded so the dominant cause
+                // is visually obvious. The "总丢" sum is the user-facing
+                // frame-drop percentage.
+                // Note: "网络" is no longer a receiver-side estimator — it is
+                // the sender's UdpRttProbe lossPercent mirrored over the wire.
+                val totalLoss = stats.lossTimeoutPercent + stats.lossEvictedPercent
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CompactHudStatItem(
+                        label = "总丢帧:",
+                        value = String.format("%.1f%%", totalLoss),
+                        color = if (totalLoss < 1f) LiveGreen.copy(alpha = 0.9f) else ErrorRed.copy(alpha = 0.9f)
+                    )
+                    CompactHudStatItem(
+                        label = "超时:",
+                        value = String.format("%.1f%%", stats.lossTimeoutPercent),
+                        color = TextSecondary.copy(alpha = 0.8f)
+                    )
+                    CompactHudStatItem(
+                        label = "内存:",
+                        value = String.format("%.1f%%", stats.lossEvictedPercent),
+                        color = TextSecondary.copy(alpha = 0.8f)
+                    )
+                    CompactHudStatItem(
+                        label = "网络:",
+                        value = String.format("%.1f%%", stats.lossNetworkPercent),
+                        color = if (stats.lossNetworkPercent < 1f) LiveGreen.copy(alpha = 0.8f) else ErrorRed.copy(alpha = 0.8f)
                     )
                 }
             }
