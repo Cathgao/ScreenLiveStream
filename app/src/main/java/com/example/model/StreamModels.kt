@@ -13,9 +13,9 @@ enum class EyeCrop(val displayName: String, val sysPropValue: Int) {
     RIGHT("右眼", 1)
 }
 
-data class VideoResolution(val displayName: String, val width: Int, val height: Int) {
+data class VideoResolution(val displayName: String, val width: Int, val height: Int, val category: String = "") {
     companion object {
-        val DEFAULT = VideoResolution("原生 100%", 0, 0)
+        val DEFAULT = VideoResolution("原生 100%", 0, 0, "")
     }
 }
 
@@ -223,7 +223,11 @@ data class StreamStats(
      * latency instead of the wall-clock delta that used to clamp at
      * 1000 ms. 0 means "no beacon received yet".
      */
-    val rttMs: Int = 0
+    val rttMs: Int = 0,
+    /** Indicates if receiver is currently in 20s stream loss timeout countdown */
+    val isTimeoutCounting: Boolean = false,
+    /** Remaining seconds in the disconnect countdown */
+    val timeoutRemainingSec: Int = 0
 )
 
 data class DiscoveredDevice(

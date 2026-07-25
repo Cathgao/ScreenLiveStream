@@ -67,9 +67,15 @@ class MainActivity : ComponentActivity() {
     private val receiverConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as QuestReceiverService.LocalBinder
-            receiverService = binder.getService()
+            val svc = binder.getService()
+            receiverService = svc
             isReceiverBound = true
-            isReceiverListeningState = binder.getService().isListening
+            isReceiverListeningState = svc.isListening
+            svc.onListeningStateChanged = { listening ->
+                runOnUiThread {
+                    isReceiverListeningState = listening
+                }
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -116,11 +122,14 @@ class MainActivity : ComponentActivity() {
                                 contentColor = TextPrimary,
                                 modifier = Modifier.testTag("app_navigation_bar")
                             ) {
+                                val senderLabel = if (viewModel.isQuestDevice) "Quest 发送端" else "发送端"
+                                val receiverLabel = if (viewModel.isQuestDevice) "手机接收端" else "接收端"
+
                                 NavigationBarItem(
                                     selected = currentMode == AppMode.QUEST_SENDER,
                                     onClick = { viewModel.setAppMode(AppMode.QUEST_SENDER) },
                                     icon = { Icon(Icons.Default.Cast, contentDescription = "Sender") },
-                                    label = { Text("Quest 3 发送端", fontWeight = FontWeight.Bold) },
+                                    label = { Text(senderLabel, fontWeight = FontWeight.Bold) },
                                     colors = NavigationBarItemDefaults.colors(
                                         selectedIconColor = Color.Black,
                                         selectedTextColor = NeonCyan,
@@ -134,7 +143,7 @@ class MainActivity : ComponentActivity() {
                                     selected = currentMode == AppMode.MOBILE_RECEIVER,
                                     onClick = { viewModel.setAppMode(AppMode.MOBILE_RECEIVER) },
                                     icon = { Icon(Icons.Default.PhoneAndroid, contentDescription = "Receiver") },
-                                    label = { Text("手机接收端", fontWeight = FontWeight.Bold) },
+                                    label = { Text(receiverLabel, fontWeight = FontWeight.Bold) },
                                     colors = NavigationBarItemDefaults.colors(
                                         selectedIconColor = Color.Black,
                                         selectedTextColor = LiveGreen,

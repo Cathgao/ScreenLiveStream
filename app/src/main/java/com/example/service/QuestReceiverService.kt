@@ -42,6 +42,7 @@ class QuestReceiverService : Service() {
         private set
 
     var onStatsUpdated: ((StreamStats) -> Unit)? = null
+    var onListeningStateChanged: ((Boolean) -> Unit)? = null
 
     private var lastPort = 8888
     private var lastAutoAnnounce = true
@@ -49,6 +50,61 @@ class QuestReceiverService : Service() {
     private var lastProtocol = TransportProtocol.UDP
     
     private var lastStreamStopMs = 0L
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    @Volatile
+    private var hasReceivedFirstFrame = false
+    @Volatile
+    private var lastDataFrameTimeMs = 0L
+    @Volatile
+    private var isTimeoutCountdownActive = false
+    @Volatile
+    private var timeoutStartTimeMs = 0L
+    
+    private var latestStats = StreamStats()
+
+    private val timeoutCheckRunnable = object : Runnable {
+        override fun run() {
+            if (!isListening) return
+
+            val now = System.currentTimeMillis()
+
+            if (hasReceivedFirstFrame) {
+                val timeSinceLastData = now - lastDataFrameTimeMs
+
+                if (timeSinceLastData >= STREAM_STALL_THRESHOLD_MS || isTimeoutCountdownActive) {
+                    if (!isTimeoutCountdownActive) {
+                        isTimeoutCountdownActive = true
+                        timeoutStartTimeMs = if (lastDataFrameTimeMs > 0) lastDataFrameTimeMs else now
+                        AppLogger.w(TAG, "Stream stalled (no data for ${timeSinceLastData}ms). Started 20s disconnect countdown.")
+                    }
+
+                    val elapsedTimeout = now - timeoutStartTimeMs
+                    val remainingSec = ((TIMEOUT_DURATION_MS - elapsedTimeout) / 1000L).coerceAtLeast(0).toInt()
+
+                    if (elapsedTimeout >= TIMEOUT_DURATION_MS) {
+                        AppLogger.e(TAG, "Stream lost for 20 seconds. Considering offline and stopping listening.")
+                        stopListening()
+                        return
+                    } else {
+                        val updatedStats = latestStats.copy(
+                            isTimeoutCounting = true,
+                            timeoutRemainingSec = remainingSec
+                        )
+                        onStatsUpdated?.invoke(updatedStats)
+                    }
+                } else {
+                    if (isTimeoutCountdownActive) {
+                        isTimeoutCountdownActive = false
+                        AppLogger.i(TAG, "Stream data resumed. Cancelled 20s timeout timer.")
+                    }
+                }
+            }
+
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): QuestReceiverService = this@QuestReceiverService
@@ -127,12 +183,33 @@ class QuestReceiverService : Service() {
             UdpFecReceiver(port)
         }
         val currentReceiver = receiver!!
+
+        // Reset stream timeout state
+        hasReceivedFirstFrame = false
+        lastDataFrameTimeMs = 0L
+        isTimeoutCountdownActive = false
+        timeoutStartTimeMs = 0L
+        mainHandler.removeCallbacks(timeoutCheckRunnable)
+        mainHandler.postDelayed(timeoutCheckRunnable, 1000L)
         
         currentReceiver.onFrameAssembled = { frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq ->
+            val now = System.currentTimeMillis()
+            hasReceivedFirstFrame = true
+            lastDataFrameTimeMs = now
+            if (isTimeoutCountdownActive) {
+                isTimeoutCountdownActive = false
+                AppLogger.i(TAG, "Frame received, cancelling disconnect countdown.")
+            }
             videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
         }
 
-        currentReceiver.onAudioFrame = { frameBytes, isCodecConfig, _ ->
+        currentReceiver.onAudioFrame = { frameBytes, isCodecConfig, timestampMs ->
+            val now = System.currentTimeMillis()
+            hasReceivedFirstFrame = true
+            lastDataFrameTimeMs = now
+            if (isTimeoutCountdownActive) {
+                isTimeoutCountdownActive = false
+            }
             audioDecoder.decodeFrame(frameBytes, isCodecConfig)
         }
 
@@ -142,34 +219,29 @@ class QuestReceiverService : Service() {
 
         currentReceiver.onStreamStop = {
             val now = System.currentTimeMillis()
-            if (now - lastStreamStopMs > 3000L) {
-                lastStreamStopMs = now
-                AppLogger.i(TAG, "Stream stop signal received, calling stopListening and restarting in 500ms.")
-                
-                // 1. Stop listening completely
-                stopListening()
-                
-                // Reset stats and video size
-                onStatsUpdated?.invoke(com.example.model.StreamStats())
-                onVideoSizeChanged?.invoke(0, 0)
-                
-                // 2. Restart listening after 500ms
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    startListening(lastPort, lastAutoAnnounce, lastJitterBufferMs, lastProtocol)
-                    currentSurface?.let { surface ->
-                        if (surface.isValid) {
-                            videoDecoder.setSurface(surface)
-                        }
-                    }
-                }, 500L)
+            AppLogger.i(TAG, "Stream stop / interrupt signal received.")
+            if (hasReceivedFirstFrame) {
+                if (!isTimeoutCountdownActive) {
+                    isTimeoutCountdownActive = true
+                    timeoutStartTimeMs = now
+                    AppLogger.w(TAG, "Stream interrupted signal received. Starting 20s timeout timer...")
+                }
             } else {
-                AppLogger.d(TAG, "Duplicate STREAM_STOP signal ignored by debounce.")
+                AppLogger.i(TAG, "Stream stop received before initial frame; per requirements, 20s timer is not started.")
             }
         }
 
         currentReceiver.onStatsUpdated = { stats ->
-            // Populate active decoder name into stats
-            val updatedStats = stats.copy(codecName = videoDecoder.activeDecoderName)
+            val remainingSec = if (isTimeoutCountdownActive) {
+                ((TIMEOUT_DURATION_MS - (System.currentTimeMillis() - timeoutStartTimeMs)) / 1000L).coerceAtLeast(0).toInt()
+            } else 0
+
+            val updatedStats = stats.copy(
+                codecName = videoDecoder.activeDecoderName,
+                isTimeoutCounting = isTimeoutCountdownActive,
+                timeoutRemainingSec = remainingSec
+            )
+            latestStats = updatedStats
             onStatsUpdated?.invoke(updatedStats)
         }
         
@@ -179,11 +251,16 @@ class QuestReceiverService : Service() {
             lanDiscovery.startAnnouncing(port)
         }
         isListening = true
+        onListeningStateChanged?.invoke(true)
         AppLogger.i(TAG, "QuestReceiverService listening started on port $port, jitterBufferMs=$jitterBufferMs, protocol=${protocol.name}")
     }
 
     fun stopListening() {
+        mainHandler.removeCallbacks(timeoutCheckRunnable)
         isListening = false
+        hasReceivedFirstFrame = false
+        isTimeoutCountdownActive = false
+        
         receiver?.stop()
         videoDecoder.stop()
         audioDecoder.stop()
@@ -194,6 +271,12 @@ class QuestReceiverService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
+
+        // Reset stats and video size
+        onStatsUpdated?.invoke(com.example.model.StreamStats())
+        onVideoSizeChanged?.invoke(0, 0)
+
+        onListeningStateChanged?.invoke(false)
         AppLogger.i(TAG, "QuestReceiverService listening stopped")
     }
 
@@ -233,6 +316,9 @@ class QuestReceiverService : Service() {
         private const val TAG = "QuestReceiverService"
         private const val CHANNEL_ID = "quest_receiver_channel"
         private const val NOTIFICATION_ID = 1002
+
+        private const val STREAM_STALL_THRESHOLD_MS = 2000L
+        private const val TIMEOUT_DURATION_MS = 20000L
 
         const val EXTRA_LISTEN_PORT = "EXTRA_LISTEN_PORT"
         const val EXTRA_AUTO_ANNOUNCE = "EXTRA_AUTO_ANNOUNCE"

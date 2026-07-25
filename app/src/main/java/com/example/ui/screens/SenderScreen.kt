@@ -25,9 +25,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.log.AppLogger
@@ -354,28 +358,35 @@ fun SenderScreen(
         }
         
         if (viewModel.isQuestDevice) {
-            Spacer(modifier = Modifier.height(16.dp))
-            Text("选择投屏画面 (Quest)", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
-            Spacer(modifier = Modifier.height(6.dp))
-            @OptIn(ExperimentalLayoutApi::class)
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                EyeCrop.values().forEach { crop ->
-                    val selected = config.eyeCrop == crop
-                    FilterChip(
-                        selected = selected,
-                        onClick = { viewModel.updateEyeCrop(crop) },
-                        label = { Text(crop.displayName, fontWeight = FontWeight.Bold) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = NeonCyan,
-                            selectedLabelColor = Color.Black,
-                            containerColor = DarkCyberCard,
-                            labelColor = TextPrimary
+                Text(
+                    text = "选择投屏画面 (Quest)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary
+                )
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    EyeCrop.values().forEach { crop ->
+                        val selected = config.eyeCrop == crop
+                        FilterChip(
+                            selected = selected,
+                            onClick = { viewModel.updateEyeCrop(crop) },
+                            label = { Text(crop.displayName, fontWeight = FontWeight.Bold) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = NeonCyan,
+                                selectedLabelColor = Color.Black,
+                                containerColor = DarkCyberCard,
+                                labelColor = TextPrimary
+                            )
                         )
-                    )
+                    }
                 }
             }
         }
@@ -643,33 +654,111 @@ fun SenderScreen(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Resolution Selector
-                Text("推流分辨率", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
-                Spacer(modifier = Modifier.height(6.dp))
-                resolutionOptions.forEach { res ->
-                    val isSupported = caps?.let { res.width <= it.maxWidth && res.height <= it.maxHeight } ?: true
-                    val selected = config.resolution == res
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 2.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(
-                                if (selected) NeonCyan.copy(alpha = 0.15f)
-                                else if (!isSupported) DarkCyberCard.copy(alpha = 0.4f)
-                                else DarkCyberCard
-                            )
-                            .clickable(enabled = isSupported) { viewModel.updateResolution(res) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = if (isSupported) res.displayName else "${res.displayName} (⚠️ 编码芯片不支持此分辨率)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isSupported) TextPrimary else TextSecondary.copy(alpha = 0.5f)
+                if (viewModel.isQuestDevice) {
+                    val aspectRatios = remember(resolutionOptions) {
+                        resolutionOptions.map { it.category }.distinct().filter { it.isNotEmpty() }
+                    }
+                    var selectedAspectRatio by remember(config.resolution) {
+                        mutableStateOf(
+                            if (config.resolution.category.isNotEmpty()) config.resolution.category
+                            else aspectRatios.firstOrNull { it == "16:9" } ?: aspectRatios.firstOrNull() ?: "16:9"
                         )
-                        if (selected) {
-                            Icon(Icons.Default.Check, contentDescription = null, tint = NeonCyan, modifier = Modifier.size(16.dp))
+                    }
+
+                    Text("视频纵横比", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                    Spacer(modifier = Modifier.height(2.dp))
+
+                    @OptIn(ExperimentalLayoutApi::class)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        aspectRatios.forEach { ratio ->
+                            val selected = selectedAspectRatio == ratio
+                            FilterChip(
+                                selected = selected,
+                                onClick = {
+                                    selectedAspectRatio = ratio
+                                    if (config.resolution.category != ratio) {
+                                        resolutionOptions.firstOrNull { it.category == ratio }?.let { newRes ->
+                                            viewModel.updateResolution(newRes)
+                                        }
+                                    }
+                                },
+                                label = { Text(ratio, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = NeonCyan,
+                                    selectedLabelColor = Color.Black,
+                                    containerColor = DarkCyberCard,
+                                    labelColor = TextPrimary
+                                )
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("推流分辨率", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                    Spacer(modifier = Modifier.height(2.dp))
+
+                    val filteredResolutions = remember(selectedAspectRatio, resolutionOptions) {
+                        resolutionOptions.filter { it.category == selectedAspectRatio }
+                    }
+
+                    @OptIn(ExperimentalLayoutApi::class)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        filteredResolutions.forEach { res ->
+                            val isSupported = caps?.let { res.width <= it.maxWidth && res.height <= it.maxHeight } ?: true
+                            val selected = config.resolution.width == res.width && config.resolution.height == res.height
+                            FilterChip(
+                                selected = selected,
+                                enabled = isSupported,
+                                onClick = { viewModel.updateResolution(res) },
+                                label = { Text(res.displayName, fontSize = 12.sp, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = NeonCyan,
+                                    selectedLabelColor = Color.Black,
+                                    containerColor = DarkCyberCard,
+                                    labelColor = TextPrimary,
+                                    disabledContainerColor = DarkCyberCard.copy(alpha = 0.3f),
+                                    disabledLabelColor = TextSecondary.copy(alpha = 0.3f)
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    Text("推流分辨率", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    resolutionOptions.forEach { res ->
+                        val isSupported = caps?.let { res.width <= it.maxWidth && res.height <= it.maxHeight } ?: true
+                        val selected = config.resolution == res
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(
+                                    if (selected) NeonCyan.copy(alpha = 0.15f)
+                                    else if (!isSupported) DarkCyberCard.copy(alpha = 0.4f)
+                                    else DarkCyberCard
+                                )
+                                .clickable(enabled = isSupported) { viewModel.updateResolution(res) }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = if (isSupported) res.displayName else "${res.displayName} (⚠️ 编码芯片不支持此分辨率)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSupported) TextPrimary else TextSecondary.copy(alpha = 0.5f)
+                            )
+                            if (selected) {
+                                Icon(Icons.Default.Check, contentDescription = null, tint = NeonCyan, modifier = Modifier.size(16.dp))
+                            }
                         }
                     }
                 }
@@ -677,79 +766,81 @@ fun SenderScreen(
         }
         }
 
-        // Diagnostics & Log Export Card
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("log_export_card"),
-            colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
-            shape = RoundedCornerShape(16.dp)
+        // Diagnostics & Log Export Button + GitHub Link
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+            Button(
+                onClick = {
+                    val result = AppLogger.exportLogs(context)
+                    logExportResult = result
+                    android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NeonCyan,
+                    contentColor = Color.Black
+                ),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(56.dp)
+                    .testTag("export_logs_button")
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.BugReport,
-                        contentDescription = "Log Diagnostics Icon",
-                        tint = NeonCyan,
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "编码器与投屏诊断日志",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = TextPrimary
-                    )
-                }
-
-                Text(
-                    text = "日志包含：系统 AVC/HEVC 编码器列表、系统内部声音 (AudioPlaybackCapture) 录制状态、VirtualDisplay 及 MediaMuxer 录制详情。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
+                Icon(
+                    imageVector = Icons.Default.Save,
+                    contentDescription = null,
+                    tint = Color.Black,
+                    modifier = Modifier.size(20.dp)
                 )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "导出诊断日志到 Download 文件夹",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
 
-                Button(
-                    onClick = {
-                        val result = AppLogger.exportLogs(context)
-                        logExportResult = result
-                        android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().testTag("export_logs_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Save,
-                        contentDescription = null,
-                        tint = Color.Black,
-                        modifier = Modifier.size(18.dp)
+            Button(
+                onClick = {
+                    val intent = Intent(
+                        Intent.ACTION_VIEW,
+                        android.net.Uri.parse("https://github.com/Cathgao/ScreenLiveStream")
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "导出诊断日志到 Download 文件夹",
-                        color = Color.Black,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+                    context.startActivity(intent)
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NeonCyan,
+                    contentColor = Color.Black
+                ),
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier
+                    .size(56.dp)
+                    .testTag("github_button")
+            ) {
+                Icon(
+                    imageVector = GithubIcon,
+                    contentDescription = "GitHub Repository",
+                    tint = Color.Black,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+        }
 
-                logExportResult?.let { status ->
-                    Surface(
-                        color = DarkObsidian,
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = status,
-                            fontSize = 12.sp,
-                            color = LiveGreen,
-                            modifier = Modifier.padding(10.dp)
-                        )
-                    }
-                }
+        logExportResult?.let { status ->
+            Surface(
+                color = DarkCyberCard,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = status,
+                    fontSize = 12.sp,
+                    color = LiveGreen,
+                    modifier = Modifier.padding(10.dp)
+                )
             }
         }
     }
@@ -766,4 +857,42 @@ private fun isValidIp(ip: String): Boolean {
 private fun isValidPort(port: String): Boolean {
     val num = port.toIntOrNull() ?: return false
     return num in 1..65535
+}
+
+private val GithubIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "Github",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).path(fill = SolidColor(Color.Black)) {
+        moveTo(12f, 2f)
+        curveTo(6.477f, 2f, 2f, 6.484f, 2f, 12.017f)
+        curveTo(2f, 16.442f, 4.865f, 20.197f, 8.839f, 21.521f)
+        curveTo(9.339f, 21.613f, 9.521f, 21.304f, 9.521f, 21.038f)
+        curveTo(9.521f, 20.801f, 9.513f, 20.17f, 9.508f, 19.335f)
+        curveTo(6.726f, 19.94f, 6.139f, 17.992f, 6.139f, 17.992f)
+        curveTo(5.685f, 16.834f, 5.029f, 16.526f, 5.029f, 16.526f)
+        curveTo(4.121f, 15.906f, 5.09f, 15.918f, 5.09f, 15.918f)
+        curveTo(6.093f, 15.988f, 6.62f, 16.95f, 6.62f, 16.95f)
+        curveTo(7.512f, 18.48f, 8.961f, 18.038f, 9.53f, 17.782f)
+        curveTo(9.622f, 17.135f, 9.88f, 16.694f, 10.166f, 16.444f)
+        curveTo(7.946f, 16.191f, 5.611f, 15.331f, 5.611f, 11.493f)
+        curveTo(5.611f, 10.4f, 6.001f, 9.505f, 6.64f, 8.805f)
+        curveTo(6.537f, 8.552f, 6.194f, 7.533f, 6.738f, 6.155f)
+        curveTo(6.738f, 6.155f, 7.578f, 5.885f, 9.488f, 7.181f)
+        curveTo(10.287f, 6.959f, 11.142f, 6.848f, 11.992f, 6.844f)
+        curveTo(12.842f, 6.848f, 13.697f, 6.959f, 14.496f, 7.181f)
+        curveTo(16.406f, 5.885f, 17.246f, 6.155f, 17.246f, 6.155f)
+        curveTo(17.79f, 7.533f, 17.447f, 8.552f, 17.344f, 8.805f)
+        curveTo(17.983f, 9.505f, 18.373f, 10.4f, 18.373f, 11.493f)
+        curveTo(18.373f, 15.341f, 16.034f, 16.188f, 13.808f, 16.436f)
+        curveTo(14.167f, 16.745f, 14.486f, 17.356f, 14.486f, 18.291f)
+        curveTo(14.486f, 19.629f, 14.474f, 20.71f, 14.474f, 21.038f)
+        curveTo(14.474f, 21.306f, 14.654f, 21.618f, 15.162f, 21.52f)
+        curveTo(19.135f, 20.194f, 22f, 16.441f, 22f, 12.017f)
+        curveTo(22f, 6.484f, 17.523f, 2f, 12f, 2f)
+        close()
+    }.build()
 }

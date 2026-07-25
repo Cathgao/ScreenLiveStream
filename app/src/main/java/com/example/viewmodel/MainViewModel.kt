@@ -71,15 +71,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         initResolutionOptions()
-        val defaultRes = _resolutionOptions.value.firstOrNull()
-        if (defaultRes != null && (_streamConfig.value.resolution == VideoResolution.DEFAULT || _streamConfig.value.resolution.width == 0)) {
-            _streamConfig.value = _streamConfig.value.copy(resolution = defaultRes)
-        }
-        
         if (isQuestDevice) {
+            val defaultQuestRes = _resolutionOptions.value.find { it.width == 1920 && it.height == 1080 }
+                ?: VideoResolution("1920x1080", 1920, 1080, "16:9")
+            _streamConfig.value = _streamConfig.value.copy(resolution = defaultQuestRes)
             setSystemProperty("debug.oculus.screenCaptureEye", _streamConfig.value.eyeCrop.sysPropValue.toString())
             setSystemProperty("debug.oculus.capture.width", _streamConfig.value.resolution.width.toString())
             setSystemProperty("debug.oculus.capture.height", _streamConfig.value.resolution.height.toString())
+        } else {
+            val defaultRes = _resolutionOptions.value.firstOrNull()
+            if (defaultRes != null && (_streamConfig.value.resolution == VideoResolution.DEFAULT || _streamConfig.value.resolution.width == 0)) {
+                _streamConfig.value = _streamConfig.value.copy(resolution = defaultRes)
+            }
         }
 
         fetchLocalIp()
@@ -106,35 +109,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val options = mutableListOf<VideoResolution>()
 
         if (isQuestDevice) {
-            options.add(VideoResolution("1440x720 (Quest)", 1440, 720))
-            options.add(VideoResolution("2160x1080 (Quest)", 2160, 1080))
-            options.add(VideoResolution("2880x1440 (Quest)", 2880, 1440))
-            options.add(VideoResolution("3840x1920 (Quest)", 3840, 1920))
+            // 1:1 Aspect Ratio
+            options.add(VideoResolution("720x720", 720, 720, "1:1"))
+            options.add(VideoResolution("1024x1024", 1024, 1024, "1:1"))
+            options.add(VideoResolution("1080x1080", 1080, 1080, "1:1"))
+            options.add(VideoResolution("1440x1440", 1440, 1440, "1:1"))
+            options.add(VideoResolution("2160x2160", 2160, 2160, "1:1"))
+            options.add(VideoResolution("3840x3840", 3840, 3840, "1:1"))
+
+            // 16:9 Aspect Ratio
+            options.add(VideoResolution("1280x720", 1280, 720, "16:9"))
+            options.add(VideoResolution("1920x1080", 1920, 1080, "16:9"))
+            options.add(VideoResolution("2560x1440", 2560, 1440, "16:9"))
+            options.add(VideoResolution("3840x2160", 3840, 2160, "16:9"))
+
+            // 2:1 Aspect Ratio
+            options.add(VideoResolution("1440x720", 1440, 720, "2:1"))
+            options.add(VideoResolution("2160x1080", 2160, 1080, "2:1"))
+            options.add(VideoResolution("2880x1440", 2880, 1440, "2:1"))
+            options.add(VideoResolution("3840x1920", 3840, 1920, "2:1"))
         } else {
             // 1. 100% Native Scale
             val w100 = align16(nativeW)
             val h100 = align16(nativeH)
-            options.add(VideoResolution("原生 100% (${w100}x${h100})", w100, h100))
+            options.add(VideoResolution("原生 100% (${w100}x${h100})", w100, h100, ""))
     
             // 2. 75% Scale
             val w75 = align16((nativeW * 0.75f).toInt())
             val h75 = align16((nativeH * 0.75f).toInt())
-            options.add(VideoResolution("高清晰度 75% (${w75}x${h75})", w75, h75))
+            options.add(VideoResolution("高清晰度 75% (${w75}x${h75})", w75, h75, ""))
     
             // 3. 50% Scale
             val w50 = align16((nativeW * 0.50f).toInt())
             val h50 = align16((nativeH * 0.50f).toInt())
-            options.add(VideoResolution("平衡画质 50% (${w50}x${h50})", w50, h50))
+            options.add(VideoResolution("平衡画质 50% (${w50}x${h50})", w50, h50, ""))
     
             // 4. 33% Scale
             val w33 = align16((nativeW * 0.33f).toInt())
             val h33 = align16((nativeH * 0.33f).toInt())
-            options.add(VideoResolution("流畅画质 33% (${w33}x${h33})", w33, h33))
+            options.add(VideoResolution("流畅画质 33% (${w33}x${h33})", w33, h33, ""))
     
             // 5. 25% Scale
             val w25 = align16((nativeW * 0.25f).toInt())
             val h25 = align16((nativeH * 0.25f).toInt())
-            options.add(VideoResolution("极速推流 25% (${w25}x${h25})", w25, h25))
+            options.add(VideoResolution("极速推流 25% (${w25}x${h25})", w25, h25, ""))
         }
 
         _resolutionOptions.value = options
