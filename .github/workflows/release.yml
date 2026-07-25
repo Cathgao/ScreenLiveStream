@@ -33,7 +33,7 @@ jobs:
       # 2. 编译 Release APK（使用你 build.gradle.kts 中定义的变量名）
       - name: Build Release APK
         env:
-          KEYSTORE_PATH: release.jks
+          KEYSTORE_PATH: ${{ github.workspace }}/release.jks
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
