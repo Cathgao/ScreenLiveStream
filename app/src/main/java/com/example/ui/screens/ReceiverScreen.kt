@@ -61,6 +61,7 @@ fun ReceiverScreen(
         if (!isListening) {
             videoWidth = 0
             videoHeight = 0
+            viewModel.updateReceiverStats(com.example.model.StreamStats())
         }
     }
 
@@ -88,64 +89,68 @@ fun ReceiverScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Video Viewport using AndroidView SurfaceView
-        AndroidView(
-            modifier = Modifier
-                .fillMaxSize()
-                .testTag("receiver_surface_view"),
-            factory = { context ->
-                SurfaceView(context).apply {
-                    holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(holder: SurfaceHolder) {
-                            receiverService?.bindSurface(holder.surface)
-                        }
-
-                        override fun surfaceChanged(
-                            holder: SurfaceHolder,
-                            format: Int,
-                            width: Int,
-                            height: Int
-                        ) {
-                        }
-
-                        override fun surfaceDestroyed(holder: SurfaceHolder) {
-                            receiverService?.unbindSurface()
-                        }
-                    })
+        if (isListening) {
+            // Video Viewport using AndroidView SurfaceView
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("receiver_surface_view"),
+                factory = { context ->
+                    SurfaceView(context).apply {
+                        holder.addCallback(object : SurfaceHolder.Callback {
+                            override fun surfaceCreated(holder: SurfaceHolder) {
+                                receiverService?.bindSurface(holder.surface)
+                            }
+    
+                            override fun surfaceChanged(
+                                holder: SurfaceHolder,
+                                format: Int,
+                                width: Int,
+                                height: Int
+                            ) {
+                            }
+    
+                            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                receiverService?.unbindSurface()
+                            }
+                        })
+                    }
+                },
+                update = { surfaceView ->
+                    val holder = surfaceView.holder
+                    if (holder.surface.isValid) {
+                        receiverService?.bindSurface(holder.surface)
+                    }
                 }
-            },
-            update = { surfaceView ->
-                val holder = surfaceView.holder
-                if (holder.surface.isValid) {
-                    receiverService?.bindSurface(holder.surface)
-                }
-            }
-        )
+            )
+        }
 
-        // Floating HUD Overlay (Always Visible, Backgroundless, semi-transparent compact layout)
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(16.dp)
-                .background(Color.Transparent)
-                .padding(4.dp)
-        ) {
-            CompactHudStatItem(label = "FPS:", value = String.format("%.1f", stats.fps), color = NeonCyan.copy(alpha = 0.8f))
-            Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-            CompactHudStatItem(label = "码率:", value = String.format("%.1fM", stats.bitrateMbps), color = NeonPurple.copy(alpha = 0.8f))
-            Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-            CompactHudStatItem(label = "延迟:", value = "${stats.latencyMs}ms", color = LiveGreen.copy(alpha = 0.8f))
-            Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-            CompactHudStatItem(label = "丢包:", value = String.format("%.1f%%", stats.packetLossPercent), color = TextSecondary.copy(alpha = 0.8f))
-            if (videoWidth > 0 && videoHeight > 0) {
+        if (isListening) {
+            // Floating HUD Overlay (Always Visible, Backgroundless, semi-transparent compact layout)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(16.dp)
+                    .background(Color.Transparent)
+                    .padding(4.dp)
+            ) {
+                CompactHudStatItem(label = "FPS:", value = String.format("%.1f", stats.fps), color = NeonCyan.copy(alpha = 0.8f))
                 Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
-                CompactHudStatItem(
-                    label = "格式:",
-                    value = "${videoWidth}x${videoHeight} (${if (videoWidth > videoHeight) "横屏" else "竖屏"})",
-                    color = NeonCyan.copy(alpha = 0.8f)
-                )
+                CompactHudStatItem(label = "码率:", value = String.format("%.1fM", stats.bitrateMbps), color = NeonPurple.copy(alpha = 0.8f))
+                Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
+                CompactHudStatItem(label = "延迟:", value = "${stats.latencyMs}ms", color = LiveGreen.copy(alpha = 0.8f))
+                Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
+                CompactHudStatItem(label = "丢包:", value = String.format("%.1f%%", stats.packetLossPercent), color = TextSecondary.copy(alpha = 0.8f))
+                if (videoWidth > 0 && videoHeight > 0) {
+                    Text("|", fontSize = 10.sp, color = Color.White.copy(alpha = 0.3f))
+                    CompactHudStatItem(
+                        label = "格式:",
+                        value = "${videoWidth}x${videoHeight} (${if (videoWidth > videoHeight) "横屏" else "竖屏"})",
+                        color = NeonCyan.copy(alpha = 0.8f)
+                    )
+                }
             }
         }
 

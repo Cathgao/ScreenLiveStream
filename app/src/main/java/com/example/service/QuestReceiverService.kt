@@ -111,6 +111,12 @@ class QuestReceiverService : Service() {
         videoDecoder.stop()
         audioDecoder.stop()
         lanDiscovery.stopAnnouncing()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
         Log.d(TAG, "QuestReceiverService listening stopped")
     }
 
