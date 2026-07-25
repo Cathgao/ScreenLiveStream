@@ -200,6 +200,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _receiverConfig.value = _receiverConfig.value.copy(listenPort = port)
     }
 
+    fun updateReceiverJitterBuffer(ms: Int) {
+        _receiverConfig.value = _receiverConfig.value.copy(jitterBufferMs = ms)
+    }
+
     fun selectDiscoveredDevice(device: DiscoveredDevice) {
         _streamConfig.value = _streamConfig.value.copy(
             targetIp = device.ipAddress,

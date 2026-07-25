@@ -14,6 +14,7 @@ import android.util.Log
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
+import com.example.decoder.AudioDecoder
 import com.example.decoder.VideoDecoder
 import com.example.model.ReceiverConfig
 import com.example.model.StreamStats
@@ -25,6 +26,7 @@ class QuestReceiverService : Service() {
     private val binder = LocalBinder()
     val udpReceiver = UdpReceiver()
     val videoDecoder = VideoDecoder()
+    val audioDecoder = AudioDecoder()
     val lanDiscovery = LanDiscovery()
 
     @Volatile
@@ -47,8 +49,12 @@ class QuestReceiverService : Service() {
         super.onCreate()
         createNotificationChannel()
 
-        udpReceiver.onFrameAssembled = { frameBytes, isKeyframe, isCodecConfig, isHevc ->
-            videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc)
+        udpReceiver.onFrameAssembled = { frameBytes, isKeyframe, isCodecConfig, isHevc, _, seq ->
+            videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc, seq)
+        }
+
+        udpReceiver.onAudioFrame = { frameBytes, isCodecConfig, _ ->
+            audioDecoder.decodeFrame(frameBytes, isCodecConfig)
         }
 
         videoDecoder.onVideoSizeChanged = { w, h ->
@@ -59,6 +65,7 @@ class QuestReceiverService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val port = intent?.getIntExtra(EXTRA_LISTEN_PORT, 8888) ?: 8888
         val autoAnnounce = intent?.getBooleanExtra(EXTRA_AUTO_ANNOUNCE, true) ?: true
+        val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, 120) ?: 120
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -70,7 +77,7 @@ class QuestReceiverService : Service() {
             startForeground(NOTIFICATION_ID, createNotification(port))
         }
 
-        startListening(port, autoAnnounce)
+        startListening(port, autoAnnounce, jitterBufferMs)
 
         return START_STICKY
     }
@@ -84,22 +91,25 @@ class QuestReceiverService : Service() {
         currentSurface = null
         videoDecoder.setSurface(null)
         videoDecoder.stop()
+        audioDecoder.stop()
     }
 
-    fun startListening(port: Int = 8888, autoAnnounce: Boolean = true) {
+    fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 120) {
         stopListening()
+        udpReceiver.jitterBufferMs = jitterBufferMs
         udpReceiver.start(port)
         if (autoAnnounce) {
             lanDiscovery.startAnnouncing(port)
         }
         isListening = true
-        Log.d(TAG, "QuestReceiverService listening started on port $port")
+        Log.d(TAG, "QuestReceiverService listening started on port $port, jitterBufferMs=$jitterBufferMs")
     }
 
     fun stopListening() {
         isListening = false
         udpReceiver.stop()
         videoDecoder.stop()
+        audioDecoder.stop()
         lanDiscovery.stopAnnouncing()
         Log.d(TAG, "QuestReceiverService listening stopped")
     }
@@ -143,5 +153,6 @@ class QuestReceiverService : Service() {
 
         const val EXTRA_LISTEN_PORT = "EXTRA_LISTEN_PORT"
         const val EXTRA_AUTO_ANNOUNCE = "EXTRA_AUTO_ANNOUNCE"
+        const val EXTRA_JITTER_BUFFER_MS = "EXTRA_JITTER_BUFFER_MS"
     }
 }

@@ -1,7 +1,7 @@
 package com.example.net
 
 import android.util.Log
-import com.example.log.SessionLog
+import com.example.log.AppLogger as SessionLog
 import com.example.model.StreamStats
 import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
@@ -16,13 +16,14 @@ class UdpReceiver {
     private var isListening = false
     private var listenerThread: Thread? = null
 
-    // Callback for decoded frames: (frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs)
-    var onFrameAssembled: ((ByteArray, Boolean, Boolean, Boolean, Long) -> Unit)? = null
+    // Callback for decoded frames: (frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
+    var onFrameAssembled: ((ByteArray, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
     // Callback for completed audio frames: (aacBytes, isCodecConfig, timestampMs)
     var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
     var onStatsUpdated: ((StreamStats) -> Unit)? = null
 
-    private val frameBuffers = ConcurrentHashMap<Int, FrameAssembly>()
+    private val videoFrameBuffers = ConcurrentHashMap<Int, FrameAssembly>()
+    private val audioFrameBuffers = ConcurrentHashMap<Int, FrameAssembly>()
 
     // ---- Per-window stats (reset every STATS_WINDOW_MS) ----
     private var windowReceivedFrames = 0L
@@ -40,6 +41,119 @@ class UdpReceiver {
     private var totalBytesReceived = 0L
     private var totalMalformedPackets = 0L
     private val sessionStartTime = System.currentTimeMillis()
+
+    // Out-of-order and sender-reset tracking
+    private var lastVideoFrameSeq = -1
+    private var lastAudioFrameSeq = -1
+    private var lastVideoFrameTime = 0L
+    private var lastAudioFrameTime = 0L
+    private var lastEvictionTime = 0L
+
+    // ---- Jitter Buffer Configurations ----
+    @Volatile
+    var jitterBufferMs: Int = 120 // 0 means direct low-latency mode, >0 enables reordering buffer
+
+    private val videoJitterQueue = java.util.TreeMap<Int, JitterFrame>()
+    private val audioJitterQueue = java.util.TreeMap<Int, JitterFrame>()
+    private val jitterLock = Object()
+    private var dispatcherThread: Thread? = null
+
+    private class JitterFrame(
+        val seq: Int,
+        val timestampMs: Long,
+        val isAudio: Boolean,
+        val data: ByteArray,
+        val isKeyframe: Boolean,
+        val isCodecConfig: Boolean,
+        val isHevc: Boolean,
+        val assembledTimeMs: Long
+    )
+
+    private fun startDispatcher() {
+        synchronized(jitterLock) {
+            videoJitterQueue.clear()
+            audioJitterQueue.clear()
+        }
+        dispatcherThread = thread(start = true, name = "UdpReceiverDispatcher") {
+            try {
+                while (isListening) {
+                    var nextVideoFrame: JitterFrame? = null
+                    var nextAudioFrame: JitterFrame? = null
+                    val nowMs = System.currentTimeMillis()
+
+                    synchronized(jitterLock) {
+                        // 1. Process Video Queue
+                        if (videoJitterQueue.isNotEmpty()) {
+                            val firstKey = videoJitterQueue.firstKey()
+                            val frame = videoJitterQueue[firstKey]!!
+                            // Codec config frames are dispatched immediately
+                            if (frame.isCodecConfig || jitterBufferMs <= 0 || (nowMs - frame.assembledTimeMs) >= jitterBufferMs) {
+                                videoJitterQueue.remove(firstKey)
+                                nextVideoFrame = frame
+                            }
+                        }
+
+                        // 2. Process Audio Queue
+                        if (audioJitterQueue.isNotEmpty()) {
+                            val firstKey = audioJitterQueue.firstKey()
+                            val frame = audioJitterQueue[firstKey]!!
+                            if (frame.isCodecConfig || jitterBufferMs <= 0 || (nowMs - frame.assembledTimeMs) >= jitterBufferMs) {
+                                audioJitterQueue.remove(firstKey)
+                                nextAudioFrame = frame
+                            }
+                        }
+
+                        if (nextVideoFrame == null && nextAudioFrame == null) {
+                            val waitTime = 5L
+                            jitterLock.wait(waitTime)
+                        }
+                    }
+
+                    // Dispatch outside of lock to keep loop fast
+                    nextVideoFrame?.let { frame ->
+                        val isRestart = frame.isCodecConfig || 
+                                        frame.seq < lastVideoFrameSeq - 100 || 
+                                        (System.currentTimeMillis() - lastVideoFrameTime > 2000)
+                        if (isRestart || frame.seq > lastVideoFrameSeq) {
+                            lastVideoFrameSeq = frame.seq
+                            lastVideoFrameTime = System.currentTimeMillis()
+                            onFrameAssembled?.invoke(
+                                frame.data,
+                                frame.isKeyframe,
+                                frame.isCodecConfig,
+                                frame.isHevc,
+                                frame.timestampMs,
+                                frame.seq
+                            )
+                        } else {
+                            SessionLog.w(TAG, "Dropped stale video frame in dispatcher: seq=${frame.seq}, last=$lastVideoFrameSeq")
+                        }
+                    }
+
+                    nextAudioFrame?.let { frame ->
+                        val isRestart = frame.isCodecConfig || 
+                                        frame.seq < lastAudioFrameSeq - 100 || 
+                                        (System.currentTimeMillis() - lastAudioFrameTime > 2000)
+                        if (isRestart || frame.seq > lastAudioFrameSeq) {
+                            lastAudioFrameSeq = frame.seq
+                            lastAudioFrameTime = System.currentTimeMillis()
+                            onAudioFrame?.invoke(
+                                frame.data,
+                                frame.isCodecConfig,
+                                frame.timestampMs
+                            )
+                        } else {
+                            SessionLog.w(TAG, "Dropped stale audio frame in dispatcher: seq=${frame.seq}, last=$lastAudioFrameSeq")
+                        }
+                    }
+                }
+            } catch (e: InterruptedException) {
+                // Thread interrupted, exit loop
+            } catch (e: Exception) {
+                SessionLog.e(TAG, "Error in UdpReceiver dispatcher thread", e)
+            }
+        }
+    }
 
     private class FrameAssembly(
         val frameSeq: Int,
@@ -78,11 +192,15 @@ class UdpReceiver {
     fun start(port: Int) {
         stop()
         isListening = true
+        startDispatcher()
         listenerThread = thread(start = true, name = "UdpReceiverThread") {
             try {
-                val ds = DatagramSocket(port)
-                val requestedReceiveBuffer = 2 * 1024 * 1024 // 2MB receive socket buffer for high throughput
-                ds.receiveBufferSize = requestedReceiveBuffer
+                val requestedReceiveBuffer = 4 * 1024 * 1024 // 4MB receive socket buffer for high-throughput
+                val ds = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    receiveBufferSize = requestedReceiveBuffer
+                    bind(java.net.InetSocketAddress(port))
+                }
                 // The kernel may clamp this to its SO_RCVBUF limit; log the actual
                 // value so we can spot a too-small buffer as a cause of drops.
                 val actualReceiveBuffer = ds.receiveBufferSize
@@ -161,7 +279,7 @@ class UdpReceiver {
                         SessionLog.i(
                             TAG,
                             "rx diag: pkts=$pktCounter malformed=$malformedCounter " +
-                                "completedFrames(total)=$totalReceivedFrames pendingAssemblies=${frameBuffers.size}"
+                                "completedFrames(total)=$totalReceivedFrames pendingAssemblies=${videoFrameBuffers.size + audioFrameBuffers.size}"
                         )
                     }
                     tickPeriodicWork(forceStats = false)
@@ -192,32 +310,9 @@ class UdpReceiver {
             currentLatencyMs = (now - parsed.timestampMs).coerceIn(1, 1000)
         }
 
-        // Evict stale partial assemblies. Without this, a frame whose last
-        // packets were lost in transit would sit in the map until 20 newer
-        // seq numbers accumulated and forced it out — wasting memory and
-        // skewing stats. 500ms is well under the sender's 1.5s keyframe
-        // cadence so we never throw away a frame that might still complete.
-        if (frameBuffers.isNotEmpty()) {
-            val staleEntries = frameBuffers.entries.filter { now - it.value.lastUpdateMs > STALE_FRAME_TIMEOUT_MS }
-            for (entry in staleEntries) {
-                frameBuffers.remove(entry.key)
-                windowDroppedFrames++
-                totalDroppedFrames++
-                // Log expired assemblies: we want to know whether we're
-                // systematically losing the same kind of frame (keyframe vs
-                // P-frame, audio vs video) — that's a hint that something
-                // upstream is wrong rather than random UDP loss.
-                val ageMs = now - entry.value.firstSeenMs
-                SessionLog.w(
-                    TAG,
-                    "expired assembly seq=${entry.value.frameSeq} ageMs=$ageMs " +
-                        "got=${entry.value.receivedCount}/${entry.value.totalPackets} " +
-                        "key=${entry.value.isKeyframe} cfg=${entry.value.isCodecConfig} " +
-                        "hevc=${entry.value.isHevc} audio=${entry.value.isAudio}"
-                )
-            }
-        }
+        // Stale frame eviction has been moved to tickPeriodicWork to keep the hot path lightweight.
 
+        val frameBuffers = if (parsed.isAudio) audioFrameBuffers else videoFrameBuffers
         val assembly = frameBuffers.getOrPut(parsed.frameSeq) {
             FrameAssembly(
                 frameSeq = parsed.frameSeq,
@@ -270,17 +365,69 @@ class UdpReceiver {
                 )
             }
 
-            if (assembly.isAudio) {
-                // Audio frames skip the video decoder; route directly to AudioTrack.
-                onAudioFrame?.invoke(completeFrame, assembly.isCodecConfig, assembly.timestampMs)
+            if (jitterBufferMs <= 0) {
+                if (assembly.isAudio) {
+                    val nowMs = System.currentTimeMillis()
+                    // Check if sender reset (restarted): seq number wrapped or massive pause
+                    val isRestart = assembly.isCodecConfig || 
+                                    parsed.frameSeq < lastAudioFrameSeq - 100 || 
+                                    (nowMs - lastAudioFrameTime > 2000)
+                    if (isRestart || parsed.frameSeq > lastAudioFrameSeq) {
+                        lastAudioFrameSeq = parsed.frameSeq
+                        lastAudioFrameTime = nowMs
+                        // Audio frames skip the video decoder; route directly to AudioTrack.
+                        onAudioFrame?.invoke(completeFrame, assembly.isCodecConfig, assembly.timestampMs)
+                    } else {
+                        SessionLog.w(TAG, "Dropped out-of-order audio frame: seq=${parsed.frameSeq}, last=$lastAudioFrameSeq")
+                    }
+                } else {
+                    val nowMs = System.currentTimeMillis()
+                    // Check if sender reset (restarted): seq number wrapped or massive pause
+                    val isRestart = assembly.isCodecConfig || 
+                                    parsed.frameSeq < lastVideoFrameSeq - 100 || 
+                                    (nowMs - lastVideoFrameTime > 2000)
+                    if (isRestart || parsed.frameSeq > lastVideoFrameSeq) {
+                        lastVideoFrameSeq = parsed.frameSeq
+                        lastVideoFrameTime = nowMs
+                        onFrameAssembled?.invoke(
+                            completeFrame,
+                            assembly.isKeyframe,
+                            assembly.isCodecConfig,
+                            assembly.isHevc,
+                            assembly.timestampMs,
+                            parsed.frameSeq
+                        )
+                    } else {
+                        SessionLog.w(TAG, "Dropped out-of-order video frame: seq=${parsed.frameSeq}, last=$lastVideoFrameSeq")
+                    }
+                }
             } else {
-                onFrameAssembled?.invoke(
-                    completeFrame,
-                    assembly.isKeyframe,
-                    assembly.isCodecConfig,
-                    assembly.isHevc,
-                    assembly.timestampMs
+                val jitterFrame = JitterFrame(
+                    seq = parsed.frameSeq,
+                    timestampMs = assembly.timestampMs,
+                    isAudio = assembly.isAudio,
+                    data = completeFrame,
+                    isKeyframe = assembly.isKeyframe,
+                    isCodecConfig = assembly.isCodecConfig,
+                    isHevc = assembly.isHevc,
+                    assembledTimeMs = System.currentTimeMillis()
                 )
+                synchronized(jitterLock) {
+                    if (assembly.isAudio) {
+                        audioJitterQueue[parsed.frameSeq] = jitterFrame
+                        if (audioJitterQueue.size > 50) {
+                            val oldestKey = audioJitterQueue.firstKey()
+                            audioJitterQueue.remove(oldestKey)
+                        }
+                    } else {
+                        videoJitterQueue[parsed.frameSeq] = jitterFrame
+                        if (videoJitterQueue.size > 50) {
+                            val oldestKey = videoJitterQueue.firstKey()
+                            videoJitterQueue.remove(oldestKey)
+                        }
+                    }
+                    jitterLock.notifyAll()
+                }
             }
         }
     }
@@ -292,6 +439,31 @@ class UdpReceiver {
      */
     private fun tickPeriodicWork(forceStats: Boolean) {
         val now = System.currentTimeMillis()
+
+        // Periodically evict stale frame assemblies (every 250ms instead of on every packet)
+        if (now - lastEvictionTime >= STATS_TICK_MS) {
+            lastEvictionTime = now
+            val listsToEvict = listOf(videoFrameBuffers, audioFrameBuffers)
+            for (fb in listsToEvict) {
+                if (fb.isNotEmpty()) {
+                    val staleEntries = fb.entries.filter { now - it.value.lastUpdateMs > STALE_FRAME_TIMEOUT_MS }
+                    for (entry in staleEntries) {
+                        fb.remove(entry.key)
+                        windowDroppedFrames++
+                        totalDroppedFrames++
+                        val ageMs = now - entry.value.firstSeenMs
+                        SessionLog.w(
+                            TAG,
+                            "expired assembly seq=${entry.value.frameSeq} ageMs=$ageMs " +
+                                "got=${entry.value.receivedCount}/${entry.value.totalPackets} " +
+                                "key=${entry.value.isKeyframe} cfg=${entry.value.isCodecConfig} " +
+                                "hevc=${entry.value.isHevc} audio=${entry.value.isAudio}"
+                        )
+                    }
+                }
+            }
+        }
+
         val elapsed = now - lastStatsResetTime
         if (elapsed >= STATS_WINDOW_MS) {
             currentFps = (windowReceivedFrames * 1000f) / elapsed
@@ -339,13 +511,21 @@ class UdpReceiver {
 
     fun stop() {
         isListening = false
+        synchronized(jitterLock) {
+            jitterLock.notifyAll()
+        }
         try {
             socket?.close()
         } catch (e: Exception) {
             // Ignore
         }
         socket = null
-        frameBuffers.clear()
+        videoFrameBuffers.clear()
+        audioFrameBuffers.clear()
+        synchronized(jitterLock) {
+            videoJitterQueue.clear()
+            audioJitterQueue.clear()
+        }
     }
 
     companion object {

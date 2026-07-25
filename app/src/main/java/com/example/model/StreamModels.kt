@@ -177,7 +177,8 @@ data class EncoderCapabilities(
 data class ReceiverConfig(
     val listenPort: Int = 8888,
     val autoAnnounce: Boolean = true,
-    val lowLatencyMode: Boolean = true
+    val lowLatencyMode: Boolean = true,
+    val jitterBufferMs: Int = 300
 )
 
 data class StreamStats(

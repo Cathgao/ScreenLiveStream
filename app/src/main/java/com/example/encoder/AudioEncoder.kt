@@ -131,13 +131,28 @@ class AudioEncoder(
                         } else {
                             val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                             if (outputBuffer != null) {
-                                if (bufferInfo.size > 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                                val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                
+                                val data = ByteArray(bufferInfo.size)
+                                val originalPosition = outputBuffer.position()
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.get(data)
+                                
+                                val timestampMs = System.currentTimeMillis()
+                                
+                                if (isConfig) {
+                                    AppLogger.i(TAG, "Audio Encoder produced AAC CodecConfig, size: ${bufferInfo.size} bytes")
+                                    udpStreamer?.sendAudioFrame(data, data.size, timestampMs, true)
+                                } else {
                                     audioFrameCount++
                                     if (audioFrameCount == 1L || audioFrameCount % 200L == 0L) {
                                         AppLogger.i(TAG, "Audio Encoder captured & encoded AAC frame #$audioFrameCount, size: ${bufferInfo.size} bytes")
                                     }
 
-                                    // Write to MuxerManager
+                                    udpStreamer?.sendAudioFrame(data, data.size, timestampMs, false)
+
+                                    // Restore position for Muxer
+                                    outputBuffer.position(bufferInfo.offset)
                                     muxerManager?.writeAudioSample(outputBuffer, bufferInfo)
                                 }
                             }
