@@ -68,6 +68,16 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     dp.length = buffer.size
                     socket?.receive(dp)
                     val length = dp.length
+                    
+                    if (length >= PacketProtocol.HEADER_SIZE + 8) {
+                        val probe = PacketProtocol.readProbeSequence(buffer, length)
+                        if (probe != null && !probe.isReply) {
+                            val reply = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
+                            socket?.send(DatagramPacket(reply, reply.size, dp.address, dp.port))
+                            continue
+                        }
+                    }
+                    
                     if (length < 28) continue
                     
                     val bb = ByteBuffer.wrap(buffer, 0, length)

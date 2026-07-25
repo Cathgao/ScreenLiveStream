@@ -16,18 +16,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class AudioEncoder(
     private val mediaProjection: MediaProjection,
-    private val tcpStreamer: IStreamer? = null,
-    private var muxerManager: MuxerManager? = null
+    private val tcpStreamer: IStreamer? = null
 ) {
     private var audioRecord: AudioRecord? = null
     private var audioCodec: MediaCodec? = null
     private var captureThread: Thread? = null
 
     private val isRunning = AtomicBoolean(false)
-
-    fun setMuxerManager(muxer: MuxerManager?) {
-        this.muxerManager = muxer
-    }
 
     @SuppressLint("MissingPermission")
     fun start() {
@@ -127,7 +122,6 @@ class AudioEncoder(
                         if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             val newFormat = codec.outputFormat
                             AppLogger.i(TAG, "Audio Encoder output format changed: $newFormat")
-                            muxerManager?.setAudioFormat(newFormat)
                         } else {
                             val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                             if (outputBuffer != null) {
@@ -150,10 +144,6 @@ class AudioEncoder(
                                     }
 
                                     tcpStreamer?.sendAudioFrame(data, data.size, timestampMs, false)
-
-                                    // Restore position for Muxer
-                                    outputBuffer.position(bufferInfo.offset)
-                                    muxerManager?.writeAudioSample(outputBuffer, bufferInfo)
                                 }
                             }
                             codec.releaseOutputBuffer(outputBufferIndex, false)

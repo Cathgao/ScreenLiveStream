@@ -266,7 +266,7 @@ fun SenderScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = dev.deviceName,
+                                        text = if (dev.ipAddress == localIp) "本机" else dev.deviceName,
                                         fontWeight = FontWeight.Bold,
                                         color = TextPrimary,
                                         fontSize = 14.sp,

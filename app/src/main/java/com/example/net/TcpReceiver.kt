@@ -58,9 +58,35 @@ class TcpReceiver : IReceiver {
     private var totalReceivedFrames = 0L
     private var totalBytesReceived = 0L
 
+    private var udpProbeSocket: java.net.DatagramSocket? = null
+    private var udpProbeThread: Thread? = null
+
     override fun start(port: Int) {
         stop()
         isListening = true
+
+        udpProbeThread = thread(start = true, name = "TcpReceiverUdpProbeThread") {
+            try {
+                val ds = java.net.DatagramSocket(port)
+                udpProbeSocket = ds
+                val buffer = ByteArray(2000)
+                val dp = java.net.DatagramPacket(buffer, buffer.size)
+                while (isListening && !ds.isClosed) {
+                    dp.length = buffer.size
+                    ds.receive(dp)
+                    val length = dp.length
+                    if (length >= PacketProtocol.HEADER_SIZE + 8) {
+                        val probe = PacketProtocol.readProbeSequence(buffer, length)
+                        if (probe != null && !probe.isReply) {
+                            val reply = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
+                            ds.send(java.net.DatagramPacket(reply, reply.size, dp.address, dp.port))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }
 
         listenerThread = thread(start = true, name = "TcpReceiverListenerThread") {
             try {
@@ -208,6 +234,14 @@ class TcpReceiver : IReceiver {
             // Ignore
         }
         serverSocket = null
+        try {
+            udpProbeSocket?.close()
+        } catch (e: Exception) {}
+        udpProbeSocket = null
+        try {
+            udpProbeThread?.interrupt()
+        } catch (e: Exception) {}
+        udpProbeThread = null
         try {
             currentClientSocket?.close()
         } catch (e: Exception) {}

@@ -95,6 +95,20 @@ class QuestReceiverService : Service() {
     fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 50, protocol: TransportProtocol = TransportProtocol.UDP) {
         stopListening()
         
+        lanDiscovery.deviceNameProvider = {
+            var customName: String? = null
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
+                    customName = android.provider.Settings.Global.getString(contentResolver, android.provider.Settings.Global.DEVICE_NAME)
+                } else {
+                    customName = android.provider.Settings.Secure.getString(contentResolver, "bluetooth_name")
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to get device name", e)
+            }
+            customName ?: ""
+        }
+
         receiver = if (protocol == TransportProtocol.TCP) {
             TcpReceiver()
         } else {

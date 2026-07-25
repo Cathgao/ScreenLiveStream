@@ -21,8 +21,7 @@ class VideoEncoder(
     private val overrideWidth: Int = 0,
     private val overrideHeight: Int = 0,
     private val overrideFps: Int = 0,
-    private val context: Context? = null,
-    private var muxerManager: MuxerManager? = null
+    private val context: Context? = null
 ) {
     private var codec: MediaCodec? = null
     private var renderer: SurfaceCropRenderer? = null
@@ -35,10 +34,6 @@ class VideoEncoder(
 
     val inputSurface: Surface?
         get() = renderer?.inputSurface
-
-    fun setMuxerManager(muxer: MuxerManager?) {
-        this.muxerManager = muxer
-    }
 
     fun start() {
         try {
@@ -190,18 +185,12 @@ class VideoEncoder(
                         if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             val newFormat = mc.outputFormat
                             AppLogger.i(TAG, "Encoder output format changed: $newFormat")
-                            muxerManager?.setVideoFormat(newFormat)
                         } else {
                             totalOutputFrames++
                             val outputBuffer: ByteBuffer? = mc.getOutputBuffer(outputIndex)
                             if (outputBuffer != null && bufferInfo.size > 0) {
                                 val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                                 val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-
-                                // Write sample to MP4 via MuxerManager
-                                if (!isCodecConfig) {
-                                    muxerManager?.writeVideoSample(outputBuffer, bufferInfo)
-                                }
 
                                 outputBuffer.position(bufferInfo.offset)
                                 outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
@@ -274,7 +263,7 @@ class VideoEncoder(
                             // Periodic logging every 60 frames or 3 seconds
                             if (totalOutputFrames % 60 == 0 || now - lastLogTime > 3000) {
                                 lastLogTime = now
-                                AppLogger.i(TAG, "Encoder Stats: Total Encoded Frames=$totalOutputFrames | Muxer Video Frames=${muxerManager?.videoFramesWritten ?: 0} | Audio Frames=${muxerManager?.audioFramesWritten ?: 0}")
+                                AppLogger.i(TAG, "Encoder Stats: Total Encoded Frames=$totalOutputFrames")
                             }
                         }
 

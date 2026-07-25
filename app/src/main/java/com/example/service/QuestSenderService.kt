@@ -19,7 +19,6 @@ import android.view.Display
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.encoder.AudioEncoder
-import com.example.encoder.MuxerManager
 import com.example.encoder.VideoEncoder
 import com.example.log.AppLogger
 import com.example.model.BitrateMode
@@ -41,7 +40,6 @@ class QuestSenderService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
-    private var muxerManager: MuxerManager? = null
     private var streamer: IStreamer? = null
     // Independent ping/echo used to derive real link RTT and a true
     // network-layer loss rate (the legacy latencyMs number was based on
@@ -254,18 +252,13 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Dynamic Native Match parameters: $effWidth x $effHeight @ $effFps FPS (Metrics: ${metrics.widthPixels}x${metrics.heightPixels}, Density: ${metrics.densityDpi})")
 
-        // Disable recording to disk
-        val mux: MuxerManager? = null
-        muxerManager = mux
-
         val enc = VideoEncoder(
             config = config,
             tcpStreamer = currentStreamer,
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
-            context = this,
-            muxerManager = mux
+            context = this
         )
         enc.start()
         encoder = enc
@@ -274,8 +267,7 @@ class QuestSenderService : Service() {
         try {
             val audioEnc = AudioEncoder(
                 mediaProjection = projection,
-                tcpStreamer = currentStreamer,
-                muxerManager = mux
+                tcpStreamer = currentStreamer
             )
             audioEnc.start()
             audioEncoder = audioEnc
@@ -356,13 +348,6 @@ class QuestSenderService : Service() {
         encoder = null
 
         try {
-            muxerManager?.stop()
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error stopping muxerManager", e)
-        }
-        muxerManager = null
-
-        try {
             streamer?.stop()
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error stopping streamer", e)
@@ -406,7 +391,6 @@ class QuestSenderService : Service() {
     private fun recreateEncoderAndVirtualDisplay(screenWidth: Int, screenHeight: Int) {
         val config = savedConfig ?: return
         val projection = mediaProjection ?: return
-        val mux = muxerManager
 
         AppLogger.i(TAG, "Recreating VideoEncoder for new screen dimensions ${screenWidth}x${screenHeight}...")
 
@@ -470,8 +454,7 @@ class QuestSenderService : Service() {
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
-            context = this,
-            muxerManager = mux
+            context = this
         )
         try {
             enc.start()

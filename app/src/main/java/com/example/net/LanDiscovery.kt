@@ -20,6 +20,7 @@ class LanDiscovery {
 
     val discoveredDevices = ConcurrentHashMap<String, DiscoveredDevice>()
     var onDevicesUpdated: ((List<DiscoveredDevice>) -> Unit)? = null
+    var deviceNameProvider: (() -> String)? = null
 
     fun startScanning() {
         if (isScanning) return
@@ -103,9 +104,6 @@ class LanDiscovery {
         if (isAnnouncing) return
         isAnnouncing = true
 
-        val manufacturerName = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
-        val deviceName = "$manufacturerName ${Build.MODEL}"
-
         thread(start = true, name = "LanDiscoveryAnnouncer") {
             try {
                 val ds = DatagramSocket(null).apply {
@@ -128,6 +126,11 @@ class LanDiscovery {
                         val message = String(packet.data, 0, packet.length).trim()
 
                         if (message == PacketProtocol.DISCOVERY_PING) {
+                            val manufacturerName = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                            val fallbackName = "$manufacturerName ${Build.MODEL}"
+                            val customName = deviceNameProvider?.invoke()
+                            val deviceName = if (!customName.isNullOrBlank()) customName else fallbackName
+
                             val replyMsg = "${PacketProtocol.DISCOVERY_ACK_PREFIX}$deviceName:$listenPort"
                             val replyBytes = replyMsg.toByteArray()
                             val replyPacket = DatagramPacket(

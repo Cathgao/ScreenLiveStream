@@ -155,6 +155,12 @@ fun ReceiverScreen(
                     lineHeight = 8.sp,
                     color = Color.White
                 )
+                Text(
+                    text = "Ping:${stats.rttMs}ms",
+                    fontSize = 8.sp,
+                    lineHeight = 8.sp,
+                    color = Color.White
+                )
                 if (videoWidth > 0 && videoHeight > 0) {
                     Text(
                         text = "${videoWidth}x${videoHeight}",
