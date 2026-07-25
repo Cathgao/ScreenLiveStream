@@ -6,17 +6,18 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Bundle
+import android.os.Build
 import android.view.Surface
 import com.example.log.AppLogger
 import com.example.model.BitrateMode
 import com.example.model.StreamConfig
-import com.example.net.UdpStreamer
+import com.example.net.IStreamer
 import java.nio.ByteBuffer
 import kotlin.concurrent.thread
 
 class VideoEncoder(
     private val config: StreamConfig,
-    private val udpStreamer: UdpStreamer,
+    private val tcpStreamer: IStreamer,
     private val overrideWidth: Int = 0,
     private val overrideHeight: Int = 0,
     private val overrideFps: Int = 0,
@@ -30,6 +31,7 @@ class VideoEncoder(
     private var encoderThread: Thread? = null
     @Volatile
     private var lastCodecConfigData: ByteArray? = null
+    private var streamStartNs = 0L
 
     val inputSurface: Surface?
         get() = renderer?.inputSurface
@@ -66,8 +68,12 @@ class VideoEncoder(
                 format.setInteger(MediaFormat.KEY_QUALITY, 80)
             }
 
-            // Low-latency priority hint
+            // Low-latency priority hint and no B-frames
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                format.setInteger(MediaFormat.KEY_LATENCY, 0)
+            }
+            format.setInteger("max-bframes", 0)
 
             AppLogger.i(TAG, "Configuring MediaCodec with format: $format")
 
@@ -167,19 +173,12 @@ class VideoEncoder(
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
+            streamStartNs = 0L
             AppLogger.i(TAG, "Encoder loop thread running...")
 
             while (isEncoding) {
                 try {
-                    // Periodically request keyframe (every 1.5s) to guarantee receivers recover fast
                     val now = System.currentTimeMillis()
-                    if (now - lastKeyframeReqTime > 1500) {
-                        lastKeyframeReqTime = now
-                        val params = Bundle().apply {
-                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                        }
-                        codec?.setParameters(params)
-                    }
 
                     // Draw frame via GL Renderer
                     renderer?.drawFrame()
@@ -213,36 +212,62 @@ class VideoEncoder(
                                 }
                                 outputBuffer.get(tempBuffer, 0, dataSize)
 
-                                val timestampMs = System.currentTimeMillis()
+                                val frameNs = if (bufferInfo.presentationTimeUs > 0) bufferInfo.presentationTimeUs * 1000L else System.nanoTime()
+                                if (streamStartNs == 0L) {
+                                    streamStartNs = frameNs
+                                }
+                                val timestampMs = ((frameNs - streamStartNs) / 1_000_000L).coerceAtLeast(0L)
 
                                 if (isCodecConfig) {
                                     lastCodecConfigData = tempBuffer.copyOf(dataSize)
                                     AppLogger.i(TAG, "Encoder produced CodecConfig (SPS/PPS), size: $dataSize bytes")
-                                } else if (isKeyframe) {
-                                    AppLogger.d(TAG, "Encoder produced Keyframe #$totalOutputFrames, size: $dataSize bytes")
-                                    val configBytes = lastCodecConfigData
-                                    if (configBytes != null) {
-                                        udpStreamer.sendFrame(
-                                            frameData = configBytes,
+                                    tcpStreamer.sendFrame(
+                                        frameData = tempBuffer,
+                                        offset = 0,
+                                        size = dataSize,
+                                        timestampMs = timestampMs,
+                                        isKeyframe = false,
+                                        isCodecConfig = true,
+                                        codec = config.codec
+                                    )
+                                } else {
+                                    if (isKeyframe) {
+                                        AppLogger.d(TAG, "Encoder produced Keyframe #$totalOutputFrames, size: $dataSize bytes")
+                                        val configBytes = lastCodecConfigData
+                                        if (configBytes != null) {
+                                            // Send separate CodecConfig packet so decoder gets csd-0 configured
+                                            tcpStreamer.sendFrame(
+                                                frameData = configBytes,
+                                                offset = 0,
+                                                size = configBytes.size,
+                                                timestampMs = timestampMs,
+                                                isKeyframe = false,
+                                                isCodecConfig = true,
+                                                codec = config.codec
+                                            )
+                                        }
+                                        // Send clean IDR Keyframe data without prepending configBytes inside the same buffer
+                                        tcpStreamer.sendFrame(
+                                            frameData = tempBuffer,
                                             offset = 0,
-                                            size = configBytes.size,
+                                            size = dataSize,
+                                            timestampMs = timestampMs,
+                                            isKeyframe = true,
+                                            isCodecConfig = false,
+                                            codec = config.codec
+                                        )
+                                    } else {
+                                        tcpStreamer.sendFrame(
+                                            frameData = tempBuffer,
+                                            offset = 0,
+                                            size = dataSize,
                                             timestampMs = timestampMs,
                                             isKeyframe = false,
-                                            isCodecConfig = true,
+                                            isCodecConfig = false,
                                             codec = config.codec
                                         )
                                     }
                                 }
-
-                                udpStreamer.sendFrame(
-                                    frameData = tempBuffer,
-                                    offset = 0,
-                                    size = dataSize,
-                                    timestampMs = timestampMs,
-                                    isKeyframe = isKeyframe,
-                                    isCodecConfig = isCodecConfig,
-                                    codec = config.codec
-                                )
                             }
                             mc.releaseOutputBuffer(outputIndex, false)
 
@@ -266,13 +291,39 @@ class VideoEncoder(
                     }
                 }
             }
+            try {
+                renderer?.release()
+                AppLogger.i(TAG, "SurfaceCropRenderer released on encoder thread.")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error releasing SurfaceCropRenderer on encoder thread", e)
+            }
+            renderer = null
             AppLogger.i(TAG, "Encoder loop thread exited. Final total frames encoded: $totalOutputFrames")
+        }
+    }
+
+    fun requestKeyFrame() {
+        try {
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            codec?.setParameters(params)
+            AppLogger.i(TAG, "Instant IDR Keyframe requested on VideoEncoder")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error requesting IDR keyframe", e)
         }
     }
 
     fun stop() {
         AppLogger.i(TAG, "Stopping VideoEncoder...")
         isEncoding = false
+
+        try {
+            encoderThread?.join(2000)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error joining encoderThread", e)
+        }
+        encoderThread = null
 
         try {
             codec?.stop()
@@ -282,14 +333,6 @@ class VideoEncoder(
             AppLogger.e(TAG, "Error releasing MediaCodec", e)
         }
         codec = null
-
-        try {
-            renderer?.release()
-            AppLogger.i(TAG, "SurfaceCropRenderer released.")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error releasing SurfaceCropRenderer", e)
-        }
-        renderer = null
     }
 
     companion object {

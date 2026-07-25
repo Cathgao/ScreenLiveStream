@@ -25,6 +25,11 @@ enum class BitrateMode(val displayName: String, val modeInt: Int) {
     CQ("CQ 恒定质量 (画质平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
 }
 
+enum class TransportProtocol(val displayName: String) {
+    TCP("TCP (低丢包)"),
+    UDP("UDP (带FEC, 低延迟)")
+}
+
 data class StreamConfig(
     val codec: VideoCodec = VideoCodec.H265,
     val bitrateKbps: Int = 16000, // 16 Mbps default
@@ -34,7 +39,8 @@ data class StreamConfig(
     val resolution: VideoResolution = VideoResolution.DEFAULT,
     val targetIp: String = "192.168.1.100",
     val targetPort: Int = 8888,
-    val autoDiscover: Boolean = true
+    val autoDiscover: Boolean = true,
+    val protocol: TransportProtocol = TransportProtocol.UDP
 )
 
 data class EncoderCapabilities(
@@ -178,7 +184,8 @@ data class ReceiverConfig(
     val listenPort: Int = 8888,
     val autoAnnounce: Boolean = true,
     val lowLatencyMode: Boolean = true,
-    val jitterBufferMs: Int = 300
+    val jitterBufferMs: Int = 50,
+    val protocol: TransportProtocol = TransportProtocol.UDP
 )
 
 data class StreamStats(

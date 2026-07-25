@@ -222,11 +222,7 @@ class SurfaceCropRenderer(
 
         GLES20.glUniformMatrix4fv(uSTMatrixHandle, 1, false, transformMatrix, 0)
 
-        val cropModeInt = when (eyeCrop) {
-            EyeCrop.LEFT_EYE -> 0
-            EyeCrop.RIGHT_EYE -> 1
-            EyeCrop.FULL_FRAME -> 2
-        }
+        val cropModeInt = 2 // Always FULL_FRAME for Quest 3 (no crop)
         GLES20.glUniform1i(uEyeCropModeHandle, cropModeInt)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)

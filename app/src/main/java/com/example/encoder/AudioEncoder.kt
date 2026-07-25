@@ -11,12 +11,12 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import com.example.log.AppLogger
-import com.example.net.UdpStreamer
+import com.example.net.IStreamer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AudioEncoder(
     private val mediaProjection: MediaProjection,
-    private val udpStreamer: UdpStreamer? = null,
+    private val tcpStreamer: IStreamer? = null,
     private var muxerManager: MuxerManager? = null
 ) {
     private var audioRecord: AudioRecord? = null
@@ -142,14 +142,14 @@ class AudioEncoder(
                                 
                                 if (isConfig) {
                                     AppLogger.i(TAG, "Audio Encoder produced AAC CodecConfig, size: ${bufferInfo.size} bytes")
-                                    udpStreamer?.sendAudioFrame(data, data.size, timestampMs, true)
+                                    tcpStreamer?.sendAudioFrame(data, data.size, timestampMs, true)
                                 } else {
                                     audioFrameCount++
                                     if (audioFrameCount == 1L || audioFrameCount % 200L == 0L) {
                                         AppLogger.i(TAG, "Audio Encoder captured & encoded AAC frame #$audioFrameCount, size: ${bufferInfo.size} bytes")
                                     }
 
-                                    udpStreamer?.sendAudioFrame(data, data.size, timestampMs, false)
+                                    tcpStreamer?.sendAudioFrame(data, data.size, timestampMs, false)
 
                                     // Restore position for Muxer
                                     outputBuffer.position(bufferInfo.offset)

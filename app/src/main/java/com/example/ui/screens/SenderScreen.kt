@@ -84,6 +84,7 @@ fun SenderScreen(
                 putExtra(QuestSenderService.EXTRA_EYE_CROP, config.eyeCrop.name)
                 putExtra(QuestSenderService.EXTRA_CODEC, config.codec.name)
                 putExtra(QuestSenderService.EXTRA_BITRATE_MODE, config.bitrateMode.name)
+                putExtra(QuestSenderService.EXTRA_PROTOCOL, config.protocol.name)
             }
             onStartStreamRequested(serviceIntent)
         }
@@ -363,68 +364,7 @@ fun SenderScreen(
             )
         }
 
-        // Eye Cropping Selector (Quest 3 Dual-Eye Handler)
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.Visibility,
-                        contentDescription = null,
-                        tint = NeonPurple,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Quest 3 单眼画面裁剪 (防止重影与超载)",
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                        color = TextPrimary
-                    )
-                }
-                Spacer(modifier = Modifier.height(12.dp))
 
-                EyeCrop.values().forEach { crop ->
-                    val isSelected = config.eyeCrop == crop
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(if (isSelected) NeonPurple.copy(alpha = 0.2f) else DarkCyberCard)
-                            .border(
-                                width = if (isSelected) 1.5.dp else 0.dp,
-                                color = if (isSelected) NeonPurple else Color.Transparent,
-                                shape = RoundedCornerShape(12.dp)
-                            )
-                            .clickable { viewModel.updateEyeCrop(crop) }
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = isSelected,
-                            onClick = { viewModel.updateEyeCrop(crop) },
-                            colors = RadioButtonDefaults.colors(selectedColor = NeonPurple)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(
-                                text = crop.displayName,
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                                color = TextPrimary
-                            )
-                            Text(
-                                text = crop.description,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary
-                            )
-                        }
-                    }
-                }
-            }
-        }
 
         // Hardware Video Encoder Settings Card
         Card(
@@ -545,6 +485,32 @@ fun SenderScreen(
                                 labelColor = TextPrimary,
                                 disabledContainerColor = DarkCyberCard.copy(alpha = 0.4f),
                                 disabledLabelColor = TextSecondary.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Transport Protocol Selection
+                Text("传输协议 (TCP 保证不丢帧，UDP+FEC 适合高延迟网络)", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                Spacer(modifier = Modifier.height(6.dp))
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    com.example.model.TransportProtocol.values().forEach { proto ->
+                        val selected = config.protocol == proto
+                        FilterChip(
+                            selected = selected,
+                            onClick = { viewModel.updateProtocol(proto) },
+                            label = { Text(proto.name, fontWeight = FontWeight.Bold) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = NeonCyan,
+                                selectedLabelColor = Color.Black,
+                                containerColor = DarkCyberCard,
+                                labelColor = TextPrimary
                             )
                         )
                     }

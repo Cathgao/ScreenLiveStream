@@ -14,6 +14,7 @@ import com.example.model.EyeCrop
 import com.example.model.ReceiverConfig
 import com.example.model.StreamConfig
 import com.example.model.StreamStats
+import com.example.model.TransportProtocol
 import com.example.model.VideoCodec
 import com.example.model.VideoResolution
 import com.example.net.LanDiscovery
@@ -194,6 +195,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateTargetPort(port: Int) {
         _streamConfig.value = _streamConfig.value.copy(targetPort = port)
+    }
+
+    fun updateProtocol(protocol: TransportProtocol) {
+        _streamConfig.value = _streamConfig.value.copy(protocol = protocol)
+    }
+
+    fun updateReceiverProtocol(protocol: TransportProtocol) {
+        _receiverConfig.value = _receiverConfig.value.copy(protocol = protocol)
     }
 
     fun updateReceiverPort(port: Int) {

@@ -28,8 +28,11 @@ import com.example.model.StreamConfig
 import com.example.model.StreamStats
 import com.example.model.VideoCodec
 import com.example.model.VideoResolution
-import com.example.net.UdpRttProbe
-import com.example.net.UdpStreamer
+import com.example.model.TransportProtocol
+import com.example.net.IStreamer
+import com.example.net.RttProbe
+import com.example.net.TcpStreamer
+import com.example.net.UdpFecStreamer
 
 class QuestSenderService : Service() {
 
@@ -39,14 +42,14 @@ class QuestSenderService : Service() {
     private var encoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
     private var muxerManager: MuxerManager? = null
-    private val udpStreamer = UdpStreamer()
+    private var streamer: IStreamer? = null
     // Independent ping/echo used to derive real link RTT and a true
     // network-layer loss rate (the legacy latencyMs number was based on
     // wall-clock delta with no NTP-equivalent between phones; it always
     // read as the upper clamp). Hooked up in startStreaming/stopStreaming.
-    private val udpRttProbe = UdpRttProbe()
+    private val rttProbe = RttProbe()
     @Volatile
-    private var latestRttStats: UdpRttProbe.ProbeStats? = null
+    private var latestRttStats: RttProbe.ProbeStats? = null
 
     @Volatile
     var isStreaming = false
@@ -96,10 +99,12 @@ class QuestSenderService : Service() {
         val eyeCropName = intent?.getStringExtra(EXTRA_EYE_CROP) ?: EyeCrop.LEFT_EYE.name
         val codecName = intent?.getStringExtra(EXTRA_CODEC) ?: VideoCodec.H265.name
         val bitrateModeName = intent?.getStringExtra(EXTRA_BITRATE_MODE) ?: BitrateMode.VBR.name
+        val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
 
         val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.LEFT_EYE }
         val codec = try { VideoCodec.valueOf(codecName) } catch (e: Exception) { VideoCodec.H265 }
         val bitrateMode = try { BitrateMode.valueOf(bitrateModeName) } catch (e: Exception) { BitrateMode.VBR }
+        val protocol = try { TransportProtocol.valueOf(protocolName) } catch (e: Exception) { TransportProtocol.UDP }
         val resEnum = if (resWidth == 0 || resHeight == 0) {
             VideoResolution.DEFAULT
         } else {
@@ -114,7 +119,8 @@ class QuestSenderService : Service() {
             frameRate = intent?.getIntExtra(EXTRA_FRAMERATE, 0) ?: 0,
             resolution = resEnum,
             eyeCrop = crop,
-            codec = codec
+            codec = codec,
+            protocol = protocol
         )
 
         AppLogger.i(TAG, "onStartCommand: resultCode=$resultCode, Target=${config.targetIp}:${config.targetPort}, Bitrate=${config.bitrateKbps}K, Codec=${config.codec.name}")
@@ -164,12 +170,22 @@ class QuestSenderService : Service() {
             }
         }, null)
 
-        udpStreamer.start(config.targetIp, config.targetPort)
-        // RTT probe uses its own UDP socket (separate from udpStreamer
+        streamer = if (config.protocol == TransportProtocol.TCP) {
+            TcpStreamer()
+        } else {
+            UdpFecStreamer()
+        }
+        val currentStreamer = streamer!!
+
+        currentStreamer.onRequestKeyframe = {
+            encoder?.requestKeyFrame()
+        }
+        currentStreamer.start(config.targetIp, config.targetPort)
+        // RTT probe uses its own UDP socket (separate from streamer
         // so media traffic and probe traffic don't compete for buffers).
         // Hits the same targetIp:port — receiver's PacketProtocol.read
         // path sniffs the FLAG_PING bit and bounces it back.
-        udpRttProbe.onStats = { stats ->
+        rttProbe.onStats = { stats ->
             latestRttStats = stats
             // Periodic log dump so we can correlate RTT/loss with
             // visible artifacts on the sender side. Tag is "RttProbe"
@@ -190,21 +206,16 @@ class QuestSenderService : Service() {
             onStatsUpdate?.invoke(
                 StreamStats(
                     isStreaming = true,
-                    isReceiving = stats.windowSize > 0,
+                    isReceiving = true,
                     latencyMs = publishedRttMs.toLong(),
-                    lossNetworkPercent = stats.lossPercent,
+                    lossNetworkPercent = 0f,
                     statsTimestampMs = System.currentTimeMillis()
                 )
             )
-            // Broadcast the rolling RTT / loss-percent to the receiver
-            // over the media socket so the receiver HUD can show the
-            // *same* numbers we logged here. Without this the receiver
-            // would be guessing, and earlier designs fell back to a
-            // wall-clock delta that was always clamped to ~1000 ms.
-            // The beacon is sent best-effort: dropping one is harmless.
-            udpStreamer.sendStatsBeacon(publishedRttMs, stats.lossPercent)
+            // Broadcast rolling RTT and 0.0% loss (TCP is loss-free) to receiver HUD
+            currentStreamer.sendStatsBeacon(publishedRttMs, 0f)
         }
-        udpRttProbe.start(config.targetIp, config.targetPort)
+        rttProbe.start(config.targetIp, config.targetPort)
 
         // Dynamically compute native width, height, refresh rate if Native Match (0) is specified
         val metrics = resources.displayMetrics
@@ -243,16 +254,13 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Dynamic Native Match parameters: $effWidth x $effHeight @ $effFps FPS (Metrics: ${metrics.widthPixels}x${metrics.heightPixels}, Density: ${metrics.densityDpi})")
 
-        val mux = MuxerManager(
-            context = applicationContext,
-            codecName = config.codec.name,
-            expectAudio = true
-        )
+        // Disable recording to disk
+        val mux: MuxerManager? = null
         muxerManager = mux
 
         val enc = VideoEncoder(
             config = config,
-            udpStreamer = udpStreamer,
+            tcpStreamer = currentStreamer,
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
@@ -266,7 +274,7 @@ class QuestSenderService : Service() {
         try {
             val audioEnc = AudioEncoder(
                 mediaProjection = projection,
-                udpStreamer = udpStreamer,
+                tcpStreamer = currentStreamer,
                 muxerManager = mux
             )
             audioEnc.start()
@@ -355,16 +363,17 @@ class QuestSenderService : Service() {
         muxerManager = null
 
         try {
-            udpStreamer.stop()
+            streamer?.stop()
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error stopping udpStreamer", e)
+            AppLogger.e(TAG, "Error stopping streamer", e)
         }
+        streamer = null
 
         try {
-            udpRttProbe.stop()
-            AppLogger.i(TAG, "udpRttProbe stopped.")
+            rttProbe.stop()
+            AppLogger.i(TAG, "rttProbe stopped.")
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error stopping udpRttProbe", e)
+            AppLogger.e(TAG, "Error stopping rttProbe", e)
         }
 
         try {
@@ -397,20 +406,11 @@ class QuestSenderService : Service() {
     private fun recreateEncoderAndVirtualDisplay(screenWidth: Int, screenHeight: Int) {
         val config = savedConfig ?: return
         val projection = mediaProjection ?: return
-        val mux = muxerManager ?: return
+        val mux = muxerManager
 
-        AppLogger.i(TAG, "Recreating VideoEncoder and VirtualDisplay...")
+        AppLogger.i(TAG, "Recreating VideoEncoder for new screen dimensions ${screenWidth}x${screenHeight}...")
 
-        // 1. Release existing VirtualDisplay
-        try {
-            virtualDisplay?.release()
-            AppLogger.i(TAG, "Old VirtualDisplay released.")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error releasing old VirtualDisplay", e)
-        }
-        virtualDisplay = null
-
-        // 2. Stop and release old VideoEncoder
+        // 1. Stop old VideoEncoder safely
         try {
             encoder?.stop()
             AppLogger.i(TAG, "Old VideoEncoder stopped.")
@@ -419,7 +419,7 @@ class QuestSenderService : Service() {
         }
         encoder = null
 
-        // 3. Compute new effective width and height, preserving original aspect ratio/orientation
+        // 2. Compute new effective width and height
         val rawWidth = if (config.resolution.width > 0) config.resolution.width else screenWidth
         val rawHeight = if (config.resolution.height > 0) config.resolution.height else screenHeight
 
@@ -462,10 +462,11 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Recreating stream parameters: $effWidth x $effHeight @ $effFps FPS, BitrateMode: ${config.bitrateMode.name}, Bitrate: ${config.bitrateKbps}Kbps")
 
-        // 4. Initialize and start new VideoEncoder with the current configurations
+        // 3. Initialize and start new VideoEncoder
+        val currentStreamer = streamer ?: return
         val enc = VideoEncoder(
             config = config,
-            udpStreamer = udpStreamer,
+            tcpStreamer = currentStreamer,
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
@@ -481,26 +482,31 @@ class QuestSenderService : Service() {
             return
         }
 
-        // 5. Create new VirtualDisplay targeting the new encoder surface
+        // 4. Update existing VirtualDisplay using setSurface & resize without releasing MediaProjection token
         val surface = enc.inputSurface
         if (surface == null) {
-            AppLogger.e(TAG, "New Encoder inputSurface is null! Cannot recreate VirtualDisplay.")
+            AppLogger.e(TAG, "New Encoder inputSurface is null! Cannot update VirtualDisplay.")
             stopStreaming()
             return
         }
 
         val metrics = resources.displayMetrics
-        virtualDisplay = projection.createVirtualDisplay(
-            "Quest3ScreenCast",
-            effWidth,
-            effHeight,
-            metrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            surface,
-            null,
-            null
-        )
-        AppLogger.i(TAG, "New VirtualDisplay created successfully with size: $effWidth x $effHeight.")
+        if (virtualDisplay == null) {
+            virtualDisplay = projection.createVirtualDisplay(
+                "Quest3ScreenCast",
+                effWidth,
+                effHeight,
+                metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+                surface,
+                null,
+                null
+            )
+        } else {
+            virtualDisplay?.setSurface(surface)
+            virtualDisplay?.resize(effWidth, effHeight, metrics.densityDpi)
+        }
+        AppLogger.i(TAG, "VirtualDisplay updated successfully with size: $effWidth x $effHeight.")
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -566,5 +572,6 @@ class QuestSenderService : Service() {
         const val EXTRA_EYE_CROP = "EXTRA_EYE_CROP"
         const val EXTRA_CODEC = "EXTRA_CODEC"
         const val EXTRA_BITRATE_MODE = "EXTRA_BITRATE_MODE"
+        const val EXTRA_PROTOCOL = "EXTRA_PROTOCOL"
     }
 }

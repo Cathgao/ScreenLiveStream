@@ -28,6 +28,55 @@ object PacketProtocol {
     const val FLAG_PING: Byte = 0x10
     const val FLAG_PING_REPLY: Byte = 0x20
     const val FLAG_PING_STATS: Byte = 0x40
+    const val FLAG_NACK: Byte = 0x80.toByte()
+    const val FLAG_PLI: Byte = 0x81.toByte()
+
+    fun buildNackPacket(frameSeq: Int, packetIndex: Int): ByteArray {
+        val packet = ByteArray(HEADER_SIZE)
+        val bb = ByteBuffer.wrap(packet)
+        bb.put(MAGIC_0)
+        bb.put(MAGIC_1)
+        bb.put(VERSION)
+        bb.put(FLAG_NACK)
+        bb.putInt(frameSeq)
+        bb.putLong(0L)
+        bb.putShort(packetIndex.toShort())
+        bb.putShort(0)
+        bb.putShort(0)
+        return packet
+    }
+
+    fun buildPliPacket(): ByteArray {
+        val packet = ByteArray(HEADER_SIZE)
+        val bb = ByteBuffer.wrap(packet)
+        bb.put(MAGIC_0)
+        bb.put(MAGIC_1)
+        bb.put(VERSION)
+        bb.put(FLAG_PLI)
+        bb.putInt(0)
+        bb.putLong(0L)
+        bb.putShort(0)
+        bb.putShort(0)
+        bb.putShort(0)
+        return packet
+    }
+
+    fun parseNackPacket(data: ByteArray, length: Int): Pair<Int, Int>? {
+        if (length < HEADER_SIZE) return null
+        if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
+        if (data[3] != FLAG_NACK) return null
+        val bb = ByteBuffer.wrap(data, 4, length - 4)
+        val frameSeq = bb.int
+        bb.long // timestamp
+        val packetIndex = bb.short.toInt() and 0xFFFF
+        return Pair(frameSeq, packetIndex)
+    }
+
+    fun isPliPacket(data: ByteArray, length: Int): Boolean {
+        if (length < HEADER_SIZE) return false
+        if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return false
+        return data[3] == FLAG_PLI
+    }
 
     // Discovery UDP Constants
     const val DISCOVERY_PORT = 9998

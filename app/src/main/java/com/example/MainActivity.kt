@@ -174,6 +174,7 @@ class MainActivity : ComponentActivity() {
                                         val serviceIntent = Intent(this@MainActivity, QuestReceiverService::class.java).apply {
                                             putExtra(QuestReceiverService.EXTRA_LISTEN_PORT, port)
                                             putExtra(QuestReceiverService.EXTRA_JITTER_BUFFER_MS, viewModel.receiverConfig.value.jitterBufferMs)
+                                            putExtra(QuestReceiverService.EXTRA_PROTOCOL, viewModel.receiverConfig.value.protocol.name)
                                         }
                                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                             startForegroundService(serviceIntent)
