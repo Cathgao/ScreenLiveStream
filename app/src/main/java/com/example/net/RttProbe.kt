@@ -72,6 +72,7 @@ class RttProbe {
                 val pkt = DatagramPacket(buf, buf.size)
                 while (isRunning) {
                     try {
+                        pkt.length = buf.size
                         (this.socket ?: break).receive(pkt)
                         val probe = PacketProtocol.readProbeSequence(pkt.data, pkt.length) ?: continue
                         if (probe.isReply) {

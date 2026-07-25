@@ -9,6 +9,9 @@ import android.util.Log
 import android.view.Surface
 import com.example.model.VideoCodec
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.concurrent.thread
 
 class VideoDecoder {
     private var decoder: MediaCodec? = null
@@ -20,21 +23,53 @@ class VideoDecoder {
     private var lastCodecConfigData: ByteArray? = null
     private var hasReceivedFirstKeyframe = false
     private var lastFrameSeq = -1
+    @Volatile
     private var referenceLost = false
 
     @Volatile
     private var isDraining = false
     private var drainThread: Thread? = null
+    
+    @Volatile
+    private var isFeeding = false
+    private var feedThread: Thread? = null
 
     @Volatile
     var activeDecoderName: String = "未初始化"
         private set
 
     var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
+    var onRequestKeyframe: (() -> Unit)? = null
+
+    private class DecodeTask {
+        var data: ByteArray = ByteArray(0)
+        var size: Int = 0
+        var isKeyframe: Boolean = false
+        var isCodecConfig: Boolean = false
+        var isHevc: Boolean = false
+        var timestampMs: Long = 0
+        var seq: Int = 0
+    }
+
+    private val taskQueue = ArrayBlockingQueue<DecodeTask>(60) // Max 60 frames in queue (~1 sec at 60fps)
+    private val taskPool = ConcurrentLinkedQueue<DecodeTask>()
+
+    private fun obtainTask(minSize: Int): DecodeTask {
+        val task = taskPool.poll() ?: DecodeTask()
+        if (task.data.size < minSize) {
+            task.data = ByteArray(Math.max(minSize, 512 * 1024))
+        }
+        return task
+    }
+
+    private fun recycleTask(task: DecodeTask) {
+        taskPool.offer(task)
+    }
 
     fun notifyReferenceLost() {
         referenceLost = true
         Log.w(TAG, "Reference frame lost notified! Dropping P-frames until next IDR Keyframe.")
+        onRequestKeyframe?.invoke()
     }
 
     fun setSurface(surface: Surface?) {
@@ -52,21 +87,18 @@ class VideoDecoder {
         val mimeType = if (isHevc) VideoCodec.H265.mimeType else VideoCodec.H264.mimeType
         currentCodec = if (isHevc) VideoCodec.H265 else VideoCodec.H264
         lastCodecConfigData = codecConfigData
+        taskQueue.clear()
 
         try {
-            // Default 1080p initial decoder format
             val format = MediaFormat.createVideoFormat(mimeType, 1920, 1080)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                format.setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
+                format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             }
-
-            // Low Latency flag for Android 11+ (API 30+)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
 
-            // Set CSD-0 / CSD-1 if codec config is available
             if (codecConfigData != null && codecConfigData.isNotEmpty()) {
                 if (isHevc) {
                     format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
@@ -75,15 +107,12 @@ class VideoDecoder {
                     val (sps, pps) = extractSpsAndPps(codecConfigData)
                     if (sps != null) {
                         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
-                        Log.d(TAG, "Configuring AVC decoder with csd-0 (SPS) size: ${sps.size}")
                     }
                     if (pps != null) {
                         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
-                        Log.d(TAG, "Configuring AVC decoder with csd-1 (PPS) size: ${pps.size}")
                     }
                     if (sps == null && pps == null) {
                         format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
-                        Log.w(TAG, "Configuring AVC decoder with fallback csd-0 size: ${codecConfigData.size}")
                     }
                 }
             }
@@ -97,6 +126,7 @@ class VideoDecoder {
             isDecoderReady = true
             Log.i(TAG, "VideoDecoder initialized with $mimeType using [$name]")
             startDrainThread(mc)
+            startFeedThread(mc)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VideoDecoder for $mimeType", e)
             stop()
@@ -375,6 +405,65 @@ class VideoDecoder {
         drainThread = null
     }
 
+    private fun startFeedThread(mc: MediaCodec) {
+        stopFeedThread()
+        isFeeding = true
+        feedThread = thread(start = true, name = "VideoDecoderFeedThread") {
+            while (isFeeding) {
+                try {
+                    val task = taskQueue.take()
+                    try {
+                        var inputIndex = mc.dequeueInputBuffer(10_000)
+                        var retryCount = 0
+                        while (inputIndex < 0 && retryCount < 50 && isFeeding) {
+                            inputIndex = mc.dequeueInputBuffer(10_000)
+                            retryCount++
+                        }
+                        
+                        if (inputIndex >= 0) {
+                            val inputBuffer: ByteBuffer? = mc.getInputBuffer(inputIndex)
+                            if (inputBuffer != null) {
+                                inputBuffer.clear()
+                                inputBuffer.put(task.data, 0, task.size)
+            
+                                val flags = if (task.isKeyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                                val ptsUs = if (task.timestampMs > 0) task.timestampMs * 1000L else System.nanoTime() / 1000L
+            
+                                if (receiverStartNs == 0L) {
+                                    receiverStartNs = System.nanoTime()
+                                    streamStartPtsUs = ptsUs
+                                }
+            
+                                mc.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    task.size,
+                                    ptsUs,
+                                    flags
+                                )
+                            }
+                        } else {
+                            Log.w(TAG, "Input buffer unavailable after 500ms timeout on seq=${task.seq}. Requesting IDR keyframe.")
+                            notifyReferenceLost()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error decoding frame seq=${task.seq}", e)
+                        notifyReferenceLost()
+                    }
+                    recycleTask(task)
+                } catch (e: InterruptedException) {
+                    break
+                }
+            }
+        }
+    }
+
+    private fun stopFeedThread() {
+        isFeeding = false
+        feedThread?.interrupt()
+        feedThread = null
+    }
+
     fun decodeFrame(frameBytes: ByteArray, isKeyframe: Boolean, isCodecConfig: Boolean, isHevc: Boolean, timestampMs: Long, seq: Int) {
         val codecType = if (isHevc) VideoCodec.H265 else VideoCodec.H264
         val surf = targetSurface ?: return
@@ -415,24 +504,20 @@ class VideoDecoder {
         }
 
         if (!hasReceivedFirstKeyframe) {
-            // Drop frames prior to first Keyframe to avoid corrupted rendering
             return
         }
 
         if (!isKeyframe) {
-            // 1. Check sequence gap (packet lost over network)
             if (lastFrameSeq != -1 && seq > lastFrameSeq + 1) {
                 val gap = seq - lastFrameSeq - 1
                 Log.w(TAG, "Sequence gap detected: last=$lastFrameSeq, current=$seq, gap=$gap. Requesting IDR keyframe.")
                 notifyReferenceLost()
             }
 
-            // 2. If reference frame was lost/corrupted, strictly drop non-keyframes to avoid green/macroblock artifacts ("烂帧")
             if (referenceLost) {
                 return
             }
 
-            // 3. Drop stale out-of-order frame
             if (lastFrameSeq != -1 && seq < lastFrameSeq) {
                 return
             }
@@ -440,48 +525,20 @@ class VideoDecoder {
 
         lastFrameSeq = seq
 
-        val mc = decoder ?: return
         if (!isDecoderReady) return
+        
+        val task = obtainTask(finalBytes.size)
+        System.arraycopy(finalBytes, 0, task.data, 0, finalBytes.size)
+        task.size = finalBytes.size
+        task.isKeyframe = isKeyframe
+        task.isCodecConfig = isCodecConfig
+        task.isHevc = isHevc
+        task.timestampMs = timestampMs
+        task.seq = seq
 
-        try {
-            // Wait up to 10ms for input buffer. Hardware decoders usually free input buffers in 0.5-1ms.
-            // A non-zero wait eliminates random silent frame drops at 60/90/120 FPS!
-            var inputIndex = mc.dequeueInputBuffer(10_000)
-            var retryCount = 0
-            while (inputIndex < 0 && retryCount < 50) {
-                // drain thread is running concurrently
-                inputIndex = mc.dequeueInputBuffer(10_000)
-                retryCount++
-            }
-
-            if (inputIndex >= 0) {
-                val inputBuffer: ByteBuffer? = mc.getInputBuffer(inputIndex)
-                if (inputBuffer != null) {
-                    inputBuffer.clear()
-                    inputBuffer.put(finalBytes)
-
-                    val flags = if (isKeyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                    val ptsUs = if (timestampMs > 0) timestampMs * 1000L else System.nanoTime() / 1000L
-
-                    if (receiverStartNs == 0L) {
-                        receiverStartNs = System.nanoTime()
-                        streamStartPtsUs = ptsUs
-                    }
-
-                    mc.queueInputBuffer(
-                        inputIndex,
-                        0,
-                        finalBytes.size,
-                        ptsUs,
-                        flags
-                    )
-                }
-            } else {
-                Log.w(TAG, "Input buffer unavailable after 500ms timeout on seq=$seq. Requesting IDR keyframe.")
-                notifyReferenceLost()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error decoding frame seq=$seq", e)
+        if (!taskQueue.offer(task)) {
+            Log.w(TAG, "Video decoder task queue full! Dropping frame seq=$seq and requesting IDR.")
+            recycleTask(task)
             notifyReferenceLost()
         }
     }

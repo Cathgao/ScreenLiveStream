@@ -9,6 +9,7 @@ import android.media.projection.MediaProjectionManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -224,8 +225,9 @@ fun SenderScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(64.dp)
-                            .background(DarkCyberCard, shape = RoundedCornerShape(12.dp)),
+                            .defaultMinSize(minHeight = 64.dp)
+                            .background(DarkCyberCard, shape = RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -267,23 +269,10 @@ fun SenderScreen(
                                         text = dev.deviceName,
                                         fontWeight = FontWeight.Bold,
                                         color = TextPrimary,
-                                        fontSize = 14.sp
+                                        fontSize = 14.sp,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
-                                    if (isSelected) {
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Surface(
-                                            color = LiveGreen,
-                                            shape = RoundedCornerShape(4.dp)
-                                        ) {
-                                            Text(
-                                                text = "已选中",
-                                                color = Color.Black,
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
                                 }
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
@@ -366,13 +355,14 @@ fun SenderScreen(
 
 
 
-        // Hardware Video Encoder Settings Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+        AnimatedVisibility(visible = !isStreaming) {
+            // Hardware Video Encoder Settings Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = DarkCyberSurface),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.Settings,
@@ -399,28 +389,46 @@ fun SenderScreen(
                             .padding(10.dp)
                     ) {
                         Column {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.Top) {
                                 Icon(
                                     imageVector = Icons.Default.Info,
                                     contentDescription = null,
                                     tint = NeonCyan,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(16.dp).padding(top = 2.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "自动匹配编码器: ${c.encoderName}",
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                                    color = NeonCyan
-                                )
+                                Column {
+                                    Text(
+                                        text = "自动匹配编码器:",
+                                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = NeonCyan
+                                    )
+                                    Text(
+                                        text = c.encoderName,
+                                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = NeonCyan
+                                    )
+                                }
                             }
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "硬件加速: ${if (c.isHardwareAccelerated) "是 (硬件解码芯片)" else "否 (软件编码)"} • 最高帧率: ${c.maxFrameRate} FPS",
+                                text = "硬件加速: ${if (c.isHardwareAccelerated) "是 (硬件解码芯片)" else "否 (软件编码)"}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondary
                             )
                             Text(
-                                text = "支持分辨率范围: ${c.minWidth}x${c.minHeight} ~ ${c.maxWidth}x${c.maxHeight}",
+                                text = "最高帧率: ${c.maxFrameRate} FPS",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "支持分辨率范围:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = "${c.minWidth}x${c.minHeight} ~ ${c.maxWidth}x${c.maxHeight}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondary
                             )
@@ -493,7 +501,7 @@ fun SenderScreen(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Transport Protocol Selection
-                Text("传输协议 (TCP 保证不丢帧，UDP+FEC 适合高延迟网络)", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                Text("传输协议", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                 Spacer(modifier = Modifier.height(6.dp))
                 @OptIn(ExperimentalLayoutApi::class)
                 FlowRow(
@@ -640,8 +648,7 @@ fun SenderScreen(
                 }
             }
         }
-
-
+        }
 
         // Diagnostics & Log Export Card
         Card(

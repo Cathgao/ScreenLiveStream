@@ -134,131 +134,34 @@ fun ReceiverScreen(
         }
 
         if (isListening) {
-            var isHudExpanded by remember { mutableStateOf(true) }
-
-            // Floating HUD Overlay with toggleable fold/expand mode
-            Column(
+            // Data stats Overlay
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .statusBarsPadding()
-                    .padding(12.dp)
-                    .background(Color(0xDC000000), RoundedCornerShape(12.dp))
-                    .border(0.5.dp, BorderCyan.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                // Header bar with title and fold/expand button
-                Row(
-                    modifier = Modifier.fillMaxWidth(0.9f),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    val rttText = if (stats.rttMs > 0) "${stats.rttMs}ms" else "等待"
+                Text(
+                    text = "FPS:${String.format("%.1f", stats.fps)}",
+                    fontSize = 8.sp,
+                    lineHeight = 8.sp,
+                    color = Color.White
+                )
+                Text(
+                    text = "码率:${String.format("%.1fM", stats.bitrateMbps)}",
+                    fontSize = 8.sp,
+                    lineHeight = 8.sp,
+                    color = Color.White
+                )
+                if (videoWidth > 0 && videoHeight > 0) {
                     Text(
-                        text = "📊 实时流统计 (${rttText})",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = NeonCyan
+                        text = "${videoWidth}x${videoHeight}",
+                        fontSize = 8.sp,
+                        lineHeight = 8.sp,
+                        color = Color.White
                     )
-                    Icon(
-                        imageVector = if (isHudExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                        contentDescription = "Toggle HUD",
-                        tint = TextSecondary,
-                        modifier = Modifier
-                            .size(18.dp)
-                            .clickable { isHudExpanded = !isHudExpanded }
-                    )
-                }
-
-                if (isHudExpanded) {
-                    // ---- Row 1: Link latency & Network loss ----
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val rttText = if (stats.rttMs > 0) "${stats.rttMs}ms" else "等待"
-                        val rttColor = when {
-                            stats.rttMs <= 0 -> TextSecondary.copy(alpha = 0.7f)
-                            stats.rttMs < 50 -> LiveGreen.copy(alpha = 0.9f)
-                            stats.rttMs < 150 -> NeonCyan.copy(alpha = 0.9f)
-                            else -> ErrorRed.copy(alpha = 0.9f)
-                        }
-                        CompactHudStatItem(label = "链路延迟:", value = rttText, color = rttColor)
-                        CompactHudStatItem(
-                            label = "网络丢包:",
-                            value = String.format("%.1f%%", stats.lossNetworkPercent),
-                            color = if (stats.lossNetworkPercent < 1f) LiveGreen.copy(alpha = 0.9f) else ErrorRed.copy(alpha = 0.9f)
-                        )
-                        CompactHudStatItem(
-                            label = "在途:",
-                            value = "${stats.inFlightBytes / 1024}KB",
-                            color = TextSecondary.copy(alpha = 0.7f)
-                        )
-                    }
-
-                    // ---- Row 2: FPS, Bitrate & Resolution ----
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        CompactHudStatItem(label = "FPS:", value = String.format("%.1f", stats.fps), color = NeonCyan.copy(alpha = 0.9f))
-                        CompactHudStatItem(label = "码率:", value = String.format("%.1fM", stats.bitrateMbps), color = NeonPurple.copy(alpha = 0.9f))
-                        if (videoWidth > 0 && videoHeight > 0) {
-                            CompactHudStatItem(
-                                label = "分辨率:",
-                                value = "${videoWidth}x${videoHeight}${if (videoWidth > videoHeight) "横" else "竖"}",
-                                color = NeonCyan.copy(alpha = 0.9f)
-                            )
-                        }
-                    }
-
-                    // ---- Row 3: Dedicated Decoder Chip Line ----
-                    if (stats.codecName.isNotEmpty() && stats.codecName != "未运行" && stats.codecName != "未初始化") {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            CompactHudStatItem(
-                                label = "解码器芯片:",
-                                value = stats.codecName,
-                                color = if (stats.codecName.lowercase().startsWith("c2.")) LiveGreen.copy(alpha = 0.95f) else NeonPurple.copy(alpha = 0.95f)
-                            )
-                        }
-                    }
-
-                    // ---- Row 4: Frame loss breakdown ----
-                    val totalLoss = stats.lossTimeoutPercent + stats.lossEvictedPercent
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        CompactHudStatItem(
-                            label = "总丢帧:",
-                            value = String.format("%.1f%%", totalLoss),
-                            color = if (totalLoss < 1f) LiveGreen.copy(alpha = 0.9f) else ErrorRed.copy(alpha = 0.9f)
-                        )
-                        CompactHudStatItem(
-                            label = "超时:",
-                            value = String.format("%.1f%%", stats.lossTimeoutPercent),
-                            color = TextSecondary.copy(alpha = 0.8f)
-                        )
-                        CompactHudStatItem(
-                            label = "内存:",
-                            value = String.format("%.1f%%", stats.lossEvictedPercent),
-                            color = TextSecondary.copy(alpha = 0.8f)
-                        )
-                    }
-                } else {
-                    // Compact mini-HUD single line mode
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${String.format("%.1f", stats.fps)} FPS | ${String.format("%.1fM", stats.bitrateMbps)} | ${stats.codecName}",
-                            fontSize = 10.sp,
-                            color = TextSecondary
-                        )
-                    }
                 }
             }
         }
@@ -337,11 +240,32 @@ fun ReceiverScreen(
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
                                 color = TextPrimary
                             )
-                            Text(
-                                text = "端口: ${receiverConfig.listenPort}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "端口: ",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                                var portText by remember(receiverConfig.listenPort) { mutableStateOf(receiverConfig.listenPort.toString()) }
+                                androidx.compose.foundation.text.BasicTextField(
+                                    value = portText,
+                                    onValueChange = { 
+                                        portText = it
+                                        val p = it.toIntOrNull()
+                                        if (p != null) {
+                                            viewModel.updateReceiverPort(p)
+                                        }
+                                    },
+                                    textStyle = MaterialTheme.typography.labelSmall.copy(color = NeonCyan),
+                                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                                    ),
+                                    modifier = Modifier
+                                        .width(50.dp)
+                                        .background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                                )
+                            }
                         }
 
                         Button(
@@ -372,27 +296,6 @@ fun ReceiverScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun CompactHudStatItem(label: String, value: String, color: Color) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
-        Text(
-            text = label,
-            fontSize = 10.sp,
-            color = Color.White.copy(alpha = 0.5f),
-            fontWeight = FontWeight.Medium
-        )
-        Text(
-            text = value,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            color = color
-        )
     }
 }
 

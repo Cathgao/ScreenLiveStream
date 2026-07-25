@@ -15,6 +15,9 @@ class TcpReceiver : IReceiver {
     @Volatile
     private var isListening = false
     private var listenerThread: Thread? = null
+    
+    @Volatile
+    private var currentClientSocket: Socket? = null
 
     // Callback for decoded frames: (frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
     override var onFrameAssembled: ((ByteArray, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
@@ -68,74 +71,94 @@ class TcpReceiver : IReceiver {
                 SessionLog.i(TAG, "TCP Stream Receiver listening on port $port...")
 
                 while (isListening && !ss.isClosed) {
-                    var clientSocket: Socket? = null
                     try {
-                        clientSocket = ss.accept()
+                        val clientSocket = ss.accept()
+                        
+                        // Close previous connection to drop old deadlocked senders
+                        currentClientSocket?.close()
+                        currentClientSocket = clientSocket
+                        
                         clientSocket.tcpNoDelay = true
                         clientSocket.receiveBufferSize = 8 * 1024 * 1024
                         val clientIp = clientSocket.inetAddress.hostAddress
                         SessionLog.i(TAG, "TCP Receiver accepted stream connection from $clientIp")
 
-                        val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 2 * 1024 * 1024))
-                        val headerBuf = ByteArray(20)
+                        kotlin.concurrent.thread(start = true, name = "TcpReceiverClientThread") {
+                            try {
+                                val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 2 * 1024 * 1024))
+                                val headerBuf = ByteArray(20)
 
-                        while (isListening && !clientSocket.isClosed) {
-                            dis.readFully(headerBuf, 0, 20)
+                                while (isListening && !clientSocket.isClosed && currentClientSocket == clientSocket) {
+                                    if (totalReceivedFrames <= 5L) {
+                                        SessionLog.d(TAG, "TCP waiting to read 20-byte header...")
+                                    }
+                                    dis.readFully(headerBuf, 0, 20)
 
-                            if (headerBuf[0] != PacketProtocol.MAGIC_0 || headerBuf[1] != PacketProtocol.MAGIC_1) {
-                                SessionLog.w(TAG, "Header magic mismatch in TCP stream! Closing client socket.")
-                                break
-                            }
+                                    if (headerBuf[0] != PacketProtocol.MAGIC_0 || headerBuf[1] != PacketProtocol.MAGIC_1) {
+                                        SessionLog.w(TAG, "Header magic mismatch in TCP stream! Closing client socket.")
+                                        break
+                                    }
 
-                            val flags = headerBuf[3].toInt() and 0xFF
-                            val isKeyframe = (flags and PacketProtocol.FLAG_KEYFRAME.toInt()) != 0
-                            val isCodecConfig = (flags and PacketProtocol.FLAG_CODEC_CONFIG.toInt()) != 0
-                            val isHevc = (flags and PacketProtocol.FLAG_CODEC_HEVC.toInt()) != 0
-                            val isAudio = (flags and PacketProtocol.FLAG_AUDIO.toInt()) != 0
-                            val isPingStats = (flags and PacketProtocol.FLAG_PING_STATS.toInt()) != 0
+                                    val flags = headerBuf[3].toInt() and 0xFF
+                                    val isKeyframe = (flags and PacketProtocol.FLAG_KEYFRAME.toInt()) != 0
+                                    val isCodecConfig = (flags and PacketProtocol.FLAG_CODEC_CONFIG.toInt()) != 0
+                                    val isHevc = (flags and PacketProtocol.FLAG_CODEC_HEVC.toInt()) != 0
+                                    val isAudio = (flags and PacketProtocol.FLAG_AUDIO.toInt()) != 0
+                                    val isPingStats = (flags and PacketProtocol.FLAG_PING_STATS.toInt()) != 0
 
-                            val bb = ByteBuffer.wrap(headerBuf, 4, 16)
-                            val frameSeq = bb.int
-                            val timestampMs = bb.long
-                            val payloadSize = bb.int
+                                    val bb = ByteBuffer.wrap(headerBuf, 4, 16)
+                                    val frameSeq = bb.int
+                                    val timestampMs = bb.long
+                                    val payloadSize = bb.int
+                                    
+                                    if (totalReceivedFrames <= 5L) {
+                                        SessionLog.i(TAG, "TCP recv header: seq=$frameSeq size=$payloadSize isAudio=$isAudio isBeacon=$isPingStats")
+                                    }
 
-                            if (isPingStats) {
-                                val rttMs = dis.readInt()
-                                val lossBp = dis.readInt()
-                                setRttStats(rttMs, lossBp / 100f)
-                                tickStats()
-                                continue
-                            }
+                                    if (isPingStats) {
+                                        val rttMs = dis.readInt()
+                                        val lossBp = dis.readInt()
+                                        setRttStats(rttMs, lossBp / 100f)
+                                        tickStats()
+                                        continue
+                                    }
 
-                            if (payloadSize < 0 || payloadSize > 10_000_000) {
-                                SessionLog.w(TAG, "Invalid payload size $payloadSize in TCP stream!")
-                                break
-                            }
+                                    if (payloadSize < 0 || payloadSize > 10_000_000) {
+                                        SessionLog.w(TAG, "Invalid payload size $payloadSize in TCP stream!")
+                                        break
+                                    }
 
-                            val payload = ByteArray(payloadSize)
-                            dis.readFully(payload, 0, payloadSize)
+                                    val payload = ByteArray(payloadSize)
+                                    dis.readFully(payload, 0, payloadSize)
 
-                            totalBytesReceived += 20 + payloadSize
-                            windowBytesReceived += 20 + payloadSize
+                                    totalBytesReceived += 20 + payloadSize
+                                    windowBytesReceived += 20 + payloadSize
 
-                            if (isAudio) {
-                                onAudioFrame?.invoke(payload, isCodecConfig, timestampMs)
-                            } else {
-                                if (!isCodecConfig) {
-                                    totalReceivedFrames++
-                                    windowReceivedFrames++
+                                    if (isAudio) {
+                                        onAudioFrame?.invoke(payload, isCodecConfig, timestampMs)
+                                    } else {
+                                        if (!isCodecConfig) {
+                                            totalReceivedFrames++
+                                            windowReceivedFrames++
+                                        }
+                                        onFrameAssembled?.invoke(payload, isKeyframe, isCodecConfig, isHevc, timestampMs, frameSeq)
+                                    }
+
+                                    tickStats()
                                 }
-                                onFrameAssembled?.invoke(payload, isKeyframe, isCodecConfig, isHevc, timestampMs, frameSeq)
+                            } catch (e: Exception) {
+                                if (isListening && currentClientSocket == clientSocket) {
+                                    SessionLog.w(TAG, "TCP Receiver stream connection disconnected: ${e.message}")
+                                }
+                            } finally {
+                                try { clientSocket.close() } catch (_: Exception) {}
+                                if (currentClientSocket == clientSocket) currentClientSocket = null
                             }
-
-                            tickStats()
                         }
                     } catch (e: Exception) {
                         if (isListening) {
-                            SessionLog.w(TAG, "TCP Receiver stream connection disconnected: ${e.message}")
+                            SessionLog.w(TAG, "TCP Receiver accept failed: ${e.message}")
                         }
-                    } finally {
-                        try { clientSocket?.close() } catch (_: Exception) {}
                     }
                 }
             } catch (e: Exception) {
@@ -185,6 +208,11 @@ class TcpReceiver : IReceiver {
             // Ignore
         }
         serverSocket = null
+        try {
+            currentClientSocket?.close()
+        } catch (e: Exception) {}
+        currentClientSocket = null
+        
         totalReceivedFrames = 0
         totalBytesReceived = 0
         windowReceivedFrames = 0

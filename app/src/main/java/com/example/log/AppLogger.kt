@@ -75,55 +75,36 @@ object AppLogger {
 
         val savedPaths = mutableListOf<String>()
 
-        // 1. Always write to App External Directory (Guaranteed Writable on all Android versions)
-        try {
-            val appDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                ?: context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-                ?: context.filesDir
-
-            if (appDir != null) {
-                if (!appDir.exists()) appDir.mkdirs()
-                val targetFile = File(appDir, fileName)
-                targetFile.writeText(content)
-                savedPaths.add(targetFile.absolutePath)
-                MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("text/plain"), null)
-            }
-        } catch (e: Exception) {
-            e("AppLogger", "Failed to save log to app external directory", e)
-        }
-
-        // 2. MediaStore API for public Downloads folder on Android 10+ (API 29+)
+        // MediaStore API for public Downloads folder on Android 10+ (API 29+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 val resolver = context.contentResolver
                 val contentValues = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/QuestCast")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                 }
                 val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
                 if (uri != null) {
                     resolver.openOutputStream(uri)?.use { os ->
                         os.write(content.toByteArray())
                     }
-                    savedPaths.add("内部存储/Download/QuestCast/$fileName")
+                    savedPaths.add("内部存储/Download/$fileName")
                 }
             } catch (e: Exception) {
                 e("AppLogger", "Failed to save log via MediaStore to Downloads", e)
             }
         } else {
-            // Android 9 and lower: direct path write to /sdcard/Download or /sdcard/Movies
-            listOf("/sdcard/Download", "/sdcard/Movies").forEach { path ->
-                try {
-                    val dir = File(path)
-                    if (!dir.exists()) dir.mkdirs()
-                    val targetFile = File(dir, fileName)
-                    targetFile.writeText(content)
-                    savedPaths.add(targetFile.absolutePath)
-                    MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("text/plain"), null)
-                } catch (e: Exception) {
-                    // Ignore if no permission
-                }
+            // Android 9 and lower
+            try {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!dir.exists()) dir.mkdirs()
+                val targetFile = File(dir, fileName)
+                targetFile.writeText(content)
+                savedPaths.add(targetFile.absolutePath)
+                MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("text/plain"), null)
+            } catch (e: Exception) {
+                e("AppLogger", "Failed to save log to Downloads directory", e)
             }
         }
 

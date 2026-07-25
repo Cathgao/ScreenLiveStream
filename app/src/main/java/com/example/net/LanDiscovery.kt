@@ -1,7 +1,7 @@
 package com.example.net
 
 import android.os.Build
-import android.util.Log
+import com.example.log.AppLogger
 import com.example.model.DiscoveredDevice
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -46,6 +46,7 @@ class LanDiscovery {
 
                     ds.soTimeout = 1000
                     try {
+                        packet.length = buffer.size
                         ds.receive(packet)
                         val message = String(packet.data, 0, packet.length).trim()
                         val senderIp = packet.address.hostAddress ?: continue
@@ -77,7 +78,7 @@ class LanDiscovery {
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Scanner error", e)
+                AppLogger.e(TAG, "Scanner error", e)
             }
         }
     }
@@ -94,7 +95,7 @@ class LanDiscovery {
             )
             socket.send(packet)
         } catch (e: Exception) {
-            Log.e(TAG, "Broadcast ping failed", e)
+            AppLogger.e(TAG, "Broadcast ping failed", e)
         }
     }
 
@@ -117,10 +118,11 @@ class LanDiscovery {
                 val buffer = ByteArray(1024)
                 val packet = DatagramPacket(buffer, buffer.size)
 
-                Log.d(TAG, "LanDiscovery Announcer listening on port ${PacketProtocol.DISCOVERY_PORT}")
+                AppLogger.d(TAG, "LanDiscovery Announcer listening on port ${PacketProtocol.DISCOVERY_PORT}")
 
                 while (isAnnouncing && !ds.isClosed) {
                     try {
+                        packet.length = buffer.size
                         ds.soTimeout = 2000
                         ds.receive(packet)
                         val message = String(packet.data, 0, packet.length).trim()
@@ -141,7 +143,7 @@ class LanDiscovery {
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Announcer error", e)
+                AppLogger.e(TAG, "Announcer error", e)
             }
         }
     }

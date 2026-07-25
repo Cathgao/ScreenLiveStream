@@ -23,6 +23,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.ContextCompat
@@ -94,8 +96,15 @@ class MainActivity : ComponentActivity() {
         bindService(receiverIntent, receiverConnection, Context.BIND_AUTO_CREATE)
 
         setContent {
-            QuestCastTheme {
-                val currentMode by viewModel.currentMode.collectAsState()
+            val density = LocalDensity.current
+            // Clamp font scale to prevent large text from breaking the layout on different DPI/font settings
+            val customDensity = Density(
+                density = density.density,
+                fontScale = density.fontScale.coerceIn(0.85f, 1.15f)
+            )
+            CompositionLocalProvider(LocalDensity provides customDensity) {
+                QuestCastTheme {
+                    val currentMode by viewModel.currentMode.collectAsState()
 
                 Scaffold(
                     modifier = Modifier.fillMaxSize(),
@@ -193,6 +202,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            }
             }
         }
     }

@@ -10,7 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
+import com.example.log.AppLogger
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
@@ -126,7 +126,7 @@ class QuestReceiverService : Service() {
             lanDiscovery.startAnnouncing(port)
         }
         isListening = true
-        Log.d(TAG, "QuestReceiverService listening started on port $port, jitterBufferMs=$jitterBufferMs, protocol=${protocol.name}")
+        AppLogger.i(TAG, "QuestReceiverService listening started on port $port, jitterBufferMs=$jitterBufferMs, protocol=${protocol.name}")
     }
 
     fun stopListening() {
@@ -141,7 +141,7 @@ class QuestReceiverService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
-        Log.d(TAG, "QuestReceiverService listening stopped")
+        AppLogger.i(TAG, "QuestReceiverService listening stopped")
     }
 
     override fun onDestroy() {

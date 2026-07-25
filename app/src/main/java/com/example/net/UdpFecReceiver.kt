@@ -1,6 +1,6 @@
 package com.example.net
 
-import android.util.Log
+import com.example.log.AppLogger
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.nio.ByteBuffer
@@ -54,16 +54,18 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     override fun start(port: Int) {
         if (isListening) return
         isListening = true
+        
         kotlin.concurrent.thread(name = "UdpReceiverThread") {
             try {
                 socket = DatagramSocket(listenPort)
                 socket?.receiveBufferSize = 8 * 1024 * 1024
-                Log.i(TAG, "UDP Receiver listening on port $listenPort")
+                AppLogger.i(TAG, "UDP Receiver listening on port $listenPort")
                 
                 val buffer = ByteArray(2000)
                 val dp = DatagramPacket(buffer, buffer.size)
                 
                 while (isListening) {
+                    dp.length = buffer.size
                     socket?.receive(dp)
                     val length = dp.length
                     if (length < 28) continue
@@ -133,7 +135,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     checkAndAssemble(fb)
                 }
             } catch (e: Exception) {
-                if (isListening) Log.e(TAG, "UDP Receiver error", e)
+                if (isListening) AppLogger.e(TAG, "UDP Receiver error", e)
             } finally {
                 isListening = false
             }
