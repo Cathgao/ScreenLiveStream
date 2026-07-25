@@ -315,7 +315,7 @@ fun SenderScreen(
         val buttonText = when {
             isStreaming -> "停止推流"
             !isInputValid -> "请在上方输入合法的接收端 IP 及端口"
-            config.targetIp.isNotEmpty() -> "启动 Quest 3 画面投屏"
+            config.targetIp.isNotEmpty() -> if (viewModel.isQuestDevice) "启动Quest画面投屏" else "启动画面投屏"
             else -> "请在上方选择或输入接收端 IP"
         }
 
@@ -351,6 +351,33 @@ fun SenderScreen(
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
+        }
+        
+        if (viewModel.isQuestDevice) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("选择投屏画面 (Quest)", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+            Spacer(modifier = Modifier.height(6.dp))
+            @OptIn(ExperimentalLayoutApi::class)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                EyeCrop.values().forEach { crop ->
+                    val selected = config.eyeCrop == crop
+                    FilterChip(
+                        selected = selected,
+                        onClick = { viewModel.updateEyeCrop(crop) },
+                        label = { Text(crop.displayName, fontWeight = FontWeight.Bold) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = NeonCyan,
+                            selectedLabelColor = Color.Black,
+                            containerColor = DarkCyberCard,
+                            labelColor = TextPrimary
+                        )
+                    )
+                }
+            }
         }
 
 

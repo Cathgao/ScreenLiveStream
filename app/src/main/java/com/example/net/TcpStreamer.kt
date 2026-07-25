@@ -41,6 +41,7 @@ class TcpStreamer : IStreamer {
         var isBeacon: Boolean = false
         var rttMs: Int = 0
         var lossPercent: Float = 0f
+        var isStreamStop: Boolean = false
     }
 
     private val taskQueue = ArrayBlockingQueue<FrameTask>(100)
@@ -96,7 +97,17 @@ class TcpStreamer : IStreamer {
                     val dos = dataOutputStream
                     if (dos != null) {
                         try {
-                            if (task.isBeacon) {
+                            if (task.isStreamStop) {
+                                val flags = PacketProtocol.FLAG_STREAM_STOP
+                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
+                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
+                                dos.writeByte(PacketProtocol.VERSION.toInt())
+                                dos.writeByte(flags.toInt())
+                                dos.writeInt(0)
+                                dos.writeLong(0L)
+                                dos.writeInt(0)
+                                dos.flush()
+                            } else if (task.isBeacon) {
                                 val flags = PacketProtocol.FLAG_PING_STATS
                                 dos.writeByte(PacketProtocol.MAGIC_0.toInt())
                                 dos.writeByte(PacketProtocol.MAGIC_1.toInt())
@@ -233,6 +244,16 @@ class TcpStreamer : IStreamer {
         task.rttMs = rttMs
         task.lossPercent = lossPercent
 
+        if (!taskQueue.offer(task)) {
+            recycleTask(task)
+        }
+    }
+
+    override fun sendStreamStopSignal() {
+        if (!isConnected) return
+        taskQueue.clear()
+        val task = obtainTask(0)
+        task.isStreamStop = true
         if (!taskQueue.offer(task)) {
             recycleTask(task)
         }

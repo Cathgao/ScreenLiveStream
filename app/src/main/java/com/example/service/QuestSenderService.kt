@@ -94,12 +94,12 @@ class QuestSenderService : Service() {
 
         val resWidth = intent?.getIntExtra(EXTRA_RES_WIDTH, 0) ?: 0
         val resHeight = intent?.getIntExtra(EXTRA_RES_HEIGHT, 0) ?: 0
-        val eyeCropName = intent?.getStringExtra(EXTRA_EYE_CROP) ?: EyeCrop.LEFT_EYE.name
+        val eyeCropName = intent?.getStringExtra(EXTRA_EYE_CROP) ?: EyeCrop.BOTH.name
         val codecName = intent?.getStringExtra(EXTRA_CODEC) ?: VideoCodec.H265.name
         val bitrateModeName = intent?.getStringExtra(EXTRA_BITRATE_MODE) ?: BitrateMode.VBR.name
         val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
 
-        val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.LEFT_EYE }
+        val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.BOTH }
         val codec = try { VideoCodec.valueOf(codecName) } catch (e: Exception) { VideoCodec.H265 }
         val bitrateMode = try { BitrateMode.valueOf(bitrateModeName) } catch (e: Exception) { BitrateMode.VBR }
         val protocol = try { TransportProtocol.valueOf(protocolName) } catch (e: Exception) { TransportProtocol.UDP }
@@ -215,6 +215,9 @@ class QuestSenderService : Service() {
         }
         rttProbe.start(config.targetIp, config.targetPort)
 
+        // Apply EyeCrop to System Properties for Quest
+        setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
+
         // Dynamically compute native width, height, refresh rate if Native Match (0) is specified
         val metrics = resources.displayMetrics
         var effWidth = if (config.resolution.width > 0) {
@@ -241,6 +244,10 @@ class QuestSenderService : Service() {
             AppLogger.w(TAG, "Height $effHeight exceeds encoder capability maximum ${caps.maxHeight}, clamping to $clampedHeight")
             effHeight = clampedHeight
         }
+
+        // Apply Resolution to System Properties for Quest
+        setSystemProperty("debug.oculus.capture.width", effWidth.toString())
+        setSystemProperty("debug.oculus.capture.height", effHeight.toString())
 
         val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
@@ -348,6 +355,9 @@ class QuestSenderService : Service() {
         encoder = null
 
         try {
+            streamer?.sendStreamStopSignal()
+            // Allow a brief moment for the signal to be sent over the socket before closing
+            Thread.sleep(50)
             streamer?.stop()
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error stopping streamer", e)
@@ -536,6 +546,24 @@ class QuestSenderService : Service() {
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止投屏", stopPendingIntent)
             .setOngoing(true)
             .build()
+    }
+
+    private fun setSystemProperty(key: String, value: String) {
+        try {
+            val process = Runtime.getRuntime().exec("setprop $key $value")
+            process.waitFor()
+            AppLogger.i(TAG, "Successfully executed setprop for $key: $value")
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to execute setprop. Attempting reflection fallback for $key.", e)
+            try {
+                val clazz = Class.forName("android.os.SystemProperties")
+                val setMethod = clazz.getMethod("set", String::class.java, String::class.java)
+                setMethod.invoke(null, key, value)
+                AppLogger.i(TAG, "Successfully set $key via reflection: $value")
+            } catch (ex: Exception) {
+                AppLogger.e(TAG, "Reflection fallback failed for $key", ex)
+            }
+        }
     }
 
     companion object {

@@ -7,10 +7,10 @@ enum class VideoCodec(val displayName: String, val mimeType: String) {
     H265("H.265 / HEVC (推荐)", "video/hevc")
 }
 
-enum class EyeCrop(val displayName: String, val description: String) {
-    LEFT_EYE("Left Eye (推荐)", "仅截取 Quest 3 左眼画面，无双眼重影"),
-    RIGHT_EYE("Right Eye", "仅截取 Quest 3 右眼画面"),
-    FULL_FRAME("Full SBS Frame", "全屏双眼并排画面 (VR 原始格式)")
+enum class EyeCrop(val displayName: String, val sysPropValue: Int) {
+    BOTH("双眼", 2),
+    LEFT("左眼", 0),
+    RIGHT("右眼", 1)
 }
 
 data class VideoResolution(val displayName: String, val width: Int, val height: Int) {
@@ -35,7 +35,7 @@ data class StreamConfig(
     val bitrateKbps: Int = 16000, // 16 Mbps default
     val bitrateMode: BitrateMode = BitrateMode.VBR, // VBR default for max resource savings
     val frameRate: Int = 0, // 0 = Match Native (72/90/120 FPS)
-    val eyeCrop: EyeCrop = EyeCrop.LEFT_EYE,
+    val eyeCrop: EyeCrop = EyeCrop.BOTH,
     val resolution: VideoResolution = VideoResolution.DEFAULT,
     val targetIp: String = "192.168.1.100",
     val targetPort: Int = 8888,

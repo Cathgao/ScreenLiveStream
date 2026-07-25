@@ -40,6 +40,7 @@ class UdpFecStreamer : IStreamer {
         var isBeacon: Boolean = false
         var rttMs: Int = 0
         var lossPercent: Float = 0f
+        var isStreamStop: Boolean = false
     }
 
     private val taskQueue = ArrayBlockingQueue<FrameTask>(100)
@@ -86,7 +87,14 @@ class UdpFecStreamer : IStreamer {
                     val task = taskQueue.take()
                     if (socket != null && targetAddress != null) {
                         try {
-                            if (task.isBeacon) {
+                            if (task.isStreamStop) {
+                                packetBuf.clear()
+                                packetBuf.put(PacketProtocol.buildStreamStopPacket())
+                                val dp = DatagramPacket(packetBuf.array(), PacketProtocol.HEADER_SIZE, targetAddress, targetPort)
+                                for (i in 0 until 10) {
+                                    socket?.send(dp)
+                                }
+                            } else if (task.isBeacon) {
                                 val flags = 64 // 64 = Beacon
                                 packetBuf.clear()
                                 packetBuf.putInt(0x55445056)
@@ -256,6 +264,16 @@ class UdpFecStreamer : IStreamer {
         task.rttMs = rttMs
         task.lossPercent = lossPercent
         
+        if (!taskQueue.offer(task)) {
+            recycleTask(task)
+        }
+    }
+    
+    override fun sendStreamStopSignal() {
+        if (!isStreaming) return
+        taskQueue.clear()
+        val task = obtainTask(0)
+        task.isStreamStop = true
         if (!taskQueue.offer(task)) {
             recycleTask(task)
         }

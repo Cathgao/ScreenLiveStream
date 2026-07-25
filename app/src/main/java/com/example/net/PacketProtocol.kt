@@ -30,6 +30,24 @@ object PacketProtocol {
     const val FLAG_PING_STATS: Byte = 0x40
     const val FLAG_NACK: Byte = 0x80.toByte()
     const val FLAG_PLI: Byte = 0x81.toByte()
+    const val FLAG_STREAM_STOP: Byte = 0x82.toByte()
+
+    fun buildStreamStopPacket(): ByteArray {
+        val packet = ByteArray(HEADER_SIZE)
+        val bb = ByteBuffer.wrap(packet)
+        bb.put(MAGIC_0)
+        bb.put(MAGIC_1)
+        bb.put(VERSION)
+        bb.put(FLAG_STREAM_STOP)
+        // Rest can be zeros
+        return packet
+    }
+
+    fun isStreamStopPacket(data: ByteArray, length: Int): Boolean {
+        if (length < HEADER_SIZE) return false
+        if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return false
+        return data[3] == FLAG_STREAM_STOP
+    }
 
     fun buildNackPacket(frameSeq: Int, packetIndex: Int): ByteArray {
         val packet = ByteArray(HEADER_SIZE)

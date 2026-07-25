@@ -21,6 +21,7 @@ interface IStreamer {
     )
 
     fun sendStatsBeacon(rttMs: Int, lossPercent: Float)
+    fun sendStreamStopSignal()
     
     var onRequestKeyframe: (() -> Unit)?
     

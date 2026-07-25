@@ -43,6 +43,13 @@ class QuestReceiverService : Service() {
 
     var onStatsUpdated: ((StreamStats) -> Unit)? = null
 
+    private var lastPort = 8888
+    private var lastAutoAnnounce = true
+    private var lastJitterBufferMs = 50
+    private var lastProtocol = TransportProtocol.UDP
+    
+    private var lastStreamStopMs = 0L
+
     inner class LocalBinder : Binder() {
         fun getService(): QuestReceiverService = this@QuestReceiverService
     }
@@ -93,6 +100,11 @@ class QuestReceiverService : Service() {
     }
 
     fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 50, protocol: TransportProtocol = TransportProtocol.UDP) {
+        lastPort = port
+        lastAutoAnnounce = autoAnnounce
+        lastJitterBufferMs = jitterBufferMs
+        lastProtocol = protocol
+        
         stopListening()
         
         lanDiscovery.deviceNameProvider = {
@@ -126,6 +138,33 @@ class QuestReceiverService : Service() {
 
         currentReceiver.onReferenceLost = {
             videoDecoder.notifyReferenceLost()
+        }
+
+        currentReceiver.onStreamStop = {
+            val now = System.currentTimeMillis()
+            if (now - lastStreamStopMs > 3000L) {
+                lastStreamStopMs = now
+                AppLogger.i(TAG, "Stream stop signal received, calling stopListening and restarting in 500ms.")
+                
+                // 1. Stop listening completely
+                stopListening()
+                
+                // Reset stats and video size
+                onStatsUpdated?.invoke(com.example.model.StreamStats())
+                onVideoSizeChanged?.invoke(0, 0)
+                
+                // 2. Restart listening after 500ms
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    startListening(lastPort, lastAutoAnnounce, lastJitterBufferMs, lastProtocol)
+                    currentSurface?.let { surface ->
+                        if (surface.isValid) {
+                            videoDecoder.setSurface(surface)
+                        }
+                    }
+                }, 500L)
+            } else {
+                AppLogger.d(TAG, "Duplicate STREAM_STOP signal ignored by debounce.")
+            }
         }
 
         currentReceiver.onStatsUpdated = { stats ->

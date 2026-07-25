@@ -181,12 +181,24 @@ class AudioDecoder {
     }
 
     @Synchronized
+    fun flushDecoder() {
+        try {
+            decoder?.flush()
+            taskQueue.clear()
+            Log.i(TAG, "AudioDecoder flushed successfully.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error flushing AudioDecoder", e)
+        }
+    }
+
+    @Synchronized
     fun stop() {
         isFeeding = false
         feedThread?.interrupt()
         feedThread = null
         
         isDecoderReady = false
+        lastCodecConfigData = null
         try {
             decoder?.stop()
             decoder?.release()

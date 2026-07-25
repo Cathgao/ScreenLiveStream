@@ -25,6 +25,7 @@ class TcpReceiver : IReceiver {
     override var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
     override var onStatsUpdated: ((StreamStats) -> Unit)? = null
     override var onReferenceLost: (() -> Unit)? = null
+    override var onStreamStop: (() -> Unit)? = null
     var onProbeReply: ((probeSeq: Int, originalSendTimeNanos: Long) -> Unit)? = null
 
     @Volatile
@@ -131,11 +132,18 @@ class TcpReceiver : IReceiver {
                                     val isHevc = (flags and PacketProtocol.FLAG_CODEC_HEVC.toInt()) != 0
                                     val isAudio = (flags and PacketProtocol.FLAG_AUDIO.toInt()) != 0
                                     val isPingStats = (flags and PacketProtocol.FLAG_PING_STATS.toInt()) != 0
+                                    val isStreamStop = (flags == (PacketProtocol.FLAG_STREAM_STOP.toInt() and 0xFF))
 
                                     val bb = ByteBuffer.wrap(headerBuf, 4, 16)
                                     val frameSeq = bb.int
                                     val timestampMs = bb.long
                                     val payloadSize = bb.int
+                                    
+                                    if (isStreamStop) {
+                                        SessionLog.i(TAG, "Received STREAM_STOP packet via TCP")
+                                        onStreamStop?.invoke()
+                                        continue
+                                    }
                                     
                                     if (totalReceivedFrames <= 5L) {
                                         SessionLog.i(TAG, "TCP recv header: seq=$frameSeq size=$payloadSize isAudio=$isAudio isBeacon=$isPingStats")
@@ -175,6 +183,7 @@ class TcpReceiver : IReceiver {
                             } catch (e: Exception) {
                                 if (isListening && currentClientSocket == clientSocket) {
                                     SessionLog.w(TAG, "TCP Receiver stream connection disconnected: ${e.message}")
+                                    onStreamStop?.invoke()
                                 }
                             } finally {
                                 try { clientSocket.close() } catch (_: Exception) {}

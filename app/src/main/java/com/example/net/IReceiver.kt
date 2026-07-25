@@ -7,6 +7,7 @@ interface IReceiver {
     var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)?
     var onReferenceLost: (() -> Unit)?
     var onStatsUpdated: ((StreamStats) -> Unit)?
+    var onStreamStop: (() -> Unit)?
     
     var jitterBufferMs: Int
     

@@ -19,6 +19,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     override var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
     override var onReferenceLost: (() -> Unit)? = null
     override var onStatsUpdated: ((StreamStats) -> Unit)? = null
+    override var onStreamStop: (() -> Unit)? = null
     override var jitterBufferMs: Int = 0
     
     private val MAX_PAYLOAD = 1300
@@ -57,7 +58,10 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         
         kotlin.concurrent.thread(name = "UdpReceiverThread") {
             try {
-                socket = DatagramSocket(listenPort)
+                val s = DatagramSocket(null)
+                s.reuseAddress = true
+                s.bind(java.net.InetSocketAddress(listenPort))
+                socket = s
                 socket?.receiveBufferSize = 8 * 1024 * 1024
                 AppLogger.i(TAG, "UDP Receiver listening on port $listenPort")
                 
@@ -69,6 +73,17 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     socket?.receive(dp)
                     val length = dp.length
                     
+                    if (length >= PacketProtocol.HEADER_SIZE) {
+                        if (PacketProtocol.isStreamStopPacket(buffer, length)) {
+                            AppLogger.i(TAG, "Received STREAM_STOP packet via UDP")
+                            onStreamStop?.invoke()
+                            // Clear state
+                            lastAssembledSeq = -1
+                            frameBuffers.clear()
+                            continue
+                        }
+                    }
+
                     if (length >= PacketProtocol.HEADER_SIZE + 8) {
                         val probe = PacketProtocol.readProbeSequence(buffer, length)
                         if (probe != null && !probe.isReply) {
@@ -115,8 +130,17 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                         continue
                     }
                     
-                    if (seq <= lastAssembledSeq) continue
-                    
+                    if (seq <= lastAssembledSeq) {
+                        if (lastAssembledSeq - seq > 100) {
+                            AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq")
+                            lastAssembledSeq = -1
+                            frameBuffers.clear()
+                            // Fall through to process this packet
+                        } else {
+                            continue
+                        }
+                    }
+
                     var fb = frameBuffers[seq]
                     if (fb == null) {
                         fb = FrameBuffer(seq, totalFragments, frameSize, ts, flags)

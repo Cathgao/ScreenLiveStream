@@ -23,6 +23,7 @@ class VideoDecoder {
     private var lastCodecConfigData: ByteArray? = null
     private var hasReceivedFirstKeyframe = false
     private var lastFrameSeq = -1
+    private var lastTimestampMs = -1L
     @Volatile
     private var referenceLost = false
 
@@ -484,6 +485,13 @@ class VideoDecoder {
             start(surf, isHevc, lastCodecConfigData)
         }
 
+        if (lastTimestampMs != -1L && timestampMs < lastTimestampMs - 1000) {
+            Log.i(TAG, "Timestamp reset detected (old=$lastTimestampMs, new=$timestampMs). Restarting decoder.")
+            stop()
+            start(surf, isHevc, lastCodecConfigData)
+        }
+        lastTimestampMs = timestampMs
+
         val finalBytes = if (isKeyframe && lastCodecConfigData != null && !containsParameterSets(formattedBytes, isHevc)) {
             val config = lastCodecConfigData!!
             val combined = ByteArray(config.size + formattedBytes.size)
@@ -557,11 +565,14 @@ class VideoDecoder {
 
     fun stop() {
         stopDrainThread()
+        stopFeedThread()
         isDecoderReady = false
         hasReceivedFirstKeyframe = false
         lastFrameSeq = -1
+        lastTimestampMs = -1L
         referenceLost = false
         receiverStartNs = 0L
+        lastCodecConfigData = null
         activeDecoderName = "未运行"
         try {
             decoder?.stop()
@@ -571,6 +582,21 @@ class VideoDecoder {
         }
         decoder = null
         currentCodec = null
+    }
+
+    fun flushDecoder() {
+        try {
+            decoder?.flush()
+            taskQueue.clear()
+            hasReceivedFirstKeyframe = false
+            lastFrameSeq = -1
+            referenceLost = false
+            receiverStartNs = 0L
+            streamStartPtsUs = 0L
+            Log.i(TAG, "Decoder flushed successfully.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error flushing decoder", e)
+        }
     }
 
     companion object {
