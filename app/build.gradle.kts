@@ -9,6 +9,13 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+// Version is overridable from CI via `-PversionCode=N -PversionName=...`.
+// Defaults keep local/non-release builds working as before.
+val resolvedVersionCode: Int =
+  (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 1
+val resolvedVersionName: String =
+  (project.findProperty("versionName") as? String) ?: "1.0"
+
 android {
   namespace = "com.cath.screencast"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -17,8 +24,8 @@ android {
     applicationId = "com.cath.screencast"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = resolvedVersionCode
+    versionName = resolvedVersionName
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

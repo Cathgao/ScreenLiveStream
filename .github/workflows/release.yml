@@ -31,18 +31,33 @@ jobs:
         run: |
           echo $ENCODED_STRING | base64 -d > release.jks
 
+      - name: Parse version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Tag '$TAG' must match vMAJOR.MINOR (e.g. v1.0, v2.3)."
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          VERSION_NAME="$MAJOR.$MINOR"
+          VERSION_CODE=$((MAJOR * 100 + MINOR))
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "Resolved tag '$TAG' -> versionName='$VERSION_NAME' versionCode=$VERSION_CODE"
+
       - name: Unit tests
-        run: ./gradlew :app:testDebugUnitTest
+        run: ./gradlew :app:testDebugUnitTest -PversionCode=$VERSION_CODE -PversionName="$VERSION_NAME"
 
       - name: Android lint
-        run: ./gradlew :app:lintDebug
+        run: ./gradlew :app:lintDebug -PversionCode=$VERSION_CODE -PversionName="$VERSION_NAME"
 
       - name: Build Release APK
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/release.jks
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+        run: ./gradlew assembleRelease -PversionCode=$VERSION_CODE -PversionName="$VERSION_NAME"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
