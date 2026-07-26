@@ -39,6 +39,14 @@ class VideoDecoder {
     var activeDecoderName: String = "未初始化"
         private set
 
+    @Volatile
+    var videoWidth: Int = 0
+        private set
+
+    @Volatile
+    var videoHeight: Int = 0
+        private set
+
     var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
     var onRequestKeyframe: (() -> Unit)? = null
 
@@ -383,6 +391,8 @@ class VideoDecoder {
                             val format = mc.outputFormat
                             val w = format.getInteger(MediaFormat.KEY_WIDTH)
                             val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+                            videoWidth = w
+                            videoHeight = h
                             AppLogger.i(TAG, "Video format changed: $w x $h")
                             onVideoSizeChanged?.invoke(w, h)
                         } catch (e: Exception) {

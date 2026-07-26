@@ -30,6 +30,9 @@ class QuestReceiverService : Service() {
     val videoDecoder = VideoDecoder()
     val audioDecoder = AudioDecoder()
     val lanDiscovery = LanDiscovery()
+    private var muxerManager: com.example.encoder.MuxerManager? = null
+    @Volatile
+    private var recordingStartNs: Long = 0L
 
     @Volatile
     var isListening = false
@@ -127,6 +130,7 @@ class QuestReceiverService : Service() {
         val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, 50) ?: 50
         val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
         val protocol = try { TransportProtocol.valueOf(protocolName) } catch (e: Exception) { TransportProtocol.UDP }
+        val isRecordEnabled = intent?.getBooleanExtra(EXTRA_RECORD_ENABLED, false) ?: false
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -138,7 +142,7 @@ class QuestReceiverService : Service() {
             startForeground(NOTIFICATION_ID, createNotification(port))
         }
 
-        startListening(port, autoAnnounce, jitterBufferMs, protocol)
+        startListening(port, autoAnnounce, jitterBufferMs, protocol, isRecordEnabled)
 
         return START_STICKY
     }
@@ -155,13 +159,42 @@ class QuestReceiverService : Service() {
         audioDecoder.stop()
     }
 
-    fun startListening(port: Int = 8888, autoAnnounce: Boolean = true, jitterBufferMs: Int = 50, protocol: TransportProtocol = TransportProtocol.UDP) {
+    fun startListening(
+        port: Int = 8888,
+        autoAnnounce: Boolean = true,
+        jitterBufferMs: Int = 50,
+        protocol: TransportProtocol = TransportProtocol.UDP,
+        isRecordEnabled: Boolean = false
+    ) {
         lastPort = port
         lastAutoAnnounce = autoAnnounce
         lastJitterBufferMs = jitterBufferMs
         lastProtocol = protocol
         
         stopListening()
+        
+        if (isRecordEnabled) {
+            try {
+                recordingStartNs = System.nanoTime()
+                val mgr = com.example.encoder.MuxerManager(
+                    context = this,
+                    codecName = "Receiver",
+                    expectAudio = true
+                )
+                // Pre-set standard AAC format (AAC-LC 48kHz Stereo csd-0: 0x11, 0x90) so audio track is never skipped
+                val defaultAudioFormat = android.media.MediaFormat.createAudioFormat(android.media.MediaFormat.MIMETYPE_AUDIO_AAC, 48000, 2).apply {
+                    setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(byteArrayOf(0x11.toByte(), 0x90.toByte())))
+                }
+                mgr.setAudioFormat(defaultAudioFormat)
+                muxerManager = mgr
+                AppLogger.i(TAG, "QuestReceiverService initialized MuxerManager with AAC audio pre-set for MP4 recording.")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to initialize MuxerManager in QuestReceiverService", e)
+                muxerManager = null
+            }
+        } else {
+            muxerManager = null
+        }
         
         lanDiscovery.deviceNameProvider = {
             var customName: String? = null
@@ -200,6 +233,37 @@ class QuestReceiverService : Service() {
                 isTimeoutCountdownActive = false
                 AppLogger.i(TAG, "Frame received, cancelling disconnect countdown.")
             }
+
+            muxerManager?.let { mgr ->
+                try {
+                    val ptsUs = (timestampMs * 1000L).coerceAtLeast(0L)
+                    if (isCodecConfig) {
+                        val mime = if (isHevc) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+                        val w = if (videoDecoder.videoWidth > 0) videoDecoder.videoWidth else 1280
+                        val h = if (videoDecoder.videoHeight > 0) videoDecoder.videoHeight else 720
+                        val format = android.media.MediaFormat.createVideoFormat(mime, w, h)
+                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
+                        mgr.setVideoFormat(format)
+                    } else {
+                        if (!mgr.isStarted) {
+                            val mime = if (isHevc) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+                            val w = if (videoDecoder.videoWidth > 0) videoDecoder.videoWidth else 1280
+                            val h = if (videoDecoder.videoHeight > 0) videoDecoder.videoHeight else 720
+                            val format = android.media.MediaFormat.createVideoFormat(mime, w, h)
+                            format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
+                            mgr.setVideoFormat(format)
+                        }
+                        val buffer = java.nio.ByteBuffer.wrap(frameBytes)
+                        val bufferInfo = android.media.MediaCodec.BufferInfo().apply {
+                            set(0, frameBytes.size, ptsUs, if (isKeyframe) android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                        }
+                        mgr.writeVideoSample(buffer, bufferInfo)
+                    }
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "Error writing video sample to receiver muxer", e)
+                }
+            }
+
             videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
         }
 
@@ -210,6 +274,26 @@ class QuestReceiverService : Service() {
             if (isTimeoutCountdownActive) {
                 isTimeoutCountdownActive = false
             }
+
+            muxerManager?.let { mgr ->
+                try {
+                    val ptsUs = (timestampMs * 1000L).coerceAtLeast(0L)
+                    if (isCodecConfig) {
+                        val format = android.media.MediaFormat.createAudioFormat(android.media.MediaFormat.MIMETYPE_AUDIO_AAC, 48000, 2)
+                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
+                        mgr.setAudioFormat(format)
+                    } else {
+                        val buffer = java.nio.ByteBuffer.wrap(frameBytes)
+                        val bufferInfo = android.media.MediaCodec.BufferInfo().apply {
+                            set(0, frameBytes.size, ptsUs, 0)
+                        }
+                        mgr.writeAudioSample(buffer, bufferInfo)
+                    }
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "Error writing audio sample to receiver muxer", e)
+                }
+            }
+
             audioDecoder.decodeFrame(frameBytes, isCodecConfig, timestampMs)
         }
 
@@ -261,6 +345,13 @@ class QuestReceiverService : Service() {
         hasReceivedFirstFrame = false
         isTimeoutCountdownActive = false
         
+        try {
+            muxerManager?.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping receiver muxerManager", e)
+        }
+        muxerManager = null
+
         receiver?.stop()
         videoDecoder.stop()
         audioDecoder.stop()
@@ -324,5 +415,6 @@ class QuestReceiverService : Service() {
         const val EXTRA_AUTO_ANNOUNCE = "EXTRA_AUTO_ANNOUNCE"
         const val EXTRA_JITTER_BUFFER_MS = "EXTRA_JITTER_BUFFER_MS"
         const val EXTRA_PROTOCOL = "EXTRA_PROTOCOL"
+        const val EXTRA_RECORD_ENABLED = "EXTRA_RECORD_ENABLED"
     }
 }

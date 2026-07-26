@@ -39,7 +39,7 @@ fun ReceiverScreen(
     viewModel: MainViewModel,
     receiverService: QuestReceiverService?,
     isListening: Boolean,
-    onStartListening: (Int) -> Unit,
+    onStartListening: (port: Int, isRecordEnabled: Boolean) -> Unit,
     onStopListening: () -> Unit
 ) {
     val receiverConfig by viewModel.receiverConfig.collectAsState()
@@ -48,6 +48,7 @@ fun ReceiverScreen(
 
     var videoWidth by remember { mutableStateOf(0) }
     var videoHeight by remember { mutableStateOf(0) }
+    var isRecordEnabled by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -264,6 +265,47 @@ fun ReceiverScreen(
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                     
+                    // Recording switch above start button
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Videocam,
+                                contentDescription = null,
+                                tint = if (isRecordEnabled) LiveGreen else TextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = "同时录制到本地",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "保存至 Movies/QuestCast/",
+                                    fontSize = 10.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = isRecordEnabled,
+                            onCheckedChange = { isRecordEnabled = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.Black,
+                                checkedTrackColor = LiveGreen
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -305,7 +347,7 @@ fun ReceiverScreen(
 
                         Button(
                             onClick = {
-                                onStartListening(receiverConfig.listenPort)
+                                onStartListening(receiverConfig.listenPort, isRecordEnabled)
                             },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = LiveGreen,

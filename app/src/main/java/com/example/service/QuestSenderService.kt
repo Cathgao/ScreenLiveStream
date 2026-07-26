@@ -41,18 +41,6 @@ class QuestSenderService : Service() {
     private var encoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
     private var streamer: IStreamer? = null
-    // Local MP4 recording sink. When non-null, every encoder output
-    // buffer is also written to a file in /sdcard/Movies/QuestCast.
-    // Lifecycle is bound to startStreaming/stopStreaming; rotating the
-    // screen (recreateEncoderAndVirtualDisplay) keeps the existing
-    // muxer alive because the underlying MediaProjection is reused.
-    // Local MP4 recording sink. Lifecycle: created in startStreaming
-    // when recordingEnabled, stopped first in stopStreaming.
-    private var muxer: com.example.encoder.MuxerManager? = null
-    // Independent ping/echo used to derive real link RTT and a true
-    // network-layer loss rate (the legacy latencyMs number was based on
-    // wall-clock delta with no NTP-equivalent between phones; it always
-    // read as the upper clamp). Hooked up in startStreaming/stopStreaming.
     private val rttProbe = RttProbe()
     @Volatile
     private var latestRttStats: RttProbe.ProbeStats? = null
@@ -60,11 +48,6 @@ class QuestSenderService : Service() {
     @Volatile
     var isStreaming = false
         private set
-
-    /** When true, the sender also writes the encoded stream to a
-     *  local MP4 in Movies/QuestCast while streaming. Set via
-     *  EXTRA_RECORD; defaults to false. */
-    private var recordingEnabled: Boolean = false
 
     private var savedResultCode: Int = 0
     private var savedResultData: Intent? = null
@@ -111,11 +94,6 @@ class QuestSenderService : Service() {
         val codecName = intent?.getStringExtra(EXTRA_CODEC) ?: VideoCodec.H265.name
         val bitrateModeName = intent?.getStringExtra(EXTRA_BITRATE_MODE) ?: BitrateMode.VBR.name
         val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
-        // Default recording to ON so the desync vs. capture question
-        // can be answered on the very first run. The UI can flip this
-        // via EXTRA_RECORD = true.
-        recordingEnabled = intent?.getBooleanExtra(EXTRA_RECORD, false) ?: false
-
         val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.BOTH }
         val codec = try { VideoCodec.valueOf(codecName) } catch (e: Exception) { VideoCodec.H265 }
         val bitrateMode = try { BitrateMode.valueOf(bitrateModeName) } catch (e: Exception) { BitrateMode.VBR }
@@ -316,27 +294,6 @@ class QuestSenderService : Service() {
             AppLogger.e(TAG, "Failed to start internal AudioEncoder", e)
         }
 
-        // Wire up the local MP4 muxer (if recording is enabled).
-        // Muxer is created after both encoders so the first buffers
-        // (codec config + format change) are still captured.
-        if (recordingEnabled) {
-            try {
-                val mgr = com.example.encoder.MuxerManager(
-                    context = this,
-                    codecName = config.codec.name,
-                    expectAudio = audioEncoder != null
-                )
-                enc.onEncodedSample?.let { /* already set below via attach */ }
-                mgr.attachVideoEncoder(enc)
-                audioEncoder?.let { mgr.attachAudioEncoder(it) }
-                muxer = mgr
-                AppLogger.i(TAG, "Local MP4 recording enabled (${config.codec.name}, audio=${audioEncoder != null})")
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Failed to start local MP4 recording — recording disabled for this session", e)
-                muxer = null
-            }
-        }
-
         val surface = enc.inputSurface
         if (surface == null) {
             AppLogger.e(TAG, "Encoder inputSurface is null! Cannot create VirtualDisplay.")
@@ -376,20 +333,6 @@ class QuestSenderService : Service() {
     fun stopStreaming() {
         AppLogger.i(TAG, "stopStreaming requested.")
         isStreaming = false
-
-        // Stop the muxer first so its MediaMuxer.stop() runs before
-        // the encoders that feed it are released — otherwise a final
-        // frame can race with release().
-        muxer?.let { mgr ->
-            encoder?.let { mgr.detachVideoEncoder(it) }
-            audioEncoder?.let { mgr.detachAudioEncoder(it) }
-            try {
-                mgr.stop()
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Error stopping muxer", e)
-            }
-        }
-        muxer = null
 
         displayListener?.let { listener ->
             val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager

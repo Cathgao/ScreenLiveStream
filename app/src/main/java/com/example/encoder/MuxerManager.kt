@@ -41,8 +41,10 @@ class MuxerManager(
     // sample's PTS to produce a zero-based muxerPts. a/v sync is now
     // established at the sender, so the muxer just records whatever
     // the encoders hand in.
-    private var videoStartPtsUs = -1L
-    private var audioStartPtsUs = -1L
+    // Unified baseline PTS. The first sample (video or audio) sets
+    // baseStartPtsUs; all subsequent samples subtract this base to preserve
+    // A/V sync and VFR frame timing.
+    private var baseStartPtsUs = -1L
     private var prevVideoPtsUs = -1L
     private var prevAudioPtsUs = -1L
 
@@ -232,8 +234,8 @@ class MuxerManager(
             if (!isStarted || videoTrackIndex < 0) return
 
             val rawPtsUs = bufferInfo.presentationTimeUs
-            if (rawPtsUs <= 0L) {
-                AppLogger.w(TAG, "Skipping video sample with non-positive PTS=${bufferInfo.presentationTimeUs}")
+            if (rawPtsUs < 0L) {
+                AppLogger.w(TAG, "Skipping video sample with negative PTS=${bufferInfo.presentationTimeUs}")
                 return
             }
 
@@ -241,12 +243,12 @@ class MuxerManager(
             dupBuffer.position(bufferInfo.offset)
             dupBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-            if (videoStartPtsUs < 0L) {
-                videoStartPtsUs = rawPtsUs
-                AppLogger.i(TAG, "MediaMuxer videoStartPtsUs locked to $rawPtsUs (first video frame)")
+            if (baseStartPtsUs < 0L) {
+                baseStartPtsUs = rawPtsUs
+                AppLogger.i(TAG, "MediaMuxer baseStartPtsUs locked to $rawPtsUs (via first video frame)")
             }
 
-            var muxerPts = rawPtsUs - videoStartPtsUs
+            var muxerPts = rawPtsUs - baseStartPtsUs
             if (muxerPts <= prevVideoPtsUs) {
                 muxerPts = prevVideoPtsUs + 1_000L
             }
@@ -268,11 +270,14 @@ class MuxerManager(
 
     fun writeAudioSample(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
         synchronized(lock) {
+            if (!isStarted) {
+                tryStartMuxerLocked()
+            }
             if (!isStarted || audioTrackIndex < 0) return
 
             val rawPtsUs = bufferInfo.presentationTimeUs
-            if (rawPtsUs <= 0L) {
-                AppLogger.w(TAG, "Skipping audio sample with non-positive PTS=${bufferInfo.presentationTimeUs}")
+            if (rawPtsUs < 0L) {
+                AppLogger.w(TAG, "Skipping audio sample with negative PTS=${bufferInfo.presentationTimeUs}")
                 return
             }
 
@@ -280,12 +285,12 @@ class MuxerManager(
             dupBuffer.position(bufferInfo.offset)
             dupBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-            if (audioStartPtsUs < 0L) {
-                audioStartPtsUs = rawPtsUs
-                AppLogger.i(TAG, "MediaMuxer audioStartPtsUs locked to $rawPtsUs (first audio frame)")
+            if (baseStartPtsUs < 0L) {
+                baseStartPtsUs = rawPtsUs
+                AppLogger.i(TAG, "MediaMuxer baseStartPtsUs locked to $rawPtsUs (via first audio frame)")
             }
 
-            var muxerPts = rawPtsUs - audioStartPtsUs
+            var muxerPts = rawPtsUs - baseStartPtsUs
             if (muxerPts <= prevAudioPtsUs) {
                 muxerPts = prevAudioPtsUs + 1_000L
             }
