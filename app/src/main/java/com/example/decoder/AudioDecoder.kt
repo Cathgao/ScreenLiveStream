@@ -77,7 +77,8 @@ class AudioDecoder {
                 channelConfig,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = minBufferSize.coerceAtLeast(2048)
+            // Increase buffer size to 4x minBufferSize (min 32KB) to prevent AudioTrack underruns
+            val bufferSize = (minBufferSize * 4).coerceAtLeast(32 * 1024)
 
             val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -121,48 +122,56 @@ class AudioDecoder {
                 try {
                     val task = taskQueue.take()
                     try {
-                        val inputIndex = mc.dequeueInputBuffer(10_000)
-                        if (inputIndex >= 0) {
-                            val inputBuffer = mc.getInputBuffer(inputIndex)
-                            if (inputBuffer != null) {
-                                inputBuffer.clear()
-                                inputBuffer.put(task.data, 0, task.size)
-                                val ptsUs = if (task.timestampMs > 0) {
-                                    task.timestampMs * 1000L
-                                } else {
-                                    System.nanoTime() / 1000
+                        var queued = false
+                        while (isFeeding && !queued) {
+                            val inputIndex = mc.dequeueInputBuffer(10_000)
+                            if (inputIndex >= 0) {
+                                val inputBuffer = mc.getInputBuffer(inputIndex)
+                                if (inputBuffer != null) {
+                                    inputBuffer.clear()
+                                    inputBuffer.put(task.data, 0, task.size)
+                                    val ptsUs = if (task.timestampMs > 0) {
+                                        task.timestampMs * 1000L
+                                    } else {
+                                        System.nanoTime() / 1000
+                                    }
+                                    mc.queueInputBuffer(
+                                        inputIndex,
+                                        0,
+                                        task.size,
+                                        ptsUs,
+                                        0
+                                    )
+                                    queued = true
                                 }
-                                mc.queueInputBuffer(
-                                    inputIndex,
-                                    0,
-                                    task.size,
-                                    ptsUs,
-                                    0
-                                )
                             }
-                        }
-
-                        var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
-                        while (outputIndex >= 0) {
-                            val outputBuffer = mc.getOutputBuffer(outputIndex)
-                            if (outputBuffer != null && bufferInfo.size > 0) {
-                                val pcmBytes = ByteArray(bufferInfo.size)
-                                outputBuffer.position(bufferInfo.offset)
-                                outputBuffer.get(pcmBytes)
-                                
-                                track.write(pcmBytes, 0, pcmBytes.size)
-                            }
-                            mc.releaseOutputBuffer(outputIndex, false)
-                            outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
+                            drainOutputBuffers(mc, track, bufferInfo)
                         }
                     } catch (e: Exception) {
                         AppLogger.e(TAG, "Error decoding audio frame", e)
+                    } finally {
+                        recycleTask(task)
                     }
-                    recycleTask(task)
                 } catch (e: InterruptedException) {
                     break
                 }
             }
+        }
+    }
+
+    private fun drainOutputBuffers(mc: MediaCodec, track: AudioTrack, bufferInfo: MediaCodec.BufferInfo) {
+        var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
+        while (outputIndex >= 0) {
+            val outputBuffer = mc.getOutputBuffer(outputIndex)
+            if (outputBuffer != null && bufferInfo.size > 0) {
+                val pcmBytes = ByteArray(bufferInfo.size)
+                outputBuffer.position(bufferInfo.offset)
+                outputBuffer.get(pcmBytes)
+                
+                track.write(pcmBytes, 0, pcmBytes.size)
+            }
+            mc.releaseOutputBuffer(outputIndex, false)
+            outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
         }
     }
 
@@ -182,8 +191,9 @@ class AudioDecoder {
 
         if (!isDecoderReady) return
 
-        // Low latency catch-up: if TCP burst delivers multiple frames (> 2 queued), drop oldest frames
-        while (taskQueue.size > 2) {
+        // Low latency catch-up: allow small queue buffer for network packet bursts (up to 6 frames / ~120ms)
+        // Drops oldest frames only if network gets significantly backlogged, keeping audio low-latency & perfectly synced with video
+        while (taskQueue.size > 6) {
             val dropped = taskQueue.poll()
             if (dropped != null) {
                 recycleTask(dropped)

@@ -22,7 +22,11 @@ class GreetingScreenshotTest {
 
   @Test
   fun greeting_screenshot() {
-    composeTestRule.setContent { QuestCastTheme { Text("Robolectric") } }
+    composeTestRule.setContent {
+      QuestCastTheme {
+        Text("Robolectric")
+      }
+    }
 
     composeTestRule.onRoot().captureRoboImage(filePath = "src/test/screenshots/greeting.png")
   }

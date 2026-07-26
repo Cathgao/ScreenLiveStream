@@ -95,7 +95,7 @@ class AudioEncoder(
             // Configure AAC MediaCodec
             val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                setInteger(MediaFormat.KEY_BIT_RATE, 128000)
+                setInteger(MediaFormat.KEY_BIT_RATE, 256000)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
             }
 
@@ -105,7 +105,7 @@ class AudioEncoder(
             audioCodec = codec
 
             record.startRecording()
-            AppLogger.i(TAG, "Internal Audio AudioRecord and AAC MediaCodec started successfully (48kHz Stereo 128kbps).")
+            AppLogger.i(TAG, "Internal Audio AudioRecord and AAC MediaCodec started successfully (48kHz Stereo 256kbps).")
 
             startAudioLoop(record, codec, bufferSize)
         } catch (e: Exception) {
@@ -118,11 +118,13 @@ class AudioEncoder(
         val audioThreadStartNs = System.nanoTime()
 
         captureThread = Thread({
-            val audioBuffer = ByteArray(bufferSize)
+            // Read standard AAC frame chunk size: 1024 samples * 2 channels * 2 bytes = 4096 bytes (~21.3ms per read)
+            val pcmChunkSize = 4096
+            val audioBuffer = ByteArray(pcmChunkSize)
             val bufferInfo = MediaCodec.BufferInfo()
             var audioFrameCount = 0L
 
-            AppLogger.i(TAG, "Audio capture loop thread running...")
+            AppLogger.i(TAG, "Audio capture loop thread running with $pcmChunkSize bytes chunk reading...")
 
             fun computePtsUs(): Long {
                 val vStartPts = videoStartPtsUs
