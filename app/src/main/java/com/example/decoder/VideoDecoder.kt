@@ -216,37 +216,16 @@ class VideoDecoder {
         }
     }
 
-    private fun extractSpsAndPps(data: ByteArray): Pair<ByteArray?, ByteArray?> {
-        val nals = splitNalUnits(data)
-        var sps: ByteArray? = null
-        var pps: ByteArray? = null
-        for (nal in nals) {
-            if (nal.size < 5) continue
-            val headerOffset = if (nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 0.toByte() && nal[3] == 1.toByte()) {
-                4
-            } else if (nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()) {
-                3
-            } else {
-                continue
-            }
-            if (headerOffset >= nal.size) continue
-            val nalType = nal[headerOffset].toInt() and 0x1F
-            if (nalType == 7) {
-                sps = nal
-            } else if (nalType == 8) {
-                pps = nal
-            }
-        }
-        return Pair(sps, pps)
-    }
+    private class NalUnit(val offset: Int, val length: Int, val startCodeLen: Int)
 
-    private fun splitNalUnits(data: ByteArray): List<ByteArray> {
-        val list = mutableListOf<ByteArray>()
+    private fun findNalUnits(data: ByteArray): List<NalUnit> {
+        val list = mutableListOf<NalUnit>()
         var i = 0
         val len = data.size
         while (i < len - 3) {
             if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
                 val start = i
+                val startCodeLen = 4
                 i += 4
                 var nextStart = len
                 var j = i
@@ -260,10 +239,11 @@ class VideoDecoder {
                     }
                     j++
                 }
-                list.add(data.copyOfRange(start, nextStart))
+                list.add(NalUnit(start, nextStart - start, startCodeLen))
                 i = j - 1
             } else if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
                 val start = i
+                val startCodeLen = 3
                 i += 3
                 var nextStart = len
                 var j = i
@@ -277,7 +257,7 @@ class VideoDecoder {
                     }
                     j++
                 }
-                list.add(data.copyOfRange(start, nextStart))
+                list.add(NalUnit(start, nextStart - start, startCodeLen))
                 i = j - 1
             }
             i++
@@ -285,19 +265,36 @@ class VideoDecoder {
         return list
     }
 
+    private fun extractSpsAndPps(data: ByteArray): Pair<ByteArray?, ByteArray?> {
+        val nals = findNalUnits(data)
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        for (nal in nals) {
+            val payloadOffset = nal.offset + nal.startCodeLen
+            if (payloadOffset >= data.size) continue
+            val nalType = data[payloadOffset].toInt() and 0x1F
+            if (nalType == 7) {
+                sps = data.copyOfRange(nal.offset, nal.offset + nal.length)
+            } else if (nalType == 8) {
+                pps = data.copyOfRange(nal.offset, nal.offset + nal.length)
+            }
+        }
+        return Pair(sps, pps)
+    }
+
     private fun ensure4ByteAnnexB(data: ByteArray): ByteArray {
         if (data.size < 4) return data
-        val nals = splitNalUnits(data)
+        val nals = findNalUnits(data)
         if (nals.isEmpty()) return data
 
         var needsNormalizing = false
         var totalSize = 0
         for (nal in nals) {
-            if (nal.size >= 3 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()) {
+            if (nal.startCodeLen == 3) {
                 needsNormalizing = true
-                totalSize += nal.size + 1
+                totalSize += nal.length + 1
             } else {
-                totalSize += nal.size
+                totalSize += nal.length
             }
         }
 
@@ -306,38 +303,31 @@ class VideoDecoder {
         val result = ByteArray(totalSize)
         var pos = 0
         for (nal in nals) {
-            if (nal.size >= 3 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()) {
+            if (nal.startCodeLen == 3) {
                 result[pos++] = 0.toByte()
                 result[pos++] = 0.toByte()
                 result[pos++] = 0.toByte()
                 result[pos++] = 1.toByte()
-                System.arraycopy(nal, 3, result, pos, nal.size - 3)
-                pos += nal.size - 3
+                System.arraycopy(data, nal.offset + 3, result, pos, nal.length - 3)
+                pos += nal.length - 3
             } else {
-                System.arraycopy(nal, 0, result, pos, nal.size)
-                pos += nal.size
+                System.arraycopy(data, nal.offset, result, pos, nal.length)
+                pos += nal.length
             }
         }
         return result
     }
 
     private fun containsParameterSets(data: ByteArray, isHevc: Boolean): Boolean {
-        val nals = splitNalUnits(data)
+        val nals = findNalUnits(data)
         for (nal in nals) {
-            if (nal.size < 4) continue
-            val headerOffset = if (nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 0.toByte() && nal[3] == 1.toByte()) {
-                4
-            } else if (nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()) {
-                3
-            } else {
-                continue
-            }
-            if (headerOffset >= nal.size) continue
+            val payloadOffset = nal.offset + nal.startCodeLen
+            if (payloadOffset >= data.size) continue
 
             val nalType = if (isHevc) {
-                (nal[headerOffset].toInt() and 0x7E) ushr 1
+                (data[payloadOffset].toInt() and 0x7E) ushr 1
             } else {
-                nal[headerOffset].toInt() and 0x1F
+                data[payloadOffset].toInt() and 0x1F
             }
 
             if (isHevc) {

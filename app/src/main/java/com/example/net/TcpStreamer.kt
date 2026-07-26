@@ -71,10 +71,10 @@ class TcpStreamer : IStreamer {
         taskPool.offer(task)
     }
 
-    override fun start(targetIp: String, targetPort: Int) {
+    override fun start(targetIp: String, port: Int) {
         stop()
         this.targetIp = targetIp
-        this.targetPort = targetPort
+        this.targetPort = port
         this.isConnected = true
         taskQueue.clear()
 

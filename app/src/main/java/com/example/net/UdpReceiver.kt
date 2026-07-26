@@ -3,7 +3,6 @@ package com.example.net
 import android.util.Log
 import com.example.log.AppLogger as SessionLog
 import com.example.model.StreamStats
-import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.SocketTimeoutException
@@ -209,8 +208,10 @@ class UdpReceiver {
         val timestampMs: Long,
         val firstSeenMs: Long
     ) {
-        val packets = Array<ByteArray?>(totalPackets) { null }
+        val data = ByteArray(totalPackets * PacketProtocol.MAX_PAYLOAD_SIZE)
+        val receivedFragments = BooleanArray(totalPackets)
         var receivedCount = 0
+        var actualSize = 0
         var lastUpdateMs: Long = firstSeenMs
         // Per-packet MTU is 1300 B, but it's an upper bound (last packet
         // is typically shorter). Using totalPackets * MAX_PAYLOAD_SIZE
@@ -221,9 +222,11 @@ class UdpReceiver {
         // 20-slot cap.
         val expectedBytes: Int = totalPackets * PacketProtocol.MAX_PAYLOAD_SIZE
 
-        fun addPacket(idx: Int, payload: ByteArray): Boolean {
-            if (idx in 0 until totalPackets && packets[idx] == null) {
-                packets[idx] = payload
+        fun addPacket(idx: Int, rawBuffer: ByteArray, payloadOffset: Int, payloadSize: Int): Boolean {
+            if (idx in 0 until totalPackets && !receivedFragments[idx]) {
+                receivedFragments[idx] = true
+                System.arraycopy(rawBuffer, payloadOffset, data, idx * PacketProtocol.MAX_PAYLOAD_SIZE, payloadSize)
+                actualSize += payloadSize
                 receivedCount++
             }
             lastUpdateMs = System.currentTimeMillis()
@@ -231,13 +234,14 @@ class UdpReceiver {
         }
 
         fun assemble(): ByteArray {
-            val baos = ByteArrayOutputStream()
-            for (p in packets) {
-                if (p != null) {
-                    baos.write(p)
-                }
-            }
-            return baos.toByteArray()
+            val result = ByteArray(actualSize)
+            // Even though the last packet might be smaller, it's at the end, so we can't just copy the whole data?
+            // Actually, if we just copy chunk by chunk into result it's safer, but they are already at idx * MAX_PAYLOAD_SIZE.
+            // Wait, the payload is NOT contiguous if we just use `actualSize` from 0, because if the last packet is not max size, it is contiguous!
+            // E.g. pkt 0: 1300, pkt 1: 1300, pkt 2: 500. actualSize = 3100.
+            // Copying from 0 to 3100 gets exactly the right data!
+            System.arraycopy(data, 0, result, 0, actualSize)
+            return result
         }
     }
 
@@ -341,14 +345,14 @@ class UdpReceiver {
                                     TAG,
                                     "incoherent packet #$pktCounter seq=${parsed.frameSeq} " +
                                         "idx=${parsed.packetIndex}/${parsed.totalPackets} " +
-                                        "payload=${parsed.payload.size}B addr=${packet.address.hostAddress}"
+                                        "payload=${parsed.payloadSize}B addr=${packet.address.hostAddress}"
                                 )
                             }
                         } else {
                             totalBytesReceived += packet.length
                             windowBytesReceived += packet.length
                             try {
-                                processParsedPacket(parsed)
+                                processParsedPacket(parsed, receiveBuffer)
                             } catch (e: Exception) {
                                 // Never let a callback exception kill the listener
                                 // thread — the rest of the stream would silently
@@ -394,11 +398,11 @@ class UdpReceiver {
     private fun isPacketCoherent(parsed: PacketProtocol.ParsedPacket): Boolean {
         if (parsed.totalPackets <= 0) return false
         if (parsed.packetIndex < 0 || parsed.packetIndex >= parsed.totalPackets) return false
-        if (parsed.payload.size > PacketProtocol.MAX_PAYLOAD_SIZE) return false
+        if (parsed.payloadSize > PacketProtocol.MAX_PAYLOAD_SIZE) return false
         return true
     }
 
-    private fun processParsedPacket(parsed: PacketProtocol.ParsedPacket) {
+    private fun processParsedPacket(parsed: PacketProtocol.ParsedPacket, rawBuffer: ByteArray) {
         val now = System.currentTimeMillis()
         // The legacy "currentLatencyMs" derived from a wall-clock delta
         // has been retired — sender and receiver may be on different
@@ -440,7 +444,7 @@ class UdpReceiver {
         // note on the receiver-side counters above. True link-layer loss
         // now comes from UdpRttProbe.lossPercent only.
 
-        if (assembly.addPacket(parsed.packetIndex, parsed.payload)) {
+        if (assembly.addPacket(parsed.packetIndex, rawBuffer, parsed.payloadOffset, parsed.payloadSize)) {
             val completeFrame = assembly.assemble()
             frameBuffers.remove(parsed.frameSeq)
             windowReceivedFrames++

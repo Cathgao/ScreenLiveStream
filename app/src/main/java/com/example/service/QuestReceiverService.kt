@@ -31,8 +31,6 @@ class QuestReceiverService : Service() {
     val audioDecoder = AudioDecoder()
     val lanDiscovery = LanDiscovery()
     private var muxerManager: com.example.encoder.MuxerManager? = null
-    @Volatile
-    private var recordingStartNs: Long = 0L
 
     @Volatile
     var isListening = false
@@ -46,13 +44,6 @@ class QuestReceiverService : Service() {
 
     var onStatsUpdated: ((StreamStats) -> Unit)? = null
     var onListeningStateChanged: ((Boolean) -> Unit)? = null
-
-    private var lastPort = 8888
-    private var lastAutoAnnounce = true
-    private var lastJitterBufferMs = 50
-    private var lastProtocol = TransportProtocol.UDP
-    
-    private var lastStreamStopMs = 0L
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
@@ -166,16 +157,10 @@ class QuestReceiverService : Service() {
         protocol: TransportProtocol = TransportProtocol.UDP,
         isRecordEnabled: Boolean = false
     ) {
-        lastPort = port
-        lastAutoAnnounce = autoAnnounce
-        lastJitterBufferMs = jitterBufferMs
-        lastProtocol = protocol
-        
         stopListening()
         
         if (isRecordEnabled) {
             try {
-                recordingStartNs = System.nanoTime()
                 val mgr = com.example.encoder.MuxerManager(
                     context = this,
                     codecName = "Receiver",

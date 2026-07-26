@@ -44,7 +44,7 @@ object AppLogger {
     }
 
     private fun appendLog(level: String, tag: String, message: String) {
-        val timestamp = dateFormat.format(Date())
+        val timestamp = synchronized(dateFormat) { dateFormat.format(Date()) }
         val entry = "[$timestamp] [$level/$tag] $message"
         logQueue.add(entry)
         while (logQueue.size > MAX_LOG_COUNT) {
@@ -58,12 +58,14 @@ object AppLogger {
 
     fun exportLogs(context: Context): String {
         val fileNameFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-        val fileName = "screen_cast_log_${fileNameFormat.format(Date())}.txt"
+        val formattedFileNameDate = synchronized(fileNameFormat) { fileNameFormat.format(Date()) }
+        val fileName = "screen_cast_log_${formattedFileNameDate}.txt"
         val logList = getLogs()
+        val exportTimeStr = synchronized(dateFormat) { dateFormat.format(Date()) }
         val content = StringBuilder().apply {
             append("==================================================\n")
             append("QuestCast Diagnostics Log Export\n")
-            append("Export Time: ${dateFormat.format(Date())}\n")
+            append("Export Time: $exportTimeStr\n")
             append("Total Log Lines: ${logList.size}\n")
             append("Device: ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})\n")
             append("Android Version: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})\n")

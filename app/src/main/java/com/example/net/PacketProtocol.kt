@@ -145,17 +145,27 @@ object PacketProtocol {
         val flags = data[3].toInt() and 0xFF
         return when {
             (flags and FLAG_PING.toInt()) != 0 -> {
-                val bb = ByteBuffer.wrap(data, 4, length - 4)
-                ProbeType(isReply = false, seq = bb.int, echoedNanos = 0L)
+                val seq = ((data[4].toInt() and 0xFF) shl 24) or
+                          ((data[5].toInt() and 0xFF) shl 16) or
+                          ((data[6].toInt() and 0xFF) shl 8) or
+                          (data[7].toInt() and 0xFF)
+                ProbeType(isReply = false, seq = seq, echoedNanos = 0L)
             }
             (flags and FLAG_PING_REPLY.toInt()) != 0 -> {
-                val bb = ByteBuffer.wrap(data, 4, length - 4)
-                ProbeType(
-                    isReply = true,
-                    seq = bb.int,
-                    // skip the 8B wall-clock field after frameSeq (int=4B + long=8B = total 12B from offset 4)
-                    echoedNanos = bb.getLong(12)
-                )
+                val seq = ((data[4].toInt() and 0xFF) shl 24) or
+                          ((data[5].toInt() and 0xFF) shl 16) or
+                          ((data[6].toInt() and 0xFF) shl 8) or
+                          (data[7].toInt() and 0xFF)
+                // skip 8B wall-clock field after frameSeq, echoedNanos starts at byte index 16
+                val echoedNanos = ((data[16].toLong() and 0xFFL) shl 56) or
+                                  ((data[17].toLong() and 0xFFL) shl 48) or
+                                  ((data[18].toLong() and 0xFFL) shl 40) or
+                                  ((data[19].toLong() and 0xFFL) shl 32) or
+                                  ((data[20].toLong() and 0xFFL) shl 24) or
+                                  ((data[21].toLong() and 0xFFL) shl 16) or
+                                  ((data[22].toLong() and 0xFFL) shl 8) or
+                                  (data[23].toLong() and 0xFFL)
+                ProbeType(isReply = true, seq = seq, echoedNanos = echoedNanos)
             }
             else -> null
         }
@@ -171,9 +181,14 @@ object PacketProtocol {
         if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
         val flags = data[3].toInt() and 0xFF
         if ((flags and FLAG_PING_STATS.toInt()) == 0) return null
-        val bb = ByteBuffer.wrap(data, HEADER_SIZE, 8)
-        val rttMs = bb.int and 0x7FFFFFFF
-        val lossBps = bb.int and 0x7FFFFFFF
+        val rttMs = (((data[HEADER_SIZE].toInt() and 0xFF) shl 24) or
+                    ((data[HEADER_SIZE + 1].toInt() and 0xFF) shl 16) or
+                    ((data[HEADER_SIZE + 2].toInt() and 0xFF) shl 8) or
+                    (data[HEADER_SIZE + 3].toInt() and 0xFF)) and 0x7FFFFFFF
+        val lossBps = (((data[HEADER_SIZE + 4].toInt() and 0xFF) shl 24) or
+                      ((data[HEADER_SIZE + 5].toInt() and 0xFF) shl 16) or
+                      ((data[HEADER_SIZE + 6].toInt() and 0xFF) shl 8) or
+                      (data[HEADER_SIZE + 7].toInt() and 0xFF)) and 0x7FFFFFFF
         return Pair(rttMs, lossBps)
     }
 
@@ -208,32 +223,40 @@ object PacketProtocol {
         val isCodecConfig: Boolean,
         val isHevc: Boolean,
         val isAudio: Boolean,
-        val payload: ByteArray
+        val payloadSize: Int,
+        val payloadOffset: Int
     )
 
     fun parsePacket(data: ByteArray, length: Int): ParsedPacket? {
         if (length < HEADER_SIZE) return null
         if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
 
-        val bb = ByteBuffer.wrap(data, 0, length)
-        bb.position(3) // skip magic + version
-        val flags = bb.get().toInt()
+        val flags = data[3].toInt() and 0xFF
 
         val isKeyframe = (flags and FLAG_KEYFRAME.toInt()) != 0
         val isCodecConfig = (flags and FLAG_CODEC_CONFIG.toInt()) != 0
         val isHevc = (flags and FLAG_CODEC_HEVC.toInt()) != 0
         val isAudio = (flags and FLAG_AUDIO.toInt()) != 0
 
-        val frameSeq = bb.int
-        val timestampMs = bb.long
-        val packetIndex = bb.short.toInt() and 0xFFFF
-        val totalPackets = bb.short.toInt() and 0xFFFF
-        val payloadSize = bb.short.toInt() and 0xFFFF
+        val frameSeq = ((data[4].toInt() and 0xFF) shl 24) or
+                       ((data[5].toInt() and 0xFF) shl 16) or
+                       ((data[6].toInt() and 0xFF) shl 8) or
+                       (data[7].toInt() and 0xFF)
+
+        val timestampMs = ((data[8].toLong() and 0xFFL) shl 56) or
+                          ((data[9].toLong() and 0xFFL) shl 48) or
+                          ((data[10].toLong() and 0xFFL) shl 40) or
+                          ((data[11].toLong() and 0xFFL) shl 32) or
+                          ((data[12].toLong() and 0xFFL) shl 24) or
+                          ((data[13].toLong() and 0xFFL) shl 16) or
+                          ((data[14].toLong() and 0xFFL) shl 8) or
+                          (data[15].toLong() and 0xFFL)
+
+        val packetIndex = ((data[16].toInt() and 0xFF) shl 8) or (data[17].toInt() and 0xFF)
+        val totalPackets = ((data[18].toInt() and 0xFF) shl 8) or (data[19].toInt() and 0xFF)
+        val payloadSize = ((data[20].toInt() and 0xFF) shl 8) or (data[21].toInt() and 0xFF)
 
         if (length < HEADER_SIZE + payloadSize) return null
-
-        val payload = ByteArray(payloadSize)
-        System.arraycopy(data, HEADER_SIZE, payload, 0, payloadSize)
 
         return ParsedPacket(
             frameSeq = frameSeq,
@@ -244,7 +267,8 @@ object PacketProtocol {
             isCodecConfig = isCodecConfig,
             isHevc = isHevc,
             isAudio = isAudio,
-            payload = payload
+            payloadSize = payloadSize,
+            payloadOffset = HEADER_SIZE
         )
     }
 }

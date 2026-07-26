@@ -111,7 +111,9 @@ class UdpFecStreamer : IStreamer {
                                 packetBuf.putShort(0.toShort())
                                 packetBuf.putShort(1.toShort())
                                 packetBuf.putInt(8)
-                                packetBuf.put(ByteArray(3))
+                                packetBuf.put(0.toByte())
+                                packetBuf.put(0.toByte())
+                                packetBuf.put(0.toByte())
                                 
                                 packetBuf.putInt(task.rttMs.coerceAtLeast(0))
                                 val lossBp = (task.lossPercent * 100f).toInt().coerceIn(0, 10000)
@@ -133,7 +135,9 @@ class UdpFecStreamer : IStreamer {
                                 packetBuf.putShort(0.toShort()) // fragIndex
                                 packetBuf.putShort(1.toShort()) // totalFragments
                                 packetBuf.putInt(task.size) // frameSize
-                                packetBuf.put(ByteArray(3)) // pad
+                                packetBuf.put(0.toByte())
+                                packetBuf.put(0.toByte())
+                                packetBuf.put(0.toByte()) // pad
                                 packetBuf.put(task.data, 0, task.size)
                                 
                                 val dp = DatagramPacket(packetBuf.array(), 28 + task.size, targetAddress, targetPort)
@@ -160,7 +164,9 @@ class UdpFecStreamer : IStreamer {
                                     buf.putShort(i.toShort())
                                     buf.putShort(totalFragments.toShort())
                                     buf.putInt(frameSize)
-                                    buf.put(ByteArray(3)) // pad to 28 bytes
+                                    buf.put(0.toByte())
+                                    buf.put(0.toByte())
+                                    buf.put(0.toByte()) // pad to 28 bytes
                                     buf.put(task.data, fragOffset, length)
 
                                     val dp = DatagramPacket(fragData, 28 + length, targetAddress, targetPort)
@@ -196,7 +202,9 @@ class UdpFecStreamer : IStreamer {
                                     packetBuf.putShort(fecGroupId.toShort())
                                     packetBuf.putShort(totalFragments.toShort())
                                     packetBuf.putInt(frameSize)
-                                    packetBuf.put(ByteArray(3)) // pad
+                                    packetBuf.put(0.toByte())
+                                    packetBuf.put(0.toByte())
+                                    packetBuf.put(0.toByte()) // pad
                                     packetBuf.put(fecPayload)
                                     
                                     val dp = DatagramPacket(packetBuf.array(), 28 + MAX_PAYLOAD, targetAddress, targetPort)

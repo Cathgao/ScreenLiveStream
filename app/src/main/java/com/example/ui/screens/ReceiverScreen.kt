@@ -28,11 +28,50 @@ import androidx.compose.ui.viewinterop.AndroidView
 import android.view.WindowManager
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.service.QuestReceiverService
 import com.example.ui.theme.*
 import com.example.viewmodel.MainViewModel
 import com.example.model.StreamStats
+
+@Composable
+fun ReceiverStatsOverlay(viewModel: MainViewModel, videoWidth: Int, videoHeight: Int) {
+    val stats by viewModel.receiverStats.collectAsState()
+    Row(
+        modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.5f))
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "FPS:${String.format("%.1f", stats.fps)}",
+            fontSize = 8.sp,
+            lineHeight = 8.sp,
+            color = Color.White
+        )
+        Text(
+            text = "码率:${String.format("%.1fM", stats.bitrateMbps)}",
+            fontSize = 8.sp,
+            lineHeight = 8.sp,
+            color = Color.White
+        )
+        Text(
+            text = "Ping:${stats.rttMs}ms",
+            fontSize = 8.sp,
+            lineHeight = 8.sp,
+            color = Color.White
+        )
+        if (videoWidth > 0 && videoHeight > 0) {
+            Text(
+                text = "${videoWidth}x${videoHeight}",
+                fontSize = 8.sp,
+                lineHeight = 8.sp,
+                color = Color.White
+            )
+        }
+    }
+}
 
 @Composable
 fun ReceiverScreen(
@@ -43,7 +82,6 @@ fun ReceiverScreen(
     onStopListening: () -> Unit
 ) {
     val receiverConfig by viewModel.receiverConfig.collectAsState()
-    val stats by viewModel.receiverStats.collectAsState()
     val localIp by viewModel.localIpAddress.collectAsState()
 
     var videoWidth by remember { mutableStateOf(0) }
@@ -165,40 +203,8 @@ fun ReceiverScreen(
 
         if (isListening) {
             // Data stats Overlay
-            Row(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "FPS:${String.format("%.1f", stats.fps)}",
-                    fontSize = 8.sp,
-                    lineHeight = 8.sp,
-                    color = Color.White
-                )
-                Text(
-                    text = "码率:${String.format("%.1fM", stats.bitrateMbps)}",
-                    fontSize = 8.sp,
-                    lineHeight = 8.sp,
-                    color = Color.White
-                )
-                Text(
-                    text = "Ping:${stats.rttMs}ms",
-                    fontSize = 8.sp,
-                    lineHeight = 8.sp,
-                    color = Color.White
-                )
-                if (videoWidth > 0 && videoHeight > 0) {
-                    Text(
-                        text = "${videoWidth}x${videoHeight}",
-                        fontSize = 8.sp,
-                        lineHeight = 8.sp,
-                        color = Color.White
-                    )
-                }
+            Box(modifier = Modifier.align(Alignment.TopStart)) {
+                ReceiverStatsOverlay(viewModel, videoWidth, videoHeight)
             }
         }
 

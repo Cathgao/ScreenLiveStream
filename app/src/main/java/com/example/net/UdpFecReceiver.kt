@@ -38,7 +38,8 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     private var lastReportedLossPercent = 0f
     
     private class FrameBuffer(val seq: Int, val totalFragments: Int, val frameSize: Int, val timestampMs: Long, val flags: Byte) {
-        val fragments = arrayOfNulls<ByteArray>(totalFragments)
+        val frameBytes = ByteArray(frameSize)
+        val receivedFragments = BooleanArray(totalFragments)
         var receivedDataCount = 0
         val fecPackets = HashMap<Int, ByteArray>() // groupId -> payload
         var lastUpdate = System.currentTimeMillis()
@@ -158,10 +159,10 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                             fb.fecPackets[groupId] = payload
                         }
                     } else {
-                        if (fb.fragments[fragIndex] == null) {
-                            val payload = ByteArray(length - 28)
-                            System.arraycopy(buffer, 28, payload, 0, length - 28)
-                            fb.fragments[fragIndex] = payload
+                        if (!fb.receivedFragments[fragIndex]) {
+                            val fragLength = length - 28
+                            System.arraycopy(buffer, 28, fb.frameBytes, fragIndex * 1300, fragLength)
+                            fb.receivedFragments[fragIndex] = true
                             fb.receivedDataCount++
                         }
                     }
@@ -199,7 +200,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                 var missingCount = 0
                 var missingIdx = -1
                 for (i in startIdx until endIdx) {
-                    if (fb.fragments[i] == null) {
+                    if (!fb.receivedFragments[i]) {
                         missingCount++
                         missingIdx = i
                     }
@@ -209,21 +210,19 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     // Recover missing fragment
                     val recovered = ByteArray(MAX_PAYLOAD)
                     System.arraycopy(fecPayload, 0, recovered, 0, fecPayload.size)
-                    
                     for (i in startIdx until endIdx) {
-                        if (i != missingIdx && fb.fragments[i] != null) {
-                            val frag = fb.fragments[i]!!
-                            for (k in frag.indices) {
-                                recovered[k] = (recovered[k].toInt() xor frag[k].toInt()).toByte()
+                        if (i != missingIdx && fb.receivedFragments[i]) {
+                            val fragOffset = i * 1300
+                            val fragLen = fb.getExpectedFragLength(i)
+                            for (k in 0 until fragLen) {
+                                recovered[k] = (recovered[k].toInt() xor fb.frameBytes[fragOffset + k].toInt()).toByte()
                             }
                         }
                     }
-                    
                     val expectedLen = fb.getExpectedFragLength(missingIdx)
-                    val finalRecovered = ByteArray(expectedLen)
-                    System.arraycopy(recovered, 0, finalRecovered, 0, Math.min(expectedLen, recovered.size))
+                    System.arraycopy(recovered, 0, fb.frameBytes, missingIdx * 1300, Math.min(expectedLen, recovered.size))
                     
-                    fb.fragments[missingIdx] = finalRecovered
+                    fb.receivedFragments[missingIdx] = true
                     fb.receivedDataCount++
                 }
             }
@@ -231,16 +230,6 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         
         if (fb.receivedDataCount == fb.totalFragments) {
             fb.isCompleted = true
-            
-            // Reassemble frame
-            val frameBytes = ByteArray(fb.frameSize)
-            var offset = 0
-            for (i in 0 until fb.totalFragments) {
-                val frag = fb.fragments[i]!!
-                System.arraycopy(frag, 0, frameBytes, offset, frag.size)
-                offset += frag.size
-            }
-            
             val isKeyframe = (fb.flags.toInt() and 1) != 0
             val isCodecConfig = (fb.flags.toInt() and 2) != 0
             val isHevc = (fb.flags.toInt() and 4) != 0
@@ -254,7 +243,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                 windowReceivedFrames++
             }
             
-            onFrameAssembled?.invoke(frameBytes, isKeyframe, isCodecConfig, isHevc, fb.timestampMs, fb.seq)
+            onFrameAssembled?.invoke(fb.frameBytes, isKeyframe, isCodecConfig, isHevc, fb.timestampMs, fb.seq)
         }
     }
     

@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.text.format.Formatter
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.model.BitrateMode
@@ -290,7 +289,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 @Suppress("DEPRECATION")
                 val ipInt = wifiManager.connectionInfo.ipAddress
                 if (ipInt != 0) {
-                    _localIpAddress.value = Formatter.formatIpAddress(ipInt)
+                    _localIpAddress.value = "${ipInt and 0xFF}.${(ipInt shr 8) and 0xFF}.${(ipInt shr 16) and 0xFF}.${(ipInt shr 24) and 0xFF}"
                     return@launch
                 }
             } catch (e: Exception) {

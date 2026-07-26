@@ -594,6 +594,5 @@ class QuestSenderService : Service() {
         const val EXTRA_CODEC = "EXTRA_CODEC"
         const val EXTRA_BITRATE_MODE = "EXTRA_BITRATE_MODE"
         const val EXTRA_PROTOCOL = "EXTRA_PROTOCOL"
-        const val EXTRA_RECORD = "EXTRA_RECORD"
     }
 }

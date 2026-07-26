@@ -50,12 +50,8 @@ class MuxerManager(
 
     var videoFramesWritten = 0
         private set
-    var videoBytesWritten = 0L
-        private set
 
     var audioFramesWritten = 0
-        private set
-    var audioBytesWritten = 0L
         private set
 
     private val lock = Any()
@@ -145,8 +141,6 @@ class MuxerManager(
     // Subscribe to encoder output. The encoder's current output
     // format is forwarded to setVideoFormat as soon as it becomes
     // available, and every buffer is routed to writeVideoSample.
-    // Caller must invoke detachVideoEncoder before releasing the
-    // encoder.
     fun attachVideoEncoder(encoder: VideoEncoder) {
         encoder.onEncodedSample = { buffer, bufferInfo ->
             val format = encoder.currentOutputFormat
@@ -155,10 +149,6 @@ class MuxerManager(
             }
             writeVideoSample(buffer, bufferInfo)
         }
-    }
-
-    fun detachVideoEncoder(encoder: VideoEncoder) {
-        encoder.onEncodedSample = null
     }
 
     fun setAudioFormat(format: MediaFormat) {
@@ -178,18 +168,6 @@ class MuxerManager(
                 setAudioFormat(format)
             }
             writeAudioSample(buffer, bufferInfo)
-        }
-    }
-
-    fun detachAudioEncoder(encoder: AudioEncoder) {
-        encoder.onEncodedSample = null
-    }
-
-    fun forceStartIfTimeout() {
-        synchronized(lock) {
-            if (!isStarted && videoFormat != null) {
-                tryStartMuxerLocked()
-            }
         }
     }
 
@@ -261,7 +239,6 @@ class MuxerManager(
             try {
                 mediaMuxer?.writeSampleData(videoTrackIndex, dupBuffer, sampleInfo)
                 videoFramesWritten++
-                videoBytesWritten += bufferInfo.size
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Error writing video sample to MediaMuxer", e)
             }
@@ -303,7 +280,6 @@ class MuxerManager(
             try {
                 mediaMuxer?.writeSampleData(audioTrackIndex, dupBuffer, sampleInfo)
                 audioFramesWritten++
-                audioBytesWritten += bufferInfo.size
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Error writing audio sample to MediaMuxer", e)
             }
@@ -342,6 +318,19 @@ class MuxerManager(
                     }
                 } catch (e: Exception) {
                     AppLogger.e(TAG, "Error stopping MediaMuxer", e)
+                    if (videoFramesWritten == 0) {
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && muxerUri != null && context != null) {
+                                context.contentResolver.delete(muxerUri!!, null, null)
+                                AppLogger.i(TAG, "Deleted pending MediaStore entry because no video frames were written.")
+                            } else if (muxerOutputFile != null && muxerOutputFile!!.exists()) {
+                                muxerOutputFile!!.delete()
+                                AppLogger.i(TAG, "Deleted empty MP4 file because no video frames were written.")
+                            }
+                        } catch (delE: Exception) {
+                            AppLogger.e(TAG, "Error deleting empty MP4 file", delE)
+                        }
+                    }
                 }
             } else {
                 try {

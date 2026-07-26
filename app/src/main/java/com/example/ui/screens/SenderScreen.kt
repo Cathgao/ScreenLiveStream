@@ -31,7 +31,6 @@ import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.log.AppLogger
@@ -159,8 +158,8 @@ fun SenderScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                val isIpError = ipInput.isNotEmpty() && !isValidIp(ipInput)
-                val isPortError = portInput.isNotEmpty() && !isValidPort(portInput)
+                val isIpError = remember(ipInput) { ipInput.isNotEmpty() && !isValidIp(ipInput) }
+                val isPortError = remember(portInput) { portInput.isNotEmpty() && !isValidPort(portInput) }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
@@ -313,7 +312,7 @@ fun SenderScreen(
             }
         }
 
-        val isInputValid = isValidIp(ipInput) && isValidPort(portInput)
+        val isInputValid = remember(ipInput, portInput) { isValidIp(ipInput) && isValidPort(portInput) }
 
         // Action Button: Start / Stop Stream
         val buttonText = when {
@@ -600,7 +599,10 @@ fun SenderScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    listOf(8000, 16000, 25000, 40000).filter { it <= maxBitrateVal }.forEach { preset ->
+                    val presets = remember(maxBitrateVal) {
+                        listOf(8000, 16000, 25000, 40000).filter { it <= maxBitrateVal }
+                    }
+                    presets.forEach { preset ->
                         OutlinedButton(
                             onClick = { viewModel.updateBitrate(preset) },
                             modifier = Modifier.height(32.dp),
@@ -628,13 +630,15 @@ fun SenderScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    val fpsOptions = listOf(
-                        0 to "原生帧率",
-                        60 to "60 FPS",
-                        72 to "72 FPS",
-                        90 to "90 FPS",
-                        120 to "120 FPS"
-                    ).filter { it.first <= maxFpsVal }
+                    val fpsOptions = remember(maxFpsVal) {
+                        listOf(
+                            0 to "原生帧率",
+                            60 to "60 FPS",
+                            72 to "72 FPS",
+                            90 to "90 FPS",
+                            120 to "120 FPS"
+                        ).filter { it.first <= maxFpsVal }
+                    }
                     fpsOptions.forEach { (fpsVal, label) ->
                         val selected = config.frameRate == fpsVal
                         FilterChip(
@@ -796,7 +800,7 @@ fun SenderScreen(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "导出诊断日志到 Download 文件夹",
+                    text = "导出诊断日志",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -849,9 +853,10 @@ fun SenderScreen(
 private val ButtonDefaults.outlinedToolboxBorder: androidx.compose.foundation.BorderStroke
     get() = androidx.compose.foundation.BorderStroke(1.dp, BorderCyan)
 
+private val ipRegex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$".toRegex()
+
 private fun isValidIp(ip: String): Boolean {
-    val regex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$".toRegex()
-    return ip.matches(regex)
+    return ip.matches(ipRegex)
 }
 
 private fun isValidPort(port: String): Boolean {
