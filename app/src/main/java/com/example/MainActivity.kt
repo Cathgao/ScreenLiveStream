@@ -55,6 +55,11 @@ class MainActivity : ComponentActivity() {
             senderService = binder.getService()
             isSenderBound = true
             isSenderStreamingState = binder.getService().isStreaming
+            binder.getService().onStreamingStateChanged = { streaming ->
+                runOnUiThread {
+                    isSenderStreamingState = streaming
+                }
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {

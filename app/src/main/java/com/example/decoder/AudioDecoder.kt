@@ -130,7 +130,7 @@ class AudioDecoder {
                                 if (inputBuffer != null) {
                                     inputBuffer.clear()
                                     inputBuffer.put(task.data, 0, task.size)
-                                    val ptsUs = if (task.timestampMs > 0) {
+                                    val ptsUs = if (task.timestampMs >= 0) {
                                         task.timestampMs * 1000L
                                     } else {
                                         System.nanoTime() / 1000

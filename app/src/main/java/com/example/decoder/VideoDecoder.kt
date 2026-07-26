@@ -361,9 +361,11 @@ class VideoDecoder {
                             val renderTimeNs = receiverStartNs + deltaUs * 1000L
                             val now = System.nanoTime()
                             
-                            // If the frame render time is severely behind (more than 100ms in the past due to network stall)
-                            // or too far in the future (more than 1s), smoothly re-anchor receiverStartNs to current time.
-                            val scheduledTimeNs = if (renderTimeNs < now - 100_000_000L || renderTimeNs > now + 1_000_000_000L) {
+                            // If the frame render time is too far in the future (e.g. > 200ms due to timestamp anomaly or drift),
+                            // re-anchor to prevent MediaCodec from holding the buffer and starving the decoder.
+                            // We do NOT re-anchor if the frame is in the past, so that delayed bursts can be played
+                            // as fast as possible to catch up to real-time.
+                            val scheduledTimeNs = if (renderTimeNs > now + 200_000_000L) {
                                 receiverStartNs = now - deltaUs * 1000L
                                 now
                             } else {
@@ -426,7 +428,7 @@ class VideoDecoder {
                                 inputBuffer.put(task.data, 0, task.size)
             
                                 val flags = if (task.isKeyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                                val ptsUs = if (task.timestampMs > 0) task.timestampMs * 1000L else System.nanoTime() / 1000L
+                                val ptsUs = if (task.timestampMs >= 0) task.timestampMs * 1000L else System.nanoTime() / 1000L
             
                                 if (receiverStartNs == 0L) {
                                     receiverStartNs = System.nanoTime()

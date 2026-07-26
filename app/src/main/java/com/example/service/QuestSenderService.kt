@@ -47,7 +47,10 @@ class QuestSenderService : Service() {
 
     @Volatile
     var isStreaming = false
-        private set
+        private set(value) {
+            field = value
+            onStreamingStateChanged?.invoke(value)
+        }
 
     private var savedResultCode: Int = 0
     private var savedResultData: Intent? = null
@@ -58,6 +61,7 @@ class QuestSenderService : Service() {
     private var displayListener: DisplayManager.DisplayListener? = null
 
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
+    var onStreamingStateChanged: ((Boolean) -> Unit)? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): QuestSenderService = this@QuestSenderService
@@ -159,7 +163,10 @@ class QuestSenderService : Service() {
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 AppLogger.w(TAG, "MediaProjection onStop triggered by system or user.")
-                stopStreaming()
+                val stopIntent = Intent(this@QuestSenderService, QuestSenderService::class.java).apply {
+                    action = ACTION_STOP
+                }
+                startService(stopIntent)
             }
         }, null)
 
