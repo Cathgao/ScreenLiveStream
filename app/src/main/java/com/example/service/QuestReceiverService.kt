@@ -210,7 +210,7 @@ class QuestReceiverService : Service() {
             if (isTimeoutCountdownActive) {
                 isTimeoutCountdownActive = false
             }
-            audioDecoder.decodeFrame(frameBytes, isCodecConfig)
+            audioDecoder.decodeFrame(frameBytes, isCodecConfig, timestampMs)
         }
 
         currentReceiver.onReferenceLost = {

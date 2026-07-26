@@ -36,11 +36,15 @@ class MuxerManager(
     private var videoTrackIndex = -1
     private var audioTrackIndex = -1
 
-    private var firstVideoPtsUs = -1L
-    private var prevVideoPtsUs = 0L
-
-    private var firstAudioPtsUs = -1L
-    private var prevAudioPtsUs = 0L
+    // Per-track start PTS. Each track independently remembers the
+    // PTS of its first sample; the muxer subtracts this from every
+    // sample's PTS to produce a zero-based muxerPts. a/v sync is now
+    // established at the sender, so the muxer just records whatever
+    // the encoders hand in.
+    private var videoStartPtsUs = -1L
+    private var audioStartPtsUs = -1L
+    private var prevVideoPtsUs = -1L
+    private var prevAudioPtsUs = -1L
 
     var videoFramesWritten = 0
         private set
@@ -136,6 +140,25 @@ class MuxerManager(
         }
     }
 
+    // Subscribe to encoder output. The encoder's current output
+    // format is forwarded to setVideoFormat as soon as it becomes
+    // available, and every buffer is routed to writeVideoSample.
+    // Caller must invoke detachVideoEncoder before releasing the
+    // encoder.
+    fun attachVideoEncoder(encoder: VideoEncoder) {
+        encoder.onEncodedSample = { buffer, bufferInfo ->
+            val format = encoder.currentOutputFormat
+            if (format != null) {
+                setVideoFormat(format)
+            }
+            writeVideoSample(buffer, bufferInfo)
+        }
+    }
+
+    fun detachVideoEncoder(encoder: VideoEncoder) {
+        encoder.onEncodedSample = null
+    }
+
     fun setAudioFormat(format: MediaFormat) {
         synchronized(lock) {
             if (audioFormat == null) {
@@ -144,6 +167,20 @@ class MuxerManager(
                 tryStartMuxerLocked()
             }
         }
+    }
+
+    fun attachAudioEncoder(encoder: AudioEncoder) {
+        encoder.onEncodedSample = { buffer, bufferInfo ->
+            val format = encoder.currentOutputFormat
+            if (format != null) {
+                setAudioFormat(format)
+            }
+            writeAudioSample(buffer, bufferInfo)
+        }
+    }
+
+    fun detachAudioEncoder(encoder: AudioEncoder) {
+        encoder.onEncodedSample = null
     }
 
     fun forceStartIfTimeout() {
@@ -194,18 +231,24 @@ class MuxerManager(
             }
             if (!isStarted || videoTrackIndex < 0) return
 
+            val rawPtsUs = bufferInfo.presentationTimeUs
+            if (rawPtsUs <= 0L) {
+                AppLogger.w(TAG, "Skipping video sample with non-positive PTS=${bufferInfo.presentationTimeUs}")
+                return
+            }
+
             val dupBuffer = buffer.duplicate()
             dupBuffer.position(bufferInfo.offset)
             dupBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-            val rawPtsUs = if (bufferInfo.presentationTimeUs > 0) bufferInfo.presentationTimeUs else System.nanoTime() / 1000L
-            if (firstVideoPtsUs < 0) {
-                firstVideoPtsUs = rawPtsUs
+            if (videoStartPtsUs < 0L) {
+                videoStartPtsUs = rawPtsUs
+                AppLogger.i(TAG, "MediaMuxer videoStartPtsUs locked to $rawPtsUs (first video frame)")
             }
 
-            var muxerPts = rawPtsUs - firstVideoPtsUs
+            var muxerPts = rawPtsUs - videoStartPtsUs
             if (muxerPts <= prevVideoPtsUs) {
-                muxerPts = prevVideoPtsUs + 1000L
+                muxerPts = prevVideoPtsUs + 1_000L
             }
             prevVideoPtsUs = muxerPts
 
@@ -227,18 +270,24 @@ class MuxerManager(
         synchronized(lock) {
             if (!isStarted || audioTrackIndex < 0) return
 
+            val rawPtsUs = bufferInfo.presentationTimeUs
+            if (rawPtsUs <= 0L) {
+                AppLogger.w(TAG, "Skipping audio sample with non-positive PTS=${bufferInfo.presentationTimeUs}")
+                return
+            }
+
             val dupBuffer = buffer.duplicate()
             dupBuffer.position(bufferInfo.offset)
             dupBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-            val rawPtsUs = if (bufferInfo.presentationTimeUs > 0) bufferInfo.presentationTimeUs else System.nanoTime() / 1000L
-            if (firstAudioPtsUs < 0) {
-                firstAudioPtsUs = rawPtsUs
+            if (audioStartPtsUs < 0L) {
+                audioStartPtsUs = rawPtsUs
+                AppLogger.i(TAG, "MediaMuxer audioStartPtsUs locked to $rawPtsUs (first audio frame)")
             }
 
-            var muxerPts = rawPtsUs - firstAudioPtsUs
+            var muxerPts = rawPtsUs - audioStartPtsUs
             if (muxerPts <= prevAudioPtsUs) {
-                muxerPts = prevAudioPtsUs + 100L
+                muxerPts = prevAudioPtsUs + 1_000L
             }
             prevAudioPtsUs = muxerPts
 

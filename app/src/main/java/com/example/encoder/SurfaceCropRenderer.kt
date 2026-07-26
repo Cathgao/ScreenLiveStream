@@ -12,7 +12,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
 import com.example.log.AppLogger
-import com.example.model.EyeCrop
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -21,8 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class SurfaceCropRenderer(
     private val codecInputSurface: Surface,
     private val width: Int,
-    private val height: Int,
-    private val eyeCrop: EyeCrop
+    private val height: Int
 ) : SurfaceTexture.OnFrameAvailableListener {
 
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -49,7 +47,6 @@ class SurfaceCropRenderer(
     private var aPositionHandle: Int = 0
     private var aTexCoordHandle: Int = 0
     private var uSTMatrixHandle: Int = 0
-    private var uEyeCropModeHandle: Int = 0
 
     private val vertexBuffer: FloatBuffer
     private val texBuffer: FloatBuffer
@@ -71,7 +68,7 @@ class SurfaceCropRenderer(
     )
 
     init {
-        AppLogger.i(TAG, "Initializing SurfaceCropRenderer ($width x $height, Crop: ${eyeCrop.name})")
+        AppLogger.i(TAG, "Initializing SurfaceCropRenderer ($width x $height)")
 
         vertexBuffer = ByteBuffer.allocateDirect(quadVertices.size * 4)
             .order(ByteOrder.nativeOrder())
@@ -171,7 +168,6 @@ class SurfaceCropRenderer(
         aPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         uSTMatrixHandle = GLES20.glGetUniformLocation(program, "uSTMatrix")
-        uEyeCropModeHandle = GLES20.glGetUniformLocation(program, "uEyeCropMode")
 
         AppLogger.i(TAG, "GL Program compiled and linked successfully.")
     }
@@ -221,9 +217,6 @@ class SurfaceCropRenderer(
         GLES20.glEnableVertexAttribArray(aTexCoordHandle)
 
         GLES20.glUniformMatrix4fv(uSTMatrixHandle, 1, false, transformMatrix, 0)
-
-        val cropModeInt = 2 // Always FULL_FRAME for Quest 3 (no crop)
-        GLES20.glUniform1i(uEyeCropModeHandle, cropModeInt)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
@@ -298,18 +291,9 @@ class SurfaceCropRenderer(
             precision mediump float;
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
-            uniform int uEyeCropMode; // 0 = Left, 1 = Right, 2 = Full
 
             void main() {
-                vec2 uv = vTexCoord;
-                if (uEyeCropMode == 0) {
-                    // Left eye: map x from [0..1] to [0..0.5]
-                    uv.x = uv.x * 0.5;
-                } else if (uEyeCropMode == 1) {
-                    // Right eye: map x from [0..1] to [0.5..1.0]
-                    uv.x = 0.5 + uv.x * 0.5;
-                }
-                gl_FragColor = texture2D(sTexture, uv);
+                gl_FragColor = texture2D(sTexture, vTexCoord);
             }
         """
     }

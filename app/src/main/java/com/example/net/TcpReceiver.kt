@@ -26,18 +26,9 @@ class TcpReceiver : IReceiver {
     override var onStatsUpdated: ((StreamStats) -> Unit)? = null
     override var onReferenceLost: (() -> Unit)? = null
     override var onStreamStop: (() -> Unit)? = null
-    var onProbeReply: ((probeSeq: Int, originalSendTimeNanos: Long) -> Unit)? = null
 
     @Volatile
     override var jitterBufferMs: Int = 0
-
-    fun sendNack(frameSeq: Int, packetIndex: Int) {
-        // TCP guarantees 100% reliable ordered packet delivery; NACK is unnecessary.
-    }
-
-    fun sendPli() {
-        onReferenceLost?.invoke()
-    }
 
     // Per-window stats
     private var windowReceivedFrames = 0L
@@ -106,13 +97,13 @@ class TcpReceiver : IReceiver {
                         currentClientSocket = clientSocket
                         
                         clientSocket.tcpNoDelay = true
-                        clientSocket.receiveBufferSize = 8 * 1024 * 1024
+                        clientSocket.receiveBufferSize = 512 * 1024
                         val clientIp = clientSocket.inetAddress.hostAddress
                         SessionLog.i(TAG, "TCP Receiver accepted stream connection from $clientIp")
 
                         kotlin.concurrent.thread(start = true, name = "TcpReceiverClientThread") {
                             try {
-                                val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 2 * 1024 * 1024))
+                                val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 32 * 1024))
                                 val headerBuf = ByteArray(20)
 
                                 while (isListening && !clientSocket.isClosed && currentClientSocket == clientSocket) {

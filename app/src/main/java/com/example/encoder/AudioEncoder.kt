@@ -12,6 +12,8 @@ import android.media.projection.MediaProjection
 import android.os.Build
 import com.example.log.AppLogger
 import com.example.net.IStreamer
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AudioEncoder(
@@ -23,6 +25,26 @@ class AudioEncoder(
     private var captureThread: Thread? = null
 
     private val isRunning = AtomicBoolean(false)
+
+    // Local-recording sink. See VideoEncoder.onEncodedSample for
+    // the threading contract.
+    var onEncodedSample: ((ByteBuffer, MediaCodec.BufferInfo) -> Unit)? = null
+
+    @Volatile
+    var currentOutputFormat: MediaFormat? = null
+        private set
+
+    // Cross-encoder PTS anchors. The sender probes these from
+    // VideoEncoder (its first MediaCodec output frame) and pushes
+    // them in via the public setters. While both are 0 the audio
+    // capture thread falls back to its own nanoTime() anchor so a
+    // misconfigured sender still produces audio.
+    @Volatile
+    var videoStartPtsUs: Long = 0L
+    @Volatile
+    var videoStartRealNs: Long = 0L
+    @Volatile
+    var audioStartPtsUs: Long = -1L
 
     @SuppressLint("MissingPermission")
     fun start() {
@@ -93,7 +115,7 @@ class AudioEncoder(
     }
 
     private fun startAudioLoop(record: AudioRecord, codec: MediaCodec, bufferSize: Int) {
-        val startTimeNs = System.nanoTime()
+        val audioThreadStartNs = System.nanoTime()
 
         captureThread = Thread({
             val audioBuffer = ByteArray(bufferSize)
@@ -102,48 +124,62 @@ class AudioEncoder(
 
             AppLogger.i(TAG, "Audio capture loop thread running...")
 
+            fun computePtsUs(): Long {
+                val vStartPts = videoStartPtsUs
+                val vStartReal = videoStartRealNs
+                return if (vStartPts > 0L && vStartReal > 0L) {
+                    val deltaUs = (System.nanoTime() - vStartReal) / 1000L
+                    (vStartPts + deltaUs).coerceAtLeast(0L)
+                } else {
+                    (System.nanoTime() - audioThreadStartNs) / 1000L
+                }
+            }
+
             while (isRunning.get()) {
                 val readBytes = record.read(audioBuffer, 0, audioBuffer.size)
                 if (readBytes > 0) {
-                    val inputBufferIndex = codec.dequeueInputBuffer(10000)
-                    if (inputBufferIndex >= 0) {
-                        val inputBuffer = codec.getInputBuffer(inputBufferIndex)
-                        if (inputBuffer != null) {
-                            inputBuffer.clear()
-                            inputBuffer.put(audioBuffer, 0, readBytes)
-                            val ptsUs = (System.nanoTime() - startTimeNs) / 1000L
-                            codec.queueInputBuffer(inputBufferIndex, 0, readBytes, ptsUs, 0)
-                        }
-                    }
+                    val ptsUs = computePtsUs()
+                    queueAudio(codec, audioBuffer, readBytes, ptsUs)
 
                     // Dequeue output from AAC encoder
                     var outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                     while (outputBufferIndex >= 0 || outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             val newFormat = codec.outputFormat
+                            currentOutputFormat = newFormat
                             AppLogger.i(TAG, "Audio Encoder output format changed: $newFormat")
                         } else {
                             val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                             if (outputBuffer != null) {
+                                onEncodedSample?.invoke(outputBuffer, bufferInfo)
                                 val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                                
+
                                 val data = ByteArray(bufferInfo.size)
-                                val originalPosition = outputBuffer.position()
                                 outputBuffer.position(bufferInfo.offset)
                                 outputBuffer.get(data)
-                                
-                                val timestampMs = System.currentTimeMillis()
-                                
+
+                                val rawPtsUs = bufferInfo.presentationTimeUs
+                                if (audioStartPtsUs < 0L && rawPtsUs > 0L) {
+                                    audioStartPtsUs = rawPtsUs
+                                }
+
+                                val startPtsUs = if (videoStartPtsUs > 0L) videoStartPtsUs else audioStartPtsUs
+                                val networkPtsMs = if (startPtsUs > 0L && rawPtsUs >= startPtsUs) {
+                                    (rawPtsUs - startPtsUs) / 1000L
+                                } else {
+                                    0L
+                                }
+
                                 if (isConfig) {
                                     AppLogger.i(TAG, "Audio Encoder produced AAC CodecConfig, size: ${bufferInfo.size} bytes")
-                                    tcpStreamer?.sendAudioFrame(data, data.size, timestampMs, true)
+                                    tcpStreamer?.sendAudioFrame(data, data.size, networkPtsMs, true)
                                 } else {
                                     audioFrameCount++
                                     if (audioFrameCount == 1L || audioFrameCount % 200L == 0L) {
-                                        AppLogger.i(TAG, "Audio Encoder captured & encoded AAC frame #$audioFrameCount, size: ${bufferInfo.size} bytes")
+                                        AppLogger.i(TAG, "Audio Encoder captured & encoded AAC frame #$audioFrameCount, size: ${bufferInfo.size} bytes, rawPtsUs=$rawPtsUs, networkPtsMs=$networkPtsMs")
                                     }
 
-                                    tcpStreamer?.sendAudioFrame(data, data.size, timestampMs, false)
+                                    tcpStreamer?.sendAudioFrame(data, data.size, networkPtsMs, false)
                                 }
                             }
                             codec.releaseOutputBuffer(outputBufferIndex, false)
@@ -156,6 +192,20 @@ class AudioEncoder(
         }, "AudioCaptureThread")
 
         captureThread?.start()
+    }
+
+    // Queues a single PCM frame into the AAC encoder. Blocks (up to
+    // 10 s) if the encoder input is full.
+    private fun queueAudio(codec: MediaCodec, pcm: ByteArray, size: Int, ptsUs: Long) {
+        val inputBufferIndex = codec.dequeueInputBuffer(10_000)
+        if (inputBufferIndex >= 0) {
+            val inputBuffer = codec.getInputBuffer(inputBufferIndex)
+            if (inputBuffer != null) {
+                inputBuffer.clear()
+                inputBuffer.put(pcm, 0, size)
+                codec.queueInputBuffer(inputBufferIndex, 0, size, ptsUs, 0)
+            }
+        }
     }
 
     fun stop() {

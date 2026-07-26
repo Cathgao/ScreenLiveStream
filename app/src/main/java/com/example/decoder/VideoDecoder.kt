@@ -5,8 +5,8 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
-import android.util.Log
 import android.view.Surface
+import com.example.log.AppLogger
 import com.example.model.VideoCodec
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
@@ -69,7 +69,7 @@ class VideoDecoder {
 
     fun notifyReferenceLost() {
         referenceLost = true
-        Log.w(TAG, "Reference frame lost notified! Dropping P-frames until next IDR Keyframe.")
+        AppLogger.w(TAG, "Reference frame lost notified! Dropping P-frames until next IDR Keyframe.")
         onRequestKeyframe?.invoke()
     }
 
@@ -103,7 +103,7 @@ class VideoDecoder {
             if (codecConfigData != null && codecConfigData.isNotEmpty()) {
                 if (isHevc) {
                     format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
-                    Log.d(TAG, "Configuring HEVC decoder with csd-0 size: ${codecConfigData.size}")
+                    AppLogger.d(TAG, "Configuring HEVC decoder with csd-0 size: ${codecConfigData.size}")
                 } else {
                     val (sps, pps) = extractSpsAndPps(codecConfigData)
                     if (sps != null) {
@@ -125,11 +125,11 @@ class VideoDecoder {
             decoder = mc
             activeDecoderName = name
             isDecoderReady = true
-            Log.i(TAG, "VideoDecoder initialized with $mimeType using [$name]")
+            AppLogger.i(TAG, "VideoDecoder initialized with $mimeType using [$name]")
             startDrainThread(mc)
             startFeedThread(mc)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start VideoDecoder for $mimeType", e)
+            AppLogger.e(TAG, "Failed to start VideoDecoder for $mimeType", e)
             stop()
         }
     }
@@ -159,17 +159,17 @@ class VideoDecoder {
             for (info in sortedCandidates) {
                 try {
                     val codec = MediaCodec.createByCodecName(info.name)
-                    Log.i(TAG, "Selected Video Decoder candidate: '${info.name}' (Priority: ${getDecoderPriority(info)})")
+                    AppLogger.i(TAG, "Selected Video Decoder candidate: '${info.name}' (Priority: ${getDecoderPriority(info)})")
                     return Pair(codec, info.name)
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to instantiate decoder '${info.name}', trying next: ${e.message}")
+                    AppLogger.w(TAG, "Failed to instantiate decoder '${info.name}', trying next: ${e.message}")
                 }
             }
 
             val fallback = MediaCodec.createDecoderByType(mimeType)
             Pair(fallback, fallback.name)
         } catch (e: Exception) {
-            Log.w(TAG, "Exception during decoder lookup, using default for $mimeType: ${e.message}")
+            AppLogger.w(TAG, "Exception during decoder lookup, using default for $mimeType: ${e.message}")
             val fallback = MediaCodec.createDecoderByType(mimeType)
             Pair(fallback, fallback.name)
         }
@@ -358,16 +358,14 @@ class VideoDecoder {
                         val doRender = bufferInfo.size != 0
                         if (doRender && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && receiverStartNs != 0L) {
                             val deltaUs = bufferInfo.presentationTimeUs - streamStartPtsUs
-                            val renderTimeNs = receiverStartNs + deltaUs * 1000L + 50 * 1_000_000L // 50ms jitter buffer
                             
-                            // Prevent scheduling too far into the future due to clock drift (cap at 150ms ahead)
+                            // Calculate ideal render time based on receiver anchor
+                            val renderTimeNs = receiverStartNs + deltaUs * 1000L
                             val now = System.nanoTime()
-                            val scheduledTimeNs = if (renderTimeNs > now + 150_000_000L) {
-                                // If it's more than 150ms in the future, we drift reset
-                                receiverStartNs = now - deltaUs * 1000L
-                                now + 50 * 1_000_000L
-                            } else if (renderTimeNs < now - 50_000_000L) {
-                                // If it's more than 50ms in the past, drift reset
+                            
+                            // If the frame render time is severely behind (more than 100ms in the past due to network stall)
+                            // or too far in the future (more than 1s), smoothly re-anchor receiverStartNs to current time.
+                            val scheduledTimeNs = if (renderTimeNs < now - 100_000_000L || renderTimeNs > now + 1_000_000_000L) {
                                 receiverStartNs = now - deltaUs * 1000L
                                 now
                             } else {
@@ -385,16 +383,16 @@ class VideoDecoder {
                             val format = mc.outputFormat
                             val w = format.getInteger(MediaFormat.KEY_WIDTH)
                             val h = format.getInteger(MediaFormat.KEY_HEIGHT)
-                            Log.i(TAG, "Video format changed: $w x $h")
+                            AppLogger.i(TAG, "Video format changed: $w x $h")
                             onVideoSizeChanged?.invoke(w, h)
                         } catch (e: Exception) {
-                            Log.e(TAG, "Error getting video format", e)
+                            AppLogger.e(TAG, "Error getting video format", e)
                         }
                     }
                 } catch (e: IllegalStateException) {
                     break
                 } catch (e: Exception) {
-                    if (isDraining) Log.e(TAG, "Error in drain thread", e)
+                    if (isDraining) AppLogger.e(TAG, "Error in drain thread", e)
                 }
             }
         }
@@ -444,11 +442,11 @@ class VideoDecoder {
                                 )
                             }
                         } else {
-                            Log.w(TAG, "Input buffer unavailable after 500ms timeout on seq=${task.seq}. Requesting IDR keyframe.")
+                            AppLogger.w(TAG, "Input buffer unavailable after 500ms timeout on seq=${task.seq}. Requesting IDR keyframe.")
                             notifyReferenceLost()
                         }
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error decoding frame seq=${task.seq}", e)
+                        AppLogger.e(TAG, "Error decoding frame seq=${task.seq}", e)
                         notifyReferenceLost()
                     }
                     recycleTask(task)
@@ -475,7 +473,7 @@ class VideoDecoder {
             val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(formattedBytes)
             lastCodecConfigData = formattedBytes
             if (!isDecoderReady || currentCodec != codecType || configChanged) {
-                Log.i(TAG, "Initializing decoder with CodecConfig, size: ${formattedBytes.size}")
+                AppLogger.i(TAG, "Initializing decoder with CodecConfig, size: ${formattedBytes.size}")
                 start(surf, isHevc, formattedBytes)
             }
             return
@@ -486,7 +484,7 @@ class VideoDecoder {
         }
 
         if (lastTimestampMs != -1L && timestampMs < lastTimestampMs - 1000) {
-            Log.i(TAG, "Timestamp reset detected (old=$lastTimestampMs, new=$timestampMs). Restarting decoder.")
+            AppLogger.i(TAG, "Timestamp reset detected (old=$lastTimestampMs, new=$timestampMs). Restarting decoder.")
             stop()
             start(surf, isHevc, lastCodecConfigData)
         }
@@ -504,7 +502,7 @@ class VideoDecoder {
 
         if (isKeyframe) {
             if (!hasReceivedFirstKeyframe) {
-                Log.i(TAG, "First video Keyframe received (seq=$seq). Starting decoding!")
+                AppLogger.i(TAG, "First video Keyframe received (seq=$seq). Starting decoding!")
             }
             hasReceivedFirstKeyframe = true
             referenceLost = false
@@ -518,7 +516,7 @@ class VideoDecoder {
         if (!isKeyframe) {
             if (lastFrameSeq != -1 && seq > lastFrameSeq + 1) {
                 val gap = seq - lastFrameSeq - 1
-                Log.w(TAG, "Sequence gap detected: last=$lastFrameSeq, current=$seq, gap=$gap. Requesting IDR keyframe.")
+                AppLogger.w(TAG, "Sequence gap detected: last=$lastFrameSeq, current=$seq, gap=$gap. Requesting IDR keyframe.")
                 notifyReferenceLost()
             }
 
@@ -545,22 +543,10 @@ class VideoDecoder {
         task.seq = seq
 
         if (!taskQueue.offer(task)) {
-            Log.w(TAG, "Video decoder task queue full! Dropping frame seq=$seq and requesting IDR.")
+            AppLogger.w(TAG, "Video decoder task queue full! Dropping frame seq=$seq and requesting IDR.")
             recycleTask(task)
             notifyReferenceLost()
         }
-    }
-
-    private fun hasCodecConfigHeader(bytes: ByteArray): Boolean {
-        // Quick check if frame starts with VPS (32) / SPS (33/7) NAL header
-        if (bytes.size < 5) return false
-        val offset = if (bytes[0] == 0.toByte() && bytes[1] == 0.toByte() && bytes[2] == 0.toByte() && bytes[3] == 1.toByte()) 4
-        else if (bytes[0] == 0.toByte() && bytes[1] == 0.toByte() && bytes[2] == 1.toByte()) 3
-        else return false
-
-        if (offset >= bytes.size) return false
-        val nalType = bytes[offset].toInt() and 0x1F
-        return nalType == 7 || nalType == 8 || nalType == 32 || nalType == 33 || nalType == 34
     }
 
     fun stop() {
@@ -593,9 +579,9 @@ class VideoDecoder {
             referenceLost = false
             receiverStartNs = 0L
             streamStartPtsUs = 0L
-            Log.i(TAG, "Decoder flushed successfully.")
+            AppLogger.i(TAG, "Decoder flushed successfully.")
         } catch (e: Exception) {
-            Log.e(TAG, "Error flushing decoder", e)
+            AppLogger.e(TAG, "Error flushing decoder", e)
         }
     }
 

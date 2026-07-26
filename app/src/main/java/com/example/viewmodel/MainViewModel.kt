@@ -49,9 +49,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _receiverConfig = MutableStateFlow(ReceiverConfig())
     val receiverConfig: StateFlow<ReceiverConfig> = _receiverConfig.asStateFlow()
 
-    private val _senderStats = MutableStateFlow(StreamStats())
-    val senderStats: StateFlow<StreamStats> = _senderStats.asStateFlow()
-
     private val _receiverStats = MutableStateFlow(StreamStats())
     val receiverStats: StateFlow<StreamStats> = _receiverStats.asStateFlow()
 
@@ -271,10 +268,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _receiverConfig.value = _receiverConfig.value.copy(listenPort = port)
     }
 
-    fun updateReceiverJitterBuffer(ms: Int) {
-        _receiverConfig.value = _receiverConfig.value.copy(jitterBufferMs = ms)
-    }
-
     fun selectDiscoveredDevice(device: DiscoveredDevice) {
         _streamConfig.value = _streamConfig.value.copy(
             targetIp = device.ipAddress,
@@ -288,10 +281,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startLanScan() {
         lanDiscovery.startScanning()
-    }
-
-    fun stopLanScan() {
-        lanDiscovery.stopScanning()
     }
 
     private fun fetchLocalIp() {

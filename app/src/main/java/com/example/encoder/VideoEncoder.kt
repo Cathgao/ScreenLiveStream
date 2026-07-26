@@ -23,6 +23,17 @@ class VideoEncoder(
     private val overrideFps: Int = 0,
     private val context: Context? = null
 ) {
+    // Local-recording sink. Invoked once per output buffer; the
+    // consumer must duplicate the ByteBuffer (muxers do) or read it
+    // synchronously — MediaCodec reclaims it after the next
+    // releaseOutputBuffer.
+    var onEncodedSample: ((ByteBuffer, MediaCodec.BufferInfo) -> Unit)? = null
+
+    // Most recent MediaCodec output format. Null until the first
+    // INFO_OUTPUT_FORMAT_CHANGED arrives.
+    @Volatile
+    var currentOutputFormat: MediaFormat? = null
+        private set
     private var codec: MediaCodec? = null
     private var renderer: SurfaceCropRenderer? = null
     @Volatile
@@ -34,6 +45,27 @@ class VideoEncoder(
 
     val inputSurface: Surface?
         get() = renderer?.inputSurface
+
+    // Captured the moment the video encoder produced its first
+    // output frame. Both `presentationTimeUs` (from the SurfaceTexture
+    // queue) and `System.nanoTime()` are recorded together so the
+    // audio encoder can translate its own System.nanoTime()-based
+    // input PTS into a value that is collinear with the video
+    // MediaCodec output PTS. See AudioEncoder for the consumer side.
+    @Volatile
+    var firstFramePtsUs: Long = 0L
+        private set
+    @Volatile
+    var firstFrameRealNs: Long = 0L
+        private set
+    @Volatile
+    var firstFrameCaptured: Boolean = false
+        private set
+
+    // Callback fired on the encoder thread the first time a video
+    // output frame is produced. Sender wires this to AudioEncoder so
+    // the audio PTS domain can be rebased to the video's zero point.
+    var onFirstFrameCaptured: (() -> Unit)? = null
 
     fun start() {
         try {
@@ -99,8 +131,7 @@ class VideoEncoder(
             renderer = SurfaceCropRenderer(
                 codecInputSurface = codecSurface,
                 width = width,
-                height = height,
-                eyeCrop = config.eyeCrop
+                height = height
             )
 
             isEncoding = true
@@ -164,7 +195,6 @@ class VideoEncoder(
         encoderThread = thread(start = true, name = "QuestVideoEncoderThread") {
             val bufferInfo = MediaCodec.BufferInfo()
             var tempBuffer = ByteArray(512 * 1024)
-            var lastKeyframeReqTime = 0L
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
@@ -184,11 +214,18 @@ class VideoEncoder(
                     while (outputIndex >= 0 || outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             val newFormat = mc.outputFormat
+                            currentOutputFormat = newFormat
                             AppLogger.i(TAG, "Encoder output format changed: $newFormat")
                         } else {
                             totalOutputFrames++
                             val outputBuffer: ByteBuffer? = mc.getOutputBuffer(outputIndex)
                             if (outputBuffer != null && bufferInfo.size > 0) {
+                                // Hand the raw output buffer to the muxer
+                                // before we copy it for the network path.
+                                // bufferInfo.position/size are already set
+                                // by MediaCodec, so the muxer can write
+                                // the slice as-is.
+                                onEncodedSample?.invoke(outputBuffer, bufferInfo)
                                 val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                                 val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
 
@@ -204,6 +241,13 @@ class VideoEncoder(
                                 val frameNs = if (bufferInfo.presentationTimeUs > 0) bufferInfo.presentationTimeUs * 1000L else System.nanoTime()
                                 if (streamStartNs == 0L) {
                                     streamStartNs = frameNs
+                                    // Record the first-frame coordinates so
+                                    // AudioEncoder can rebase its PTS to
+                                    // share the same zero point.
+                                    firstFramePtsUs = bufferInfo.presentationTimeUs
+                                    firstFrameRealNs = System.nanoTime()
+                                    firstFrameCaptured = true
+                                    onFirstFrameCaptured?.invoke()
                                 }
                                 val timestampMs = ((frameNs - streamStartNs) / 1_000_000L).coerceAtLeast(0L)
 
@@ -307,10 +351,18 @@ class VideoEncoder(
         AppLogger.i(TAG, "Stopping VideoEncoder...")
         isEncoding = false
 
-        try {
-            encoderThread?.join(2000)
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error joining encoderThread", e)
+        val encoderThreadRef = encoderThread
+        if (encoderThreadRef != null && encoderThreadRef.isAlive) {
+            try {
+                encoderThreadRef.join(5_000L)
+                if (encoderThreadRef.isAlive) {
+                    AppLogger.w(TAG, "encoderThread did not terminate within 5s; releasing codec anyway")
+                }
+            } catch (e: InterruptedException) {
+                AppLogger.e(TAG, "Interrupted while joining encoderThread", e)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error joining encoderThread", e)
+            }
         }
         encoderThread = null
 

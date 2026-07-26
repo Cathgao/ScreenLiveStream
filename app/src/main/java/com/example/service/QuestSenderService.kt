@@ -41,6 +41,14 @@ class QuestSenderService : Service() {
     private var encoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
     private var streamer: IStreamer? = null
+    // Local MP4 recording sink. When non-null, every encoder output
+    // buffer is also written to a file in /sdcard/Movies/QuestCast.
+    // Lifecycle is bound to startStreaming/stopStreaming; rotating the
+    // screen (recreateEncoderAndVirtualDisplay) keeps the existing
+    // muxer alive because the underlying MediaProjection is reused.
+    // Local MP4 recording sink. Lifecycle: created in startStreaming
+    // when recordingEnabled, stopped first in stopStreaming.
+    private var muxer: com.example.encoder.MuxerManager? = null
     // Independent ping/echo used to derive real link RTT and a true
     // network-layer loss rate (the legacy latencyMs number was based on
     // wall-clock delta with no NTP-equivalent between phones; it always
@@ -52,6 +60,11 @@ class QuestSenderService : Service() {
     @Volatile
     var isStreaming = false
         private set
+
+    /** When true, the sender also writes the encoded stream to a
+     *  local MP4 in Movies/QuestCast while streaming. Set via
+     *  EXTRA_RECORD; defaults to false. */
+    private var recordingEnabled: Boolean = false
 
     private var savedResultCode: Int = 0
     private var savedResultData: Intent? = null
@@ -98,6 +111,10 @@ class QuestSenderService : Service() {
         val codecName = intent?.getStringExtra(EXTRA_CODEC) ?: VideoCodec.H265.name
         val bitrateModeName = intent?.getStringExtra(EXTRA_BITRATE_MODE) ?: BitrateMode.VBR.name
         val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
+        // Default recording to ON so the desync vs. capture question
+        // can be answered on the very first run. The UI can flip this
+        // via EXTRA_RECORD = true.
+        recordingEnabled = intent?.getBooleanExtra(EXTRA_RECORD, false) ?: false
 
         val crop = try { EyeCrop.valueOf(eyeCropName) } catch (e: Exception) { EyeCrop.BOTH }
         val codec = try { VideoCodec.valueOf(codecName) } catch (e: Exception) { VideoCodec.H265 }
@@ -276,10 +293,48 @@ class QuestSenderService : Service() {
                 mediaProjection = projection,
                 tcpStreamer = currentStreamer
             )
+            // Push the video first-frame anchor into the audio
+            // encoder. From this moment on, audio input PTS lives in
+            // the same domain as the video MediaCodec output PTS, so
+            // a/v stays in lockstep on both the live stream and the
+            // recorded MP4. AudioEncoder's capture thread holds
+            // captured PCM in a bounded buffer while it waits for
+            // this callback (500 ms timeout fallback).
+            enc.onFirstFrameCaptured = {
+                audioEnc.videoStartPtsUs = enc.firstFramePtsUs
+                audioEnc.videoStartRealNs = enc.firstFrameRealNs
+                AppLogger.i(
+                    TAG,
+                    "Audio encoder rebased to video anchor: " +
+                        "videoStartPtsUs=${enc.firstFramePtsUs}, " +
+                        "videoStartRealNs=${enc.firstFrameRealNs}"
+                )
+            }
             audioEnc.start()
             audioEncoder = audioEnc
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to start internal AudioEncoder", e)
+        }
+
+        // Wire up the local MP4 muxer (if recording is enabled).
+        // Muxer is created after both encoders so the first buffers
+        // (codec config + format change) are still captured.
+        if (recordingEnabled) {
+            try {
+                val mgr = com.example.encoder.MuxerManager(
+                    context = this,
+                    codecName = config.codec.name,
+                    expectAudio = audioEncoder != null
+                )
+                enc.onEncodedSample?.let { /* already set below via attach */ }
+                mgr.attachVideoEncoder(enc)
+                audioEncoder?.let { mgr.attachAudioEncoder(it) }
+                muxer = mgr
+                AppLogger.i(TAG, "Local MP4 recording enabled (${config.codec.name}, audio=${audioEncoder != null})")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to start local MP4 recording — recording disabled for this session", e)
+                muxer = null
+            }
         }
 
         val surface = enc.inputSurface
@@ -322,6 +377,20 @@ class QuestSenderService : Service() {
         AppLogger.i(TAG, "stopStreaming requested.")
         isStreaming = false
 
+        // Stop the muxer first so its MediaMuxer.stop() runs before
+        // the encoders that feed it are released — otherwise a final
+        // frame can race with release().
+        muxer?.let { mgr ->
+            encoder?.let { mgr.detachVideoEncoder(it) }
+            audioEncoder?.let { mgr.detachAudioEncoder(it) }
+            try {
+                mgr.stop()
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error stopping muxer", e)
+            }
+        }
+        muxer = null
+
         displayListener?.let { listener ->
             val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
             try {
@@ -356,8 +425,6 @@ class QuestSenderService : Service() {
 
         try {
             streamer?.sendStreamStopSignal()
-            // Allow a brief moment for the signal to be sent over the socket before closing
-            Thread.sleep(50)
             streamer?.stop()
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error stopping streamer", e)
@@ -584,5 +651,6 @@ class QuestSenderService : Service() {
         const val EXTRA_CODEC = "EXTRA_CODEC"
         const val EXTRA_BITRATE_MODE = "EXTRA_BITRATE_MODE"
         const val EXTRA_PROTOCOL = "EXTRA_PROTOCOL"
+        const val EXTRA_RECORD = "EXTRA_RECORD"
     }
 }

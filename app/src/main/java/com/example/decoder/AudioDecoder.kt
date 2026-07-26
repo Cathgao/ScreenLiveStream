@@ -5,7 +5,8 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.util.Log
+import android.os.Build
+import com.example.log.AppLogger
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -26,6 +27,9 @@ class AudioDecoder {
         var data: ByteArray = ByteArray(0)
         var size: Int = 0
         var isCodecConfig: Boolean = false
+        // Sender-provided relative-millisecond timestamp used to drive
+        // the AAC decoder input PTS. See [decodeFrame].
+        var timestampMs: Long = 0L
     }
 
     private val taskQueue = ArrayBlockingQueue<DecodeTask>(100)
@@ -53,10 +57,9 @@ class AudioDecoder {
             val mimeType = MediaFormat.MIMETYPE_AUDIO_AAC
             val format = MediaFormat.createAudioFormat(mimeType, sampleRate, channelCount)
             
-            if (codecConfigData != null && codecConfigData.isNotEmpty()) {
-                format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
-                Log.d(TAG, "Configuring AudioDecoder with csd-0 size: ${codecConfigData.size}")
-            }
+            val configBytes = codecConfigData ?: byteArrayOf(0x11.toByte(), 0x90.toByte())
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(configBytes))
+            AppLogger.d(TAG, "Configuring AudioDecoder with csd-0 size: ${configBytes.size}")
 
             val mc = MediaCodec.createDecoderByType(mimeType)
             mc.configure(format, null, null, 0)
@@ -74,13 +77,13 @@ class AudioDecoder {
                 channelConfig,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = (minBufferSize * 2).coerceAtLeast(8192)
+            val bufferSize = minBufferSize.coerceAtLeast(2048)
 
-            audioTrack = AudioTrack.Builder()
+            val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build()
                 )
                 .setAudioFormat(
@@ -92,15 +95,20 @@ class AudioDecoder {
                 )
                 .setBufferSizeInBytes(bufferSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            }
+
+            audioTrack = trackBuilder.build()
 
             audioTrack?.play()
             isDecoderReady = true
-            Log.d(TAG, "AudioDecoder and AudioTrack started successfully.")
+            AppLogger.d(TAG, "AudioDecoder and AudioTrack started successfully.")
             
             startFeedThread(mc, audioTrack!!)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start AudioDecoder", e)
+            AppLogger.e(TAG, "Failed to start AudioDecoder", e)
             stop()
         }
     }
@@ -119,11 +127,16 @@ class AudioDecoder {
                             if (inputBuffer != null) {
                                 inputBuffer.clear()
                                 inputBuffer.put(task.data, 0, task.size)
+                                val ptsUs = if (task.timestampMs > 0) {
+                                    task.timestampMs * 1000L
+                                } else {
+                                    System.nanoTime() / 1000
+                                }
                                 mc.queueInputBuffer(
                                     inputIndex,
                                     0,
                                     task.size,
-                                    System.nanoTime() / 1000,
+                                    ptsUs,
                                     0
                                 )
                             }
@@ -143,7 +156,7 @@ class AudioDecoder {
                             outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
                         }
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error decoding audio frame", e)
+                        AppLogger.e(TAG, "Error decoding audio frame", e)
                     }
                     recycleTask(task)
                 } catch (e: InterruptedException) {
@@ -153,11 +166,11 @@ class AudioDecoder {
         }
     }
 
-    fun decodeFrame(frameBytes: ByteArray, isCodecConfig: Boolean) {
+    fun decodeFrame(frameBytes: ByteArray, isCodecConfig: Boolean, timestampMs: Long = 0L) {
         if (isCodecConfig) {
             val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(frameBytes)
             if (!isDecoderReady || configChanged) {
-                Log.i(TAG, "Initializing/restarting audio decoder with new CodecConfig, size: ${frameBytes.size}")
+                AppLogger.i(TAG, "Initializing/restarting audio decoder with new CodecConfig, size: ${frameBytes.size}")
                 start(codecConfigData = frameBytes)
             }
             return
@@ -166,16 +179,25 @@ class AudioDecoder {
         if (!isDecoderReady) {
             start(codecConfigData = lastCodecConfigData)
         }
-        
+
         if (!isDecoderReady) return
+
+        // Low latency catch-up: if TCP burst delivers multiple frames (> 2 queued), drop oldest frames
+        while (taskQueue.size > 2) {
+            val dropped = taskQueue.poll()
+            if (dropped != null) {
+                recycleTask(dropped)
+            }
+        }
 
         val task = obtainTask(frameBytes.size)
         System.arraycopy(frameBytes, 0, task.data, 0, frameBytes.size)
         task.size = frameBytes.size
         task.isCodecConfig = isCodecConfig
+        task.timestampMs = timestampMs
 
         if (!taskQueue.offer(task)) {
-            Log.w(TAG, "Audio decoder queue full! Dropping audio frame.")
+            AppLogger.w(TAG, "Audio decoder queue full! Dropping audio frame.")
             recycleTask(task)
         }
     }
@@ -185,9 +207,9 @@ class AudioDecoder {
         try {
             decoder?.flush()
             taskQueue.clear()
-            Log.i(TAG, "AudioDecoder flushed successfully.")
+            AppLogger.i(TAG, "AudioDecoder flushed successfully.")
         } catch (e: Exception) {
-            Log.e(TAG, "Error flushing AudioDecoder", e)
+            AppLogger.e(TAG, "Error flushing AudioDecoder", e)
         }
     }
 

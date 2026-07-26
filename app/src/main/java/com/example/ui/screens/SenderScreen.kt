@@ -57,6 +57,7 @@ fun SenderScreen(
     val discoveredDevices by viewModel.discoveredDevices.collectAsState()
     val localIp by viewModel.localIpAddress.collectAsState()
     var logExportResult by remember { mutableStateOf<String?>(null) }
+    var recordingEnabled by remember { mutableStateOf(false) }
 
     var ipInput by remember { mutableStateOf(config.targetIp) }
     var portInput by remember { mutableStateOf(config.targetPort.toString()) }
@@ -90,6 +91,7 @@ fun SenderScreen(
                 putExtra(QuestSenderService.EXTRA_CODEC, config.codec.name)
                 putExtra(QuestSenderService.EXTRA_BITRATE_MODE, config.bitrateMode.name)
                 putExtra(QuestSenderService.EXTRA_PROTOCOL, config.protocol.name)
+                putExtra(QuestSenderService.EXTRA_RECORD, recordingEnabled)
             }
             onStartStreamRequested(serviceIntent)
         }
@@ -560,6 +562,42 @@ fun SenderScreen(
                             )
                         )
                     }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Local MP4 recording toggle.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Save,
+                        contentDescription = null,
+                        tint = if (recordingEnabled) LiveGreen else TextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "同时录制到本地 MP4",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "保存路径：Movies/QuestCast/screen_record_<时间>.mp4",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                    Switch(
+                        checked = recordingEnabled,
+                        onCheckedChange = { recordingEnabled = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = LiveGreen
+                        )
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))

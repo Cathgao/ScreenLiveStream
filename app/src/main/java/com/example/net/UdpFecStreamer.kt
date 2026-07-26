@@ -20,7 +20,11 @@ class UdpFecStreamer : IStreamer {
     @Volatile
     var isStreaming = false
         private set
-        
+    // Set to true once socket + targetAddress are both initialised.
+    // sendThread gates on this to avoid busy-waiting on a null socket.
+    @Volatile
+    private var ready = false
+
     private val MAX_PAYLOAD = 1300
     private val FEC_GROUP_SIZE = 12 // Adjust based on network
     
@@ -61,6 +65,7 @@ class UdpFecStreamer : IStreamer {
     override fun start(targetIp: String, port: Int) {
         if (isStreaming) return
         isStreaming = true
+        ready = false
         this.targetPort = port
         taskQueue.clear()
 
@@ -69,6 +74,7 @@ class UdpFecStreamer : IStreamer {
                 socket = DatagramSocket()
                 socket?.sendBufferSize = 4 * 1024 * 1024
                 targetAddress = InetAddress.getByName(targetIp)
+                ready = true
                 AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port")
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Error starting UDP streamer", e)
@@ -79,13 +85,14 @@ class UdpFecStreamer : IStreamer {
         sendThread = thread(start = true, name = "UdpStreamerSendThread") {
             val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD)
             val fecPayload = ByteArray(MAX_PAYLOAD)
-            val fragments = ArrayList<ByteArray>()
-            for (i in 0 until 1000) fragments.add(ByteArray(28 + MAX_PAYLOAD))
+            // Single fragment scratch buffer (frames are processed
+            // sequentially in this thread).
+            val fragData = ByteArray(28 + MAX_PAYLOAD)
 
             while (isStreaming) {
                 try {
                     val task = taskQueue.take()
-                    if (socket != null && targetAddress != null) {
+                    if (ready && socket != null && targetAddress != null) {
                         try {
                             if (task.isStreamStop) {
                                 packetBuf.clear()
@@ -144,8 +151,7 @@ class UdpFecStreamer : IStreamer {
                                 for (i in 0 until totalFragments) {
                                     val fragOffset = task.offset + i * MAX_PAYLOAD
                                     val length = Math.min(MAX_PAYLOAD, frameSize - i * MAX_PAYLOAD)
-                                    
-                                    val fragData = fragments[i]
+
                                     val buf = ByteBuffer.wrap(fragData)
                                     buf.putInt(0x55445056) // magic
                                     buf.putInt(seq)
@@ -156,22 +162,28 @@ class UdpFecStreamer : IStreamer {
                                     buf.putInt(frameSize)
                                     buf.put(ByteArray(3)) // pad to 28 bytes
                                     buf.put(task.data, fragOffset, length)
-                                    
+
                                     val dp = DatagramPacket(fragData, 28 + length, targetAddress, targetPort)
                                     socket?.send(dp)
                                 }
-                                
-                                // Generate FEC
+
+                                // Generate FEC: XOR per-fragment payloads
+                                // across each FEC group. The 28-byte packet
+                                // header is excluded; the receiver mirrors
+                                // this by XORing fb.fragments[i] at the
+                                // corresponding slice.
                                 var fecGroupId = 0
                                 for (i in 0 until totalFragments step FEC_GROUP_SIZE) {
                                     val end = Math.min(i + FEC_GROUP_SIZE, totalFragments)
-                                    
+
                                     fecPayload.fill(0)
                                     for (j in i until end) {
-                                        val fragData = fragments[j]
-                                        val fragPayloadLen = if (j == totalFragments - 1) frameSize - j * MAX_PAYLOAD else MAX_PAYLOAD
-                                        for (k in 0 until fragPayloadLen) {
-                                            fecPayload[k] = (fecPayload[k].toInt() xor fragData[28 + k].toInt()).toByte()
+                                        val fragOffset = j * MAX_PAYLOAD
+                                        val length =
+                                            if (j == totalFragments - 1) frameSize - fragOffset
+                                            else MAX_PAYLOAD
+                                        for (k in 0 until length) {
+                                            fecPayload[k] = (fecPayload[k].toInt() xor task.data[task.offset + fragOffset + k].toInt()).toByte()
                                         }
                                     }
                                     
@@ -281,7 +293,21 @@ class UdpFecStreamer : IStreamer {
     
     override fun stop() {
         isStreaming = false
+        ready = false
         sendThread?.interrupt()
+        val sendThreadRef = sendThread
+        if (sendThreadRef != null && sendThreadRef.isAlive) {
+            try {
+                sendThreadRef.join(2_000L)
+                if (sendThreadRef.isAlive) {
+                    AppLogger.w(TAG, "UdpFecStreamer sendThread did not terminate within 2s; closing socket anyway")
+                }
+            } catch (_: InterruptedException) {
+                // Caller interrupted; proceed with cleanup.
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "Error joining UdpFecStreamer sendThread: ${e.message}")
+            }
+        }
         sendThread = null
         try {
             socket?.close()

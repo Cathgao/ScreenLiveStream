@@ -15,7 +15,9 @@ class LanDiscovery {
     @Volatile
     private var isAnnouncing = false
 
+    @Volatile
     private var scanSocket: DatagramSocket? = null
+    @Volatile
     private var announceSocket: DatagramSocket? = null
 
     val discoveredDevices = ConcurrentHashMap<String, DiscoveredDevice>()
