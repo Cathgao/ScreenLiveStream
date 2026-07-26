@@ -361,13 +361,18 @@ class VideoDecoder {
                             val renderTimeNs = receiverStartNs + deltaUs * 1000L
                             val now = System.nanoTime()
                             
-                            // If the frame render time is too far in the future (e.g. > 200ms due to timestamp anomaly or drift),
-                            // re-anchor to prevent MediaCodec from holding the buffer and starving the decoder.
-                            // We do NOT re-anchor if the frame is in the past, so that delayed bursts can be played
-                            // as fast as possible to catch up to real-time.
-                            val scheduledTimeNs = if (renderTimeNs > now + 200_000_000L) {
-                                receiverStartNs = now - deltaUs * 1000L
-                                now
+                            // Jitter buffer configuration
+                            val targetBufferNs = 50_000_000L // 50ms ideal buffer to absorb network jitter
+                            val maxBufferNs = 400_000_000L   // 400ms max acceptable latency
+                            
+                            val scheduledTimeNs = if (renderTimeNs < now) {
+                                // Frame is late (buffer underrun). Re-anchor to restore the 50ms jitter buffer.
+                                receiverStartNs = (now + targetBufferNs) - deltaUs * 1000L
+                                now + targetBufferNs
+                            } else if (renderTimeNs > now + maxBufferNs) {
+                                // Buffer is too large (e.g. timestamp jump or clock drift). Re-anchor to reduce latency.
+                                receiverStartNs = (now + targetBufferNs) - deltaUs * 1000L
+                                now + targetBufferNs
                             } else {
                                 renderTimeNs
                             }
