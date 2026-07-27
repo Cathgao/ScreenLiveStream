@@ -1,3 +1,11 @@
+> [!CAUTION]
+> 因Google将要实行的政策，开源软件在不久的将来很可能无法使用，详情：
+> # [你的手机很快就不再属于你。保持安卓开放！](https://keepandroidopen.org/)
+
+> [!CAUTION]
+> 本软件仅在[本仓库](https://github.com/Cathgao/ScreenLiveStream)发布，未发布在其他网站、未上架任何商店，更没有在任何平台销售。
+> 若你是付费获得本软件，那么你已经遭到诈骗，请立即向卖家或平台投诉，并要求全额退款。
+
 # QuestCast VR
 
 > 在局域网内，将 Meta Quest 画面低延迟投送到 Android 手机或平板。
