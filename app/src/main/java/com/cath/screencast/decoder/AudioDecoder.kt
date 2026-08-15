@@ -77,8 +77,8 @@ class AudioDecoder {
                 channelConfig,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            // Increase buffer size to 4x minBufferSize (min 32KB) to prevent AudioTrack underruns
-            val bufferSize = (minBufferSize * 4).coerceAtLeast(32 * 1024)
+            // Low-latency buffer (2x minBufferSize, approx 20-30ms) to ensure audio is tightly synced with video
+            val bufferSize = (minBufferSize * 2).coerceAtLeast(minBufferSize)
 
             val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -101,13 +101,20 @@ class AudioDecoder {
                 trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             }
 
-            audioTrack = trackBuilder.build()
+            val track = trackBuilder.build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try {
+                    val targetFrames = (track.bufferCapacityInFrames / 2).coerceAtLeast(minBufferSize / 4)
+                    track.setBufferSizeInFrames(targetFrames)
+                } catch (_: Exception) {}
+            }
+            audioTrack = track
 
-            audioTrack?.play()
+            track.play()
             isDecoderReady = true
-            AppLogger.d(TAG, "AudioDecoder and AudioTrack started successfully.")
+            AppLogger.d(TAG, "AudioDecoder and AudioTrack started successfully with low-latency buffer: $bufferSize bytes.")
             
-            startFeedThread(mc, audioTrack!!)
+            startFeedThread(mc, track)
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to start AudioDecoder", e)
             stop()
@@ -164,11 +171,15 @@ class AudioDecoder {
         while (outputIndex >= 0) {
             val outputBuffer = mc.getOutputBuffer(outputIndex)
             if (outputBuffer != null && bufferInfo.size > 0) {
-                val pcmBytes = ByteArray(bufferInfo.size)
                 outputBuffer.position(bufferInfo.offset)
-                outputBuffer.get(pcmBytes)
-                
-                track.write(pcmBytes, 0, pcmBytes.size)
+                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    track.write(outputBuffer, bufferInfo.size, AudioTrack.WRITE_NON_BLOCKING)
+                } else {
+                    val pcmBytes = ByteArray(bufferInfo.size)
+                    outputBuffer.get(pcmBytes)
+                    track.write(pcmBytes, 0, pcmBytes.size)
+                }
             }
             mc.releaseOutputBuffer(outputIndex, false)
             outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
@@ -191,13 +202,21 @@ class AudioDecoder {
 
         if (!isDecoderReady) return
 
-        // Low latency catch-up: allow small queue buffer for network packet bursts (up to 6 frames / ~120ms)
-        // Drops oldest frames only if network gets significantly backlogged, keeping audio low-latency & perfectly synced with video
-        while (taskQueue.size > 6) {
+        // Low latency catch-up: allow small queue buffer for network packet bursts (up to 4 frames / ~80ms)
+        var droppedCount = 0
+        while (taskQueue.size > 4) {
             val dropped = taskQueue.poll()
             if (dropped != null) {
                 recycleTask(dropped)
+                droppedCount++
             }
+        }
+        if (droppedCount > 0) {
+            try {
+                audioTrack?.pause()
+                audioTrack?.flush()
+                audioTrack?.play()
+            } catch (_: Exception) {}
         }
 
         val task = obtainTask(frameBytes.size)

@@ -52,6 +52,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     
     private val frameBuffers = HashMap<Int, FrameBuffer>()
     private var lastAssembledSeq = -1
+    private val fecScratch = ByteArray(MAX_PAYLOAD)
     
     override fun start(port: Int) {
         if (isListening) return
@@ -96,26 +97,52 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     
                     if (length < 28) continue
                     
-                    val bb = ByteBuffer.wrap(buffer, 0, length)
-                    val magic = bb.getInt()
+                    val magic = ((buffer[0].toInt() and 0xFF) shl 24) or
+                                ((buffer[1].toInt() and 0xFF) shl 16) or
+                                ((buffer[2].toInt() and 0xFF) shl 8) or
+                                (buffer[3].toInt() and 0xFF)
                     if (magic != 0x55445056) continue
                     
-                    val seq = bb.getInt()
-                    val ts = bb.getLong()
-                    val flags = bb.get()
-                    val fragIndex = bb.getShort().toInt()
-                    val totalFragments = bb.getShort().toInt()
-                    val frameSize = bb.getInt()
+                    val seq = ((buffer[4].toInt() and 0xFF) shl 24) or
+                              ((buffer[5].toInt() and 0xFF) shl 16) or
+                              ((buffer[6].toInt() and 0xFF) shl 8) or
+                              (buffer[7].toInt() and 0xFF)
                     
+                    val ts = ((buffer[8].toLong() and 0xFFL) shl 56) or
+                             ((buffer[9].toLong() and 0xFFL) shl 48) or
+                             ((buffer[10].toLong() and 0xFFL) shl 40) or
+                             ((buffer[11].toLong() and 0xFFL) shl 32) or
+                             ((buffer[12].toLong() and 0xFFL) shl 24) or
+                             ((buffer[13].toLong() and 0xFFL) shl 16) or
+                             ((buffer[14].toLong() and 0xFFL) shl 8) or
+                             (buffer[15].toLong() and 0xFFL)
+                    
+                    val flags = buffer[16]
+                    val fragIndex = ((buffer[17].toInt() and 0xFF) shl 8) or (buffer[18].toInt() and 0xFF)
+                    val totalFragments = ((buffer[19].toInt() and 0xFF) shl 8) or (buffer[20].toInt() and 0xFF)
+                    val frameSize = ((buffer[21].toInt() and 0xFF) shl 24) or
+                                    ((buffer[22].toInt() and 0xFF) shl 16) or
+                                    ((buffer[23].toInt() and 0xFF) shl 8) or
+                                    (buffer[24].toInt() and 0xFF)
+                    
+                    val isKeyframe = (flags.toInt() and 1) != 0
                     val isAudio = (flags.toInt() and 16) != 0
                     val isBeacon = (flags.toInt() and 64) != 0
                     val isCodecConfig = (flags.toInt() and 32) != 0
                     
                     if (isBeacon) {
-                        bb.position(28)
-                        lastReportedRttMs = bb.getInt()
-                        lastReportedLossPercent = bb.getInt() / 100f
-                        tickStats()
+                        if (length >= 28 + 8) {
+                            lastReportedRttMs = ((buffer[28].toInt() and 0xFF) shl 24) or
+                                                ((buffer[29].toInt() and 0xFF) shl 16) or
+                                                ((buffer[30].toInt() and 0xFF) shl 8) or
+                                                (buffer[31].toInt() and 0xFF)
+                            val lossBp = ((buffer[32].toInt() and 0xFF) shl 24) or
+                                         ((buffer[33].toInt() and 0xFF) shl 16) or
+                                         ((buffer[34].toInt() and 0xFF) shl 8) or
+                                         (buffer[35].toInt() and 0xFF)
+                            lastReportedLossPercent = lossBp / 100f
+                            tickStats()
+                        }
                         continue
                     }
                     
@@ -124,16 +151,24 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     
                     if (isAudio) {
                         val payloadSize = length - 28
-                        val payload = ByteArray(payloadSize)
-                        System.arraycopy(buffer, 28, payload, 0, payloadSize)
-                        onAudioFrame?.invoke(payload, isCodecConfig, ts)
-                        tickStats()
+                        if (payloadSize > 0) {
+                            val payload = ByteArray(payloadSize)
+                            System.arraycopy(buffer, 28, payload, 0, payloadSize)
+                            onAudioFrame?.invoke(payload, isCodecConfig, ts)
+                            tickStats()
+                        }
                         continue
                     }
+
+                    // Bounds check for safety against corrupt UDP packets
+                    if (totalFragments <= 0 || totalFragments > 1000) continue
+                    if (fragIndex < 0 || fragIndex >= totalFragments) continue
+                    if (frameSize <= 0 || frameSize > 8 * 1024 * 1024) continue
                     
                     if (seq <= lastAssembledSeq) {
-                        if (lastAssembledSeq - seq > 100) {
-                            AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq")
+                        val isRestart = isKeyframe || (lastAssembledSeq - seq > 50)
+                        if (isRestart) {
+                            AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq isKeyframe=$isKeyframe")
                             lastAssembledSeq = -1
                             frameBuffers.clear()
                             // Fall through to process this packet
@@ -160,10 +195,13 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                         }
                     } else {
                         if (!fb.receivedFragments[fragIndex]) {
+                            val fragOffset = fragIndex * 1300
                             val fragLength = length - 28
-                            System.arraycopy(buffer, 28, fb.frameBytes, fragIndex * 1300, fragLength)
-                            fb.receivedFragments[fragIndex] = true
-                            fb.receivedDataCount++
+                            if (fragOffset + fragLength <= fb.frameBytes.size) {
+                                System.arraycopy(buffer, 28, fb.frameBytes, fragOffset, fragLength)
+                                fb.receivedFragments[fragIndex] = true
+                                fb.receivedDataCount++
+                            }
                         }
                     }
                     
@@ -207,23 +245,25 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                 }
                 
                 if (missingCount == 1) {
-                    // Recover missing fragment
-                    val recovered = ByteArray(MAX_PAYLOAD)
-                    System.arraycopy(fecPayload, 0, recovered, 0, fecPayload.size)
+                    // Recover missing fragment using reusable scratch buffer
+                    System.arraycopy(fecPayload, 0, fecScratch, 0, fecPayload.size)
                     for (i in startIdx until endIdx) {
                         if (i != missingIdx && fb.receivedFragments[i]) {
                             val fragOffset = i * 1300
                             val fragLen = fb.getExpectedFragLength(i)
                             for (k in 0 until fragLen) {
-                                recovered[k] = (recovered[k].toInt() xor fb.frameBytes[fragOffset + k].toInt()).toByte()
+                                fecScratch[k] = (fecScratch[k].toInt() xor fb.frameBytes[fragOffset + k].toInt()).toByte()
                             }
                         }
                     }
                     val expectedLen = fb.getExpectedFragLength(missingIdx)
-                    System.arraycopy(recovered, 0, fb.frameBytes, missingIdx * 1300, Math.min(expectedLen, recovered.size))
-                    
-                    fb.receivedFragments[missingIdx] = true
-                    fb.receivedDataCount++
+                    val copyLen = Math.min(expectedLen, fecScratch.size)
+                    val missingOffset = missingIdx * 1300
+                    if (missingOffset + copyLen <= fb.frameBytes.size) {
+                        System.arraycopy(fecScratch, 0, fb.frameBytes, missingOffset, copyLen)
+                        fb.receivedFragments[missingIdx] = true
+                        fb.receivedDataCount++
+                    }
                 }
             }
         }

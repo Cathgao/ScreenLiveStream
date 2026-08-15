@@ -47,6 +47,9 @@ class VideoDecoder {
     var videoHeight: Int = 0
         private set
 
+    @Volatile
+    var jitterBufferMs: Int = 0
+
     var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
     var onRequestKeyframe: (() -> Unit)? = null
 
@@ -77,7 +80,11 @@ class VideoDecoder {
 
     fun notifyReferenceLost() {
         referenceLost = true
-        AppLogger.w(TAG, "Reference frame lost notified! Dropping P-frames until next IDR Keyframe.")
+        while (taskQueue.isNotEmpty()) {
+            val task = taskQueue.poll()
+            if (task != null) recycleTask(task)
+        }
+        AppLogger.w(TAG, "Reference frame lost notified! Dropped queued frames. Requesting IDR Keyframe.")
         onRequestKeyframe?.invoke()
     }
 
@@ -96,17 +103,24 @@ class VideoDecoder {
         val mimeType = if (isHevc) VideoCodec.H265.mimeType else VideoCodec.H264.mimeType
         currentCodec = if (isHevc) VideoCodec.H265 else VideoCodec.H264
         lastCodecConfigData = codecConfigData
-        taskQueue.clear()
+        while (taskQueue.isNotEmpty()) {
+            val task = taskQueue.poll()
+            if (task != null) recycleTask(task)
+        }
 
         try {
             val format = MediaFormat.createVideoFormat(mimeType, 1920, 1080)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                format.setInteger(MediaFormat.KEY_PRIORITY, 0) // Realtime priority
+                format.setInteger(MediaFormat.KEY_OPERATING_RATE, 120) // Keep hardware decoder at maximum clock
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
+            try {
+                format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+            } catch (_: Exception) {}
 
             if (codecConfigData != null && codecConfigData.isNotEmpty()) {
                 if (isHevc) {
@@ -216,124 +230,77 @@ class VideoDecoder {
         }
     }
 
-    private class NalUnit(val offset: Int, val length: Int, val startCodeLen: Int)
-
-    private fun findNalUnits(data: ByteArray): List<NalUnit> {
-        val list = mutableListOf<NalUnit>()
-        var i = 0
-        val len = data.size
-        while (i < len - 3) {
-            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
-                val start = i
-                val startCodeLen = 4
-                i += 4
-                var nextStart = len
-                var j = i
-                while (j < len - 3) {
-                    if (data[j] == 0.toByte() && data[j + 1] == 0.toByte() && data[j + 2] == 0.toByte() && data[j + 3] == 1.toByte()) {
-                        nextStart = j
-                        break
-                    } else if (data[j] == 0.toByte() && data[j + 1] == 0.toByte() && data[j + 2] == 1.toByte()) {
-                        nextStart = j
-                        break
-                    }
-                    j++
-                }
-                list.add(NalUnit(start, nextStart - start, startCodeLen))
-                i = j - 1
-            } else if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
-                val start = i
-                val startCodeLen = 3
-                i += 3
-                var nextStart = len
-                var j = i
-                while (j < len - 3) {
-                    if (data[j] == 0.toByte() && data[j + 1] == 0.toByte() && data[j + 2] == 0.toByte() && data[j + 3] == 1.toByte()) {
-                        nextStart = j
-                        break
-                    } else if (data[j] == 0.toByte() && data[j + 1] == 0.toByte() && data[j + 2] == 1.toByte()) {
-                        nextStart = j
-                        break
-                    }
-                    j++
-                }
-                list.add(NalUnit(start, nextStart - start, startCodeLen))
-                i = j - 1
-            }
-            i++
-        }
-        return list
-    }
-
     private fun extractSpsAndPps(data: ByteArray): Pair<ByteArray?, ByteArray?> {
-        val nals = findNalUnits(data)
+        val len = data.size
         var sps: ByteArray? = null
         var pps: ByteArray? = null
-        for (nal in nals) {
-            val payloadOffset = nal.offset + nal.startCodeLen
-            if (payloadOffset >= data.size) continue
-            val nalType = data[payloadOffset].toInt() and 0x1F
-            if (nalType == 7) {
-                sps = data.copyOfRange(nal.offset, nal.offset + nal.length)
-            } else if (nalType == 8) {
-                pps = data.copyOfRange(nal.offset, nal.offset + nal.length)
+        var lastNalStart = -1
+        var lastNalType = -1
+        var i = 0
+
+        fun flushNal(endIndex: Int) {
+            if (lastNalStart != -1 && endIndex > lastNalStart) {
+                val nalBytes = data.copyOfRange(lastNalStart, endIndex)
+                if (lastNalType == 7 && sps == null) {
+                    sps = nalBytes
+                } else if (lastNalType == 8 && pps == null) {
+                    pps = nalBytes
+                }
             }
         }
+
+        while (i < len - 2) {
+            var startCodeLen = 0
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
+                if (data[i + 2] == 1.toByte()) {
+                    startCodeLen = 3
+                } else if (i < len - 3 && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
+                    startCodeLen = 4
+                }
+            }
+            if (startCodeLen > 0) {
+                flushNal(i)
+                lastNalStart = i
+                val payloadOffset = i + startCodeLen
+                lastNalType = if (payloadOffset < len) data[payloadOffset].toInt() and 0x1F else -1
+                i += startCodeLen
+            } else {
+                i++
+            }
+        }
+        flushNal(len)
         return Pair(sps, pps)
     }
 
-    private fun ensure4ByteAnnexB(data: ByteArray): ByteArray {
-        if (data.size < 4) return data
-        val nals = findNalUnits(data)
-        if (nals.isEmpty()) return data
-
-        var needsNormalizing = false
-        var totalSize = 0
-        for (nal in nals) {
-            if (nal.startCodeLen == 3) {
-                needsNormalizing = true
-                totalSize += nal.length + 1
-            } else {
-                totalSize += nal.length
-            }
-        }
-
-        if (!needsNormalizing) return data
-
-        val result = ByteArray(totalSize)
-        var pos = 0
-        for (nal in nals) {
-            if (nal.startCodeLen == 3) {
-                result[pos++] = 0.toByte()
-                result[pos++] = 0.toByte()
-                result[pos++] = 0.toByte()
-                result[pos++] = 1.toByte()
-                System.arraycopy(data, nal.offset + 3, result, pos, nal.length - 3)
-                pos += nal.length - 3
-            } else {
-                System.arraycopy(data, nal.offset, result, pos, nal.length)
-                pos += nal.length
-            }
-        }
-        return result
-    }
-
     private fun containsParameterSets(data: ByteArray, isHevc: Boolean): Boolean {
-        val nals = findNalUnits(data)
-        for (nal in nals) {
-            val payloadOffset = nal.offset + nal.startCodeLen
-            if (payloadOffset >= data.size) continue
-
-            val nalType = if (isHevc) {
-                (data[payloadOffset].toInt() and 0x7E) ushr 1
-            } else {
-                data[payloadOffset].toInt() and 0x1F
+        val len = data.size
+        var i = 0
+        while (i < len - 2) {
+            var startCodeLen = 0
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
+                if (data[i + 2] == 1.toByte()) {
+                    startCodeLen = 3
+                } else if (i < len - 3 && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
+                    startCodeLen = 4
+                }
             }
-
-            if (isHevc) {
-                if (nalType == 32 || nalType == 33 || nalType == 34) return true
+            if (startCodeLen > 0) {
+                val payloadOffset = i + startCodeLen
+                if (payloadOffset < len) {
+                    val nalType = if (isHevc) {
+                        (data[payloadOffset].toInt() and 0x7E) ushr 1
+                    } else {
+                        data[payloadOffset].toInt() and 0x1F
+                    }
+                    if (isHevc) {
+                        if (nalType == 32 || nalType == 33 || nalType == 34) return true
+                    } else {
+                        if (nalType == 7 || nalType == 8) return true
+                    }
+                }
+                i += startCodeLen
             } else {
-                if (nalType == 7 || nalType == 8) return true
+                i++
             }
         }
         return false
@@ -354,32 +321,32 @@ class VideoDecoder {
                     var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 10_000)
                     while (outputIndex >= 0 && isDraining) {
                         val doRender = bufferInfo.size != 0
-                        if (doRender && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && receiverStartNs != 0L) {
-                            val deltaUs = bufferInfo.presentationTimeUs - streamStartPtsUs
-                            
-                            // Calculate ideal render time based on receiver anchor
-                            val renderTimeNs = receiverStartNs + deltaUs * 1000L
-                            val now = System.nanoTime()
-                            
-                            // Jitter buffer configuration
-                            val targetBufferNs = 50_000_000L // 50ms ideal buffer to absorb network jitter
-                            val maxBufferNs = 400_000_000L   // 400ms max acceptable latency
-                            
-                            val scheduledTimeNs = if (renderTimeNs < now) {
-                                // Frame is late (buffer underrun). Re-anchor to restore the 50ms jitter buffer.
-                                receiverStartNs = (now + targetBufferNs) - deltaUs * 1000L
-                                now + targetBufferNs
-                            } else if (renderTimeNs > now + maxBufferNs) {
-                                // Buffer is too large (e.g. timestamp jump or clock drift). Re-anchor to reduce latency.
-                                receiverStartNs = (now + targetBufferNs) - deltaUs * 1000L
-                                now + targetBufferNs
+                        if (doRender) {
+                            if (jitterBufferMs <= 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || receiverStartNs == 0L) {
+                                // Direct ultra-low-latency mode: immediately release buffer to surface
+                                mc.releaseOutputBuffer(outputIndex, true)
                             } else {
-                                renderTimeNs
+                                val deltaUs = bufferInfo.presentationTimeUs - streamStartPtsUs
+                                val targetBufferNs = (jitterBufferMs * 1_000_000L).coerceIn(10_000_000L, 200_000_000L)
+                                val renderTimeNs = receiverStartNs + deltaUs * 1000L
+                                val now = System.nanoTime()
+
+                                val scheduledTimeNs = if (renderTimeNs < now) {
+                                    // Frame arrived late, smoothly catch up without pushing whole buffer forward
+                                    receiverStartNs = now - deltaUs * 1000L + (targetBufferNs / 2)
+                                    now
+                                } else if (renderTimeNs > now + targetBufferNs * 3) {
+                                    // Timestamp jump or drift -> smoothly re-anchor
+                                    receiverStartNs = now - deltaUs * 1000L + targetBufferNs
+                                    now + targetBufferNs
+                                } else {
+                                    renderTimeNs
+                                }
+
+                                mc.releaseOutputBuffer(outputIndex, scheduledTimeNs)
                             }
-                            
-                            mc.releaseOutputBuffer(outputIndex, scheduledTimeNs)
                         } else {
-                            mc.releaseOutputBuffer(outputIndex, doRender)
+                            mc.releaseOutputBuffer(outputIndex, false)
                         }
                         outputIndex = mc.dequeueOutputBuffer(bufferInfo, 10_000)
                     }
@@ -425,21 +392,21 @@ class VideoDecoder {
                             inputIndex = mc.dequeueInputBuffer(10_000)
                             retryCount++
                         }
-                        
+
                         if (inputIndex >= 0) {
                             val inputBuffer: ByteBuffer? = mc.getInputBuffer(inputIndex)
                             if (inputBuffer != null) {
                                 inputBuffer.clear()
                                 inputBuffer.put(task.data, 0, task.size)
-            
+
                                 val flags = if (task.isKeyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
                                 val ptsUs = if (task.timestampMs >= 0) task.timestampMs * 1000L else System.nanoTime() / 1000L
-            
+
                                 if (receiverStartNs == 0L) {
                                     receiverStartNs = System.nanoTime()
                                     streamStartPtsUs = ptsUs
                                 }
-            
+
                                 mc.queueInputBuffer(
                                     inputIndex,
                                     0,
@@ -449,7 +416,7 @@ class VideoDecoder {
                                 )
                             }
                         } else {
-                            AppLogger.w(TAG, "Input buffer unavailable after 500ms timeout on seq=${task.seq}. Requesting IDR keyframe.")
+                            AppLogger.w(TAG, "Input buffer unavailable after timeout on seq=${task.seq}. Requesting IDR keyframe.")
                             notifyReferenceLost()
                         }
                     } catch (e: Exception) {
@@ -474,14 +441,12 @@ class VideoDecoder {
         val codecType = if (isHevc) VideoCodec.H265 else VideoCodec.H264
         val surf = targetSurface ?: return
 
-        val formattedBytes = ensure4ByteAnnexB(frameBytes)
-
         if (isCodecConfig) {
-            val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(formattedBytes)
-            lastCodecConfigData = formattedBytes
+            val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(frameBytes)
+            lastCodecConfigData = frameBytes
             if (!isDecoderReady || currentCodec != codecType || configChanged) {
-                AppLogger.i(TAG, "Initializing decoder with CodecConfig, size: ${formattedBytes.size}")
-                start(surf, isHevc, formattedBytes)
+                AppLogger.i(TAG, "Initializing decoder with CodecConfig, size: ${frameBytes.size}")
+                start(surf, isHevc, frameBytes)
             }
             return
         }
@@ -497,14 +462,14 @@ class VideoDecoder {
         }
         lastTimestampMs = timestampMs
 
-        val finalBytes = if (isKeyframe && lastCodecConfigData != null && !containsParameterSets(formattedBytes, isHevc)) {
+        val finalBytes = if (isKeyframe && lastCodecConfigData != null && !containsParameterSets(frameBytes, isHevc)) {
             val config = lastCodecConfigData!!
-            val combined = ByteArray(config.size + formattedBytes.size)
+            val combined = ByteArray(config.size + frameBytes.size)
             System.arraycopy(config, 0, combined, 0, config.size)
-            System.arraycopy(formattedBytes, 0, combined, config.size, formattedBytes.size)
+            System.arraycopy(frameBytes, 0, combined, config.size, frameBytes.size)
             combined
         } else {
-            formattedBytes
+            frameBytes
         }
 
         if (isKeyframe) {
@@ -514,6 +479,12 @@ class VideoDecoder {
             hasReceivedFirstKeyframe = true
             referenceLost = false
             lastFrameSeq = seq
+
+            // Clear obsolete queued frames so keyframe decodes immediately
+            while (taskQueue.isNotEmpty()) {
+                val task = taskQueue.poll()
+                if (task != null) recycleTask(task)
+            }
         }
 
         if (!hasReceivedFirstKeyframe) {
@@ -539,7 +510,7 @@ class VideoDecoder {
         lastFrameSeq = seq
 
         if (!isDecoderReady) return
-        
+
         val task = obtainTask(finalBytes.size)
         System.arraycopy(finalBytes, 0, task.data, 0, finalBytes.size)
         task.size = finalBytes.size
@@ -567,6 +538,10 @@ class VideoDecoder {
         receiverStartNs = 0L
         lastCodecConfigData = null
         activeDecoderName = "未运行"
+        while (taskQueue.isNotEmpty()) {
+            val task = taskQueue.poll()
+            if (task != null) recycleTask(task)
+        }
         try {
             decoder?.stop()
             decoder?.release()
@@ -580,7 +555,10 @@ class VideoDecoder {
     fun flushDecoder() {
         try {
             decoder?.flush()
-            taskQueue.clear()
+            while (taskQueue.isNotEmpty()) {
+                val task = taskQueue.poll()
+                if (task != null) recycleTask(task)
+            }
             hasReceivedFirstKeyframe = false
             lastFrameSeq = -1
             referenceLost = false
@@ -596,4 +574,5 @@ class VideoDecoder {
         private const val TAG = "VideoDecoder"
     }
 }
+
 
