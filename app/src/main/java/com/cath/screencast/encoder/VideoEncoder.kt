@@ -35,7 +35,7 @@ class VideoEncoder(
     var currentOutputFormat: MediaFormat? = null
         private set
     private var codec: MediaCodec? = null
-    private var renderer: SurfaceCropRenderer? = null
+    private var codecSurface: Surface? = null
     @Volatile
     private var isEncoding = false
     private var encoderThread: Thread? = null
@@ -44,7 +44,7 @@ class VideoEncoder(
     private var streamStartNs = 0L
 
     val inputSurface: Surface?
-        get() = renderer?.inputSurface
+        get() = codecSurface
 
     // Captured the moment the video encoder produced its first
     // output frame. Both `presentationTimeUs` (from the SurfaceTexture
@@ -85,7 +85,7 @@ class VideoEncoder(
             )
             format.setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1000)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // Keyframe every 1s
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // Keyframe every 2s
             format.setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
                 config.bitrateMode.modeInt
@@ -124,19 +124,14 @@ class VideoEncoder(
 
             mc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
-            val codecSurface = mc.createInputSurface()
+            val inputSurf = mc.createInputSurface()
+            codecSurface = inputSurf
             mc.start()
             codec = mc
 
-            renderer = SurfaceCropRenderer(
-                codecInputSurface = codecSurface,
-                width = width,
-                height = height
-            )
-
             isEncoding = true
             startEncodeLoop()
-            AppLogger.i(TAG, "VideoEncoder loop started successfully using ${mc.name}")
+            AppLogger.i(TAG, "VideoEncoder loop started successfully using ${mc.name} (Direct Input Surface)")
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to initialize VideoEncoder", e)
             stop()
@@ -193,23 +188,20 @@ class VideoEncoder(
 
     private fun startEncodeLoop() {
         encoderThread = thread(start = true, name = "QuestVideoEncoderThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
             val bufferInfo = MediaCodec.BufferInfo()
             var tempBuffer = ByteArray(512 * 1024)
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
             streamStartNs = 0L
-            AppLogger.i(TAG, "Encoder loop thread running...")
+            AppLogger.i(TAG, "Encoder loop thread running at background priority...")
 
             while (isEncoding) {
                 try {
                     val now = System.currentTimeMillis()
-
-                    // Draw frame via GL Renderer
-                    renderer?.drawFrame()
-
                     val mc = codec ?: break
-                    var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 5000)
+                    var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 10_000)
 
                     while (outputIndex >= 0 || outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -313,24 +305,12 @@ class VideoEncoder(
 
                         outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
                     }
-
-                    if (outputIndex < 0 && outputIndex != MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        // Yield CPU when no buffer is ready
-                        Thread.sleep(2)
-                    }
                 } catch (e: Exception) {
                     if (isEncoding) {
                         AppLogger.e(TAG, "Error in encode loop", e)
                     }
                 }
             }
-            try {
-                renderer?.release()
-                AppLogger.i(TAG, "SurfaceCropRenderer released on encoder thread.")
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Error releasing SurfaceCropRenderer on encoder thread", e)
-            }
-            renderer = null
             AppLogger.i(TAG, "Encoder loop thread exited. Final total frames encoded: $totalOutputFrames")
         }
     }
@@ -365,6 +345,13 @@ class VideoEncoder(
             }
         }
         encoderThread = null
+
+        try {
+            codecSurface?.release()
+            codecSurface = null
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing codecSurface", e)
+        }
 
         try {
             codec?.stop()

@@ -79,6 +79,7 @@ class TcpStreamer : IStreamer {
         taskQueue.clear()
 
         connectThread = thread(start = true, name = "TcpStreamerConnectThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
             while (isConnected) {
                 if (socket == null || socket?.isClosed == true || socket?.isConnected == false) {
                     try {
@@ -145,6 +146,7 @@ class TcpStreamer : IStreamer {
         }
 
         sendThread = thread(start = true, name = "TcpStreamerSendThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
             while (isConnected) {
                 try {
                     val task = taskQueue.take()

@@ -68,6 +68,7 @@ class RttProbe {
 
             isRunning = true
             listenerThread = thread(start = true, name = "RttProbeReplyThread") {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                 val buf = ByteArray(64)
                 val pkt = DatagramPacket(buf, buf.size)
                 while (isRunning) {
@@ -90,7 +91,10 @@ class RttProbe {
             }
 
             scheduler = Executors.newSingleThreadScheduledExecutor { r ->
-                Thread(r, "RttProbeSenderThread").also { it.isDaemon = true }
+                Thread({
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    r.run()
+                }, "RttProbeSenderThread").also { it.isDaemon = true }
             }
             scheduler!!.scheduleAtFixedRate({
                 sendOneProbe()

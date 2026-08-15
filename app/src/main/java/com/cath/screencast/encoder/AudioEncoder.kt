@@ -118,6 +118,7 @@ class AudioEncoder(
         val audioThreadStartNs = System.nanoTime()
 
         captureThread = Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
             // Read standard AAC frame chunk size: 1024 samples * 2 channels * 2 bytes = 4096 bytes (~21.3ms per read)
             val pcmChunkSize = 4096
             val audioBuffer = ByteArray(pcmChunkSize)
