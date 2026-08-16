@@ -3,6 +3,7 @@ package com.cath.screencast.net
 import android.os.Build
 import com.cath.screencast.log.AppLogger
 import com.cath.screencast.model.DiscoveredDevice
+import com.cath.screencast.model.TransportProtocol
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -60,6 +61,15 @@ class LanDiscovery {
                             val parts = message.split(":")
                             val devName = if (parts.size >= 2) parts[1] else "Android Receiver"
                             val port = if (parts.size >= 3) parts[2].toIntOrNull() ?: 8888 else 8888
+                            val protocol = if (parts.size >= 4) {
+                                try {
+                                    TransportProtocol.valueOf(parts[3].uppercase())
+                                } catch (e: Exception) {
+                                    TransportProtocol.UDP
+                                }
+                            } else {
+                                TransportProtocol.UDP
+                            }
 
                             val rtt = if (lastPingTime > 0) {
                                 (System.currentTimeMillis() - lastPingTime).coerceIn(1, 999).toInt()
@@ -70,6 +80,7 @@ class LanDiscovery {
                                 deviceName = devName,
                                 ipAddress = senderIp,
                                 port = port,
+                                protocol = protocol,
                                 lastSeenMs = System.currentTimeMillis(),
                                 pingMs = rtt
                             )
@@ -102,7 +113,7 @@ class LanDiscovery {
         }
     }
 
-    fun startAnnouncing(listenPort: Int) {
+    fun startAnnouncing(listenPort: Int, protocol: TransportProtocol = TransportProtocol.UDP) {
         if (isAnnouncing) return
         isAnnouncing = true
 
@@ -115,10 +126,34 @@ class LanDiscovery {
                 }
                 announceSocket = ds
 
+                fun resolveDeviceName(): String {
+                    val manufacturerName = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                    val fallbackName = "$manufacturerName ${Build.MODEL}"
+                    val customName = deviceNameProvider?.invoke()
+                    return if (!customName.isNullOrBlank()) customName else fallbackName
+                }
+
+                // Send an active beacon broadcast so LAN senders immediately discover this receiver upon listening start
+                try {
+                    val deviceName = resolveDeviceName()
+                    val beaconMsg = "${PacketProtocol.DISCOVERY_BEACON_PREFIX}$deviceName:$listenPort:${protocol.name}"
+                    val beaconBytes = beaconMsg.toByteArray()
+                    val beaconPacket = DatagramPacket(
+                        beaconBytes,
+                        beaconBytes.size,
+                        InetAddress.getByName("255.255.255.255"),
+                        PacketProtocol.DISCOVERY_PORT
+                    )
+                    ds.send(beaconPacket)
+                    AppLogger.d(TAG, "Initial discovery beacon sent: $beaconMsg")
+                } catch (e: Exception) {
+                    AppLogger.w(TAG, "Initial beacon broadcast failed", e)
+                }
+
                 val buffer = ByteArray(1024)
                 val packet = DatagramPacket(buffer, buffer.size)
 
-                AppLogger.d(TAG, "LanDiscovery Announcer listening on port ${PacketProtocol.DISCOVERY_PORT}")
+                AppLogger.d(TAG, "LanDiscovery Announcer listening on port ${PacketProtocol.DISCOVERY_PORT}, protocol=${protocol.name}")
 
                 while (isAnnouncing && !ds.isClosed) {
                     try {
@@ -128,12 +163,8 @@ class LanDiscovery {
                         val message = String(packet.data, 0, packet.length).trim()
 
                         if (message == PacketProtocol.DISCOVERY_PING) {
-                            val manufacturerName = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
-                            val fallbackName = "$manufacturerName ${Build.MODEL}"
-                            val customName = deviceNameProvider?.invoke()
-                            val deviceName = if (!customName.isNullOrBlank()) customName else fallbackName
-
-                            val replyMsg = "${PacketProtocol.DISCOVERY_ACK_PREFIX}$deviceName:$listenPort"
+                            val deviceName = resolveDeviceName()
+                            val replyMsg = "${PacketProtocol.DISCOVERY_ACK_PREFIX}$deviceName:$listenPort:${protocol.name}"
                             val replyBytes = replyMsg.toByteArray()
                             val replyPacket = DatagramPacket(
                                 replyBytes,

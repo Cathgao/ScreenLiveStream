@@ -318,7 +318,7 @@ class QuestReceiverService : Service() {
         videoDecoder.jitterBufferMs = jitterBufferMs
         currentReceiver.start(port)
         if (autoAnnounce) {
-            lanDiscovery.startAnnouncing(port)
+            lanDiscovery.startAnnouncing(port, protocol)
         }
         isListening = true
         onListeningStateChanged?.invoke(true)

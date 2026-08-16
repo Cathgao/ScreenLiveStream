@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.sp
 import com.cath.screencast.log.AppLogger
 import com.cath.screencast.model.BitrateMode
 import com.cath.screencast.model.EyeCrop
+import com.cath.screencast.model.TransportProtocol
 import com.cath.screencast.model.VideoCodec
 import com.cath.screencast.model.VideoResolution
 import com.cath.screencast.service.QuestSenderService
@@ -76,19 +77,20 @@ fun SenderScreen(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val currentConfig = viewModel.streamConfig.value
             val serviceIntent = Intent(context, QuestSenderService::class.java).apply {
                 putExtra(QuestSenderService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(QuestSenderService.EXTRA_RESULT_DATA, result.data)
-                putExtra(QuestSenderService.EXTRA_TARGET_IP, config.targetIp)
-                putExtra(QuestSenderService.EXTRA_TARGET_PORT, config.targetPort)
-                putExtra(QuestSenderService.EXTRA_BITRATE, config.bitrateKbps)
-                putExtra(QuestSenderService.EXTRA_FRAMERATE, config.frameRate)
-                putExtra(QuestSenderService.EXTRA_RES_WIDTH, config.resolution.width)
-                putExtra(QuestSenderService.EXTRA_RES_HEIGHT, config.resolution.height)
-                putExtra(QuestSenderService.EXTRA_EYE_CROP, config.eyeCrop.name)
-                putExtra(QuestSenderService.EXTRA_CODEC, config.codec.name)
-                putExtra(QuestSenderService.EXTRA_BITRATE_MODE, config.bitrateMode.name)
-                putExtra(QuestSenderService.EXTRA_PROTOCOL, config.protocol.name)
+                putExtra(QuestSenderService.EXTRA_TARGET_IP, currentConfig.targetIp)
+                putExtra(QuestSenderService.EXTRA_TARGET_PORT, currentConfig.targetPort)
+                putExtra(QuestSenderService.EXTRA_BITRATE, currentConfig.bitrateKbps)
+                putExtra(QuestSenderService.EXTRA_FRAMERATE, currentConfig.frameRate)
+                putExtra(QuestSenderService.EXTRA_RES_WIDTH, currentConfig.resolution.width)
+                putExtra(QuestSenderService.EXTRA_RES_HEIGHT, currentConfig.resolution.height)
+                putExtra(QuestSenderService.EXTRA_EYE_CROP, currentConfig.eyeCrop.name)
+                putExtra(QuestSenderService.EXTRA_CODEC, currentConfig.codec.name)
+                putExtra(QuestSenderService.EXTRA_BITRATE_MODE, currentConfig.bitrateMode.name)
+                putExtra(QuestSenderService.EXTRA_PROTOCOL, currentConfig.protocol.name)
             }
             onStartStreamRequested(serviceIntent)
         }
@@ -276,6 +278,19 @@ fun SenderScreen(
                                         maxLines = 1,
                                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Surface(
+                                        color = if (dev.protocol == TransportProtocol.TCP) NeonCyan.copy(alpha = 0.2f) else LiveGreen.copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text(
+                                            text = dev.protocol.name,
+                                            color = if (dev.protocol == TransportProtocol.TCP) NeonCyan else LiveGreen,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                        )
+                                    }
                                 }
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(

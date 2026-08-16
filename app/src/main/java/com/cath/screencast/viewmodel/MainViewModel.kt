@@ -87,7 +87,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (list.isNotEmpty() && (_streamConfig.value.targetIp.isEmpty() || _streamConfig.value.targetIp == "192.168.1.100")) {
                 _streamConfig.value = _streamConfig.value.copy(
                     targetIp = list.first().ipAddress,
-                    targetPort = list.first().port
+                    targetPort = list.first().port,
+                    protocol = list.first().protocol
                 )
             }
         }
@@ -270,7 +271,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectDiscoveredDevice(device: DiscoveredDevice) {
         _streamConfig.value = _streamConfig.value.copy(
             targetIp = device.ipAddress,
-            targetPort = device.port
+            targetPort = device.port,
+            protocol = device.protocol
         )
     }
 

@@ -234,6 +234,7 @@ data class DiscoveredDevice(
     val deviceName: String,
     val ipAddress: String,
     val port: Int,
+    val protocol: TransportProtocol = TransportProtocol.UDP,
     val lastSeenMs: Long = System.currentTimeMillis(),
     val pingMs: Int = 5
 )
