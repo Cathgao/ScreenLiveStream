@@ -18,19 +18,34 @@ object AppLogger {
     private val logQueue = ConcurrentLinkedQueue<String>()
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
-    fun d(tag: String, message: String) {
-        Log.d(tag, message)
-        appendLog("DEBUG", tag, message)
+    fun d(tag: String, message: String, throwable: Throwable? = null) {
+        if (throwable != null) {
+            Log.d(tag, message, throwable)
+            appendLog("DEBUG", tag, "$message\n${Log.getStackTraceString(throwable)}")
+        } else {
+            Log.d(tag, message)
+            appendLog("DEBUG", tag, message)
+        }
     }
 
-    fun i(tag: String, message: String) {
-        Log.i(tag, message)
-        appendLog("INFO", tag, message)
+    fun i(tag: String, message: String, throwable: Throwable? = null) {
+        if (throwable != null) {
+            Log.i(tag, message, throwable)
+            appendLog("INFO", tag, "$message\n${Log.getStackTraceString(throwable)}")
+        } else {
+            Log.i(tag, message)
+            appendLog("INFO", tag, message)
+        }
     }
 
-    fun w(tag: String, message: String) {
-        Log.w(tag, message)
-        appendLog("WARN", tag, message)
+    fun w(tag: String, message: String, throwable: Throwable? = null) {
+        if (throwable != null) {
+            Log.w(tag, message, throwable)
+            appendLog("WARN", tag, "$message\n${Log.getStackTraceString(throwable)}")
+        } else {
+            Log.w(tag, message)
+            appendLog("WARN", tag, message)
+        }
     }
 
     fun e(tag: String, message: String, throwable: Throwable? = null) {
