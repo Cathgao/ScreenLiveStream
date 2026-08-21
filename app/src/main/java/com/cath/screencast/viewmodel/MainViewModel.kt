@@ -63,7 +63,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _resolutionOptions = MutableStateFlow<List<VideoResolution>>(emptyList())
     val resolutionOptions: StateFlow<List<VideoResolution>> = _resolutionOptions.asStateFlow()
 
-    val lanDiscovery = LanDiscovery()
+    val lanDiscovery by lazy { LanDiscovery(getApplication<Application>()) }
 
     init {
         initResolutionOptions()

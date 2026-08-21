@@ -29,7 +29,7 @@ class QuestReceiverService : Service() {
     private var receiver: IReceiver? = null
     val videoDecoder = VideoDecoder()
     val audioDecoder = AudioDecoder()
-    val lanDiscovery = LanDiscovery()
+    val lanDiscovery by lazy { LanDiscovery(this) }
     private var muxerManager: com.cath.screencast.encoder.MuxerManager? = null
 
     @Volatile
