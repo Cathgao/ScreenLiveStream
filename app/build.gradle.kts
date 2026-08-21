@@ -42,7 +42,9 @@ android {
       }
     }
     create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
+      val localDebugKeystore = file("${rootDir}/debug.keystore")
+      val userDebugKeystore = file("${System.getProperty("user.home")}/.android/debug.keystore")
+      storeFile = if (localDebugKeystore.exists()) localDebugKeystore else userDebugKeystore
       storePassword = "android"
       keyAlias = "androiddebugkey"
       keyPassword = "android"

@@ -62,7 +62,6 @@ class QuestSenderService : Service() {
     private var currentEncoderWidth = 0
     private var currentEncoderHeight = 0
     private var displayListener: DisplayManager.DisplayListener? = null
-    private var orientationEventListener: android.view.OrientationEventListener? = null
 
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
     var onStreamingStateChanged: ((Boolean) -> Unit)? = null
@@ -372,23 +371,6 @@ class QuestSenderService : Service() {
         dispMgr?.registerDisplayListener(listener, android.os.Handler(android.os.Looper.getMainLooper()))
         displayListener = listener
 
-        // Supplementary: Register OrientationEventListener for immediate physical tilt response
-        try {
-            val orientationListener = object : android.view.OrientationEventListener(this, android.hardware.SensorManager.SENSOR_DELAY_NORMAL) {
-                override fun onOrientationChanged(orientation: Int) {
-                    if (orientation != ORIENTATION_UNKNOWN) {
-                        checkScreenSizeChange()
-                    }
-                }
-            }
-            if (orientationListener.canDetectOrientation()) {
-                orientationListener.enable()
-                orientationEventListener = orientationListener
-            }
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "Could not enable OrientationEventListener: ${e.message}")
-        }
-
         isStreaming = true
         AppLogger.i(TAG, "QuestSenderService streaming started successfully.")
     }
@@ -396,13 +378,6 @@ class QuestSenderService : Service() {
     fun stopStreaming() {
         AppLogger.i(TAG, "stopStreaming requested.")
         isStreaming = false
-
-        try {
-            orientationEventListener?.disable()
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error disabling orientationEventListener", e)
-        }
-        orientationEventListener = null
 
         displayListener?.let { listener ->
             val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
@@ -493,14 +468,7 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Recreating VideoEncoder for new screen dimensions ${screenWidth}x${screenHeight} -> target resolution ${effWidth}x${effHeight}...")
 
-        // 1. Stop old VideoEncoder safely
-        try {
-            encoder?.stop()
-            AppLogger.i(TAG, "Old VideoEncoder stopped.")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error stopping old VideoEncoder", e)
-        }
-        encoder = null
+        val oldEncoder = encoder
 
         val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
@@ -512,7 +480,7 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Recreating stream parameters: $effWidth x $effHeight @ $effFps FPS, BitrateMode: ${config.bitrateMode.name}, Bitrate: ${config.bitrateKbps}Kbps")
 
-        // 2. Initialize and start new VideoEncoder
+        // 1. Initialize and start new VideoEncoder
         val currentStreamer = streamer ?: return
         val enc = VideoEncoder(
             config = config,
@@ -533,7 +501,7 @@ class QuestSenderService : Service() {
             return
         }
 
-        // 3. Recreate VirtualDisplay with new input surface
+        // 2. Update VirtualDisplay with new input surface without releasing MediaProjection token
         val surface = enc.inputSurface
         if (surface == null) {
             AppLogger.e(TAG, "New Encoder inputSurface is null! Cannot update VirtualDisplay.")
@@ -545,24 +513,33 @@ class QuestSenderService : Service() {
         defaultDisplay?.getRealMetrics(dm)
         val densityDpi = if (dm.densityDpi > 0) dm.densityDpi else resources.displayMetrics.densityDpi
 
+        if (virtualDisplay == null) {
+            virtualDisplay = projection.createVirtualDisplay(
+                "Quest3ScreenCast",
+                effWidth,
+                effHeight,
+                densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+                surface,
+                null,
+                null
+            )
+        } else {
+            virtualDisplay?.setSurface(surface)
+            virtualDisplay?.resize(effWidth, effHeight, densityDpi)
+        }
+        AppLogger.i(TAG, "VirtualDisplay updated successfully with size: $effWidth x $effHeight, DPI $densityDpi.")
+
+        // 3. Stop old VideoEncoder safely after new surface is connected
         try {
-            virtualDisplay?.release()
-            virtualDisplay = null
+            oldEncoder?.stop()
+            AppLogger.i(TAG, "Old VideoEncoder stopped.")
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error releasing old virtualDisplay", e)
+            AppLogger.e(TAG, "Error stopping old VideoEncoder", e)
         }
 
-        virtualDisplay = projection.createVirtualDisplay(
-            "Quest3ScreenCast",
-            effWidth,
-            effHeight,
-            densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            surface,
-            null,
-            null
-        )
-        AppLogger.i(TAG, "VirtualDisplay recreated successfully with size: $effWidth x $effHeight, DPI $densityDpi.")
+        // 4. Request keyframe for immediate video output
+        enc.requestKeyFrame()
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
