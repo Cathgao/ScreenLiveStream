@@ -91,18 +91,29 @@ class VideoDecoder {
     fun setSurface(surface: Surface?) {
         if (targetSurface != surface) {
             targetSurface = surface
-            if (surface == null) {
-                stop()
+            if (surface != null && isDecoderReady && decoder != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        decoder?.setOutputSurface(surface)
+                        AppLogger.i(TAG, "Successfully updated decoder output surface dynamically via setOutputSurface.")
+                        return
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "setOutputSurface failed, restarting decoder: ${e.message}")
+                    }
+                }
+                val isHevc = currentCodec == VideoCodec.H265
+                start(surface, isHevc, lastCodecConfigData)
             }
         }
     }
 
     fun start(surface: Surface, isHevc: Boolean, codecConfigData: ByteArray? = null) {
+        val configData = codecConfigData ?: lastCodecConfigData
         stop()
         targetSurface = surface
         val mimeType = if (isHevc) VideoCodec.H265.mimeType else VideoCodec.H264.mimeType
         currentCodec = if (isHevc) VideoCodec.H265 else VideoCodec.H264
-        lastCodecConfigData = codecConfigData
+        lastCodecConfigData = configData
         while (taskQueue.isNotEmpty()) {
             val task = taskQueue.poll()
             if (task != null) recycleTask(task)
@@ -353,11 +364,16 @@ class VideoDecoder {
                     if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         try {
                             val format = mc.outputFormat
-                            val w = format.getInteger(MediaFormat.KEY_WIDTH)
-                            val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+                            val cropLeft = if (format.containsKey("crop-left")) format.getInteger("crop-left") else 0
+                            val cropRight = if (format.containsKey("crop-right")) format.getInteger("crop-right") else -1
+                            val cropTop = if (format.containsKey("crop-top")) format.getInteger("crop-top") else 0
+                            val cropBottom = if (format.containsKey("crop-bottom")) format.getInteger("crop-bottom") else -1
+
+                            val w = if (cropRight >= cropLeft) cropRight - cropLeft + 1 else format.getInteger(MediaFormat.KEY_WIDTH)
+                            val h = if (cropBottom >= cropTop) cropBottom - cropTop + 1 else format.getInteger(MediaFormat.KEY_HEIGHT)
                             videoWidth = w
                             videoHeight = h
-                            AppLogger.i(TAG, "Video format changed: $w x $h")
+                            AppLogger.i(TAG, "Video format changed: $w x $h (format: $format)")
                             onVideoSizeChanged?.invoke(w, h)
                         } catch (e: Exception) {
                             AppLogger.e(TAG, "Error getting video format", e)

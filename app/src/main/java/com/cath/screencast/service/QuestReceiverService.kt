@@ -146,8 +146,6 @@ class QuestReceiverService : Service() {
     fun unbindSurface() {
         currentSurface = null
         videoDecoder.setSurface(null)
-        videoDecoder.stop()
-        audioDecoder.stop()
     }
 
     fun startListening(

@@ -58,7 +58,11 @@ class QuestSenderService : Service() {
 
     private var lastWidth = 0
     private var lastHeight = 0
+    private var lastRotation = 0
+    private var currentEncoderWidth = 0
+    private var currentEncoderHeight = 0
     private var displayListener: DisplayManager.DisplayListener? = null
+    private var orientationEventListener: android.view.OrientationEventListener? = null
 
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
     var onStreamingStateChanged: ((Boolean) -> Unit)? = null
@@ -140,6 +144,65 @@ class QuestSenderService : Service() {
         return START_STICKY
     }
 
+    private fun getRealDisplayMetrics(): Pair<Int, Int> {
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        if (display != null) {
+            val dm = android.util.DisplayMetrics()
+            display.getRealMetrics(dm)
+            return Pair(dm.widthPixels, dm.heightPixels)
+        }
+        val dm = resources.displayMetrics
+        return Pair(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun getDisplayRotation(): Int {
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        return display?.rotation ?: Display.DEFAULT_DISPLAY
+    }
+
+    private fun computeEffectiveResolution(config: StreamConfig, screenWidth: Int, screenHeight: Int): Pair<Int, Int> {
+        val rawWidth = if (config.resolution.width > 0) config.resolution.width else screenWidth
+        val rawHeight = if (config.resolution.height > 0) config.resolution.height else screenHeight
+
+        val isPhysicalLandscape = screenWidth >= screenHeight
+        
+        var effWidth: Int
+        var effHeight: Int
+
+        // If it's a 1:1 aspect ratio (e.g. Quest square crop), keep width == height
+        if (rawWidth == rawHeight) {
+            effWidth = rawWidth
+            effHeight = rawHeight
+        } else if (isPhysicalLandscape) {
+            effWidth = maxOf(rawWidth, rawHeight)
+            effHeight = minOf(rawWidth, rawHeight)
+        } else {
+            effWidth = minOf(rawWidth, rawHeight)
+            effHeight = maxOf(rawWidth, rawHeight)
+        }
+
+        // Align to 16 pixels
+        effWidth = ((effWidth / 16) * 16).coerceAtLeast(128)
+        effHeight = ((effHeight / 16) * 16).coerceAtLeast(128)
+
+        // Query capabilities and clamp dynamically to avoid crash
+        val caps = com.cath.screencast.model.EncoderCapabilities.query(config.codec, config.bitrateMode)
+        if (effWidth > caps.maxWidth) {
+            val clampedWidth = (caps.maxWidth / 16) * 16
+            AppLogger.w(TAG, "Width $effWidth exceeds encoder capability maximum ${caps.maxWidth}, clamping to $clampedWidth")
+            effWidth = clampedWidth
+        }
+        if (effHeight > caps.maxHeight) {
+            val clampedHeight = (caps.maxHeight / 16) * 16
+            AppLogger.w(TAG, "Height $effHeight exceeds encoder capability maximum ${caps.maxHeight}, clamping to $clampedHeight")
+            effHeight = clampedHeight
+        }
+
+        return Pair(effWidth, effHeight)
+    }
+
     private fun startStreaming(resultCode: Int, resultData: Intent, config: StreamConfig) {
         stopStreaming()
 
@@ -147,8 +210,10 @@ class QuestSenderService : Service() {
         savedResultData = resultData
         savedConfig = config
 
-        lastWidth = resources.displayMetrics.widthPixels
-        lastHeight = resources.displayMetrics.heightPixels
+        val (screenWidth, screenHeight) = getRealDisplayMetrics()
+        lastWidth = screenWidth
+        lastHeight = screenHeight
+        lastRotation = getDisplayRotation()
 
         AppLogger.i(TAG, "Requesting MediaProjection from projectionManager...")
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -220,32 +285,7 @@ class QuestSenderService : Service() {
         // Apply EyeCrop to System Properties for Quest
         setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
 
-        // Dynamically compute native width, height, refresh rate if Native Match (0) is specified
-        val metrics = resources.displayMetrics
-        var effWidth = if (config.resolution.width > 0) {
-            config.resolution.width
-        } else {
-            ((metrics.widthPixels / 16) * 16).coerceAtLeast(640)
-        }
-
-        var effHeight = if (config.resolution.height > 0) {
-            config.resolution.height
-        } else {
-            ((metrics.heightPixels / 16) * 16).coerceAtLeast(480)
-        }
-
-        // Query capabilities and clamp dynamically to avoid crash (e.g. CQ mode limits)
-        val caps = com.cath.screencast.model.EncoderCapabilities.query(config.codec, config.bitrateMode)
-        if (effWidth > caps.maxWidth) {
-            val clampedWidth = (caps.maxWidth / 16) * 16
-            AppLogger.w(TAG, "Width $effWidth exceeds encoder capability maximum ${caps.maxWidth}, clamping to $clampedWidth")
-            effWidth = clampedWidth
-        }
-        if (effHeight > caps.maxHeight) {
-            val clampedHeight = (caps.maxHeight / 16) * 16
-            AppLogger.w(TAG, "Height $effHeight exceeds encoder capability maximum ${caps.maxHeight}, clamping to $clampedHeight")
-            effHeight = clampedHeight
-        }
+        val (effWidth, effHeight) = computeEffectiveResolution(config, screenWidth, screenHeight)
 
         // Apply Resolution to System Properties for Quest
         setSystemProperty("debug.oculus.capture.width", effWidth.toString())
@@ -259,7 +299,7 @@ class QuestSenderService : Service() {
             defaultDisplay?.refreshRate?.toInt() ?: 90
         }
 
-        AppLogger.i(TAG, "Dynamic Native Match parameters: $effWidth x $effHeight @ $effFps FPS (Metrics: ${metrics.widthPixels}x${metrics.heightPixels}, Density: ${metrics.densityDpi})")
+        AppLogger.i(TAG, "Stream parameters computed: $effWidth x $effHeight @ $effFps FPS (Screen: ${screenWidth}x${screenHeight}, Rotation: $lastRotation)")
 
         val enc = VideoEncoder(
             config = config,
@@ -271,6 +311,8 @@ class QuestSenderService : Service() {
         )
         enc.start()
         encoder = enc
+        currentEncoderWidth = effWidth
+        currentEncoderHeight = effHeight
 
         // Start System Internal Audio Encoder (AudioPlaybackCaptureConfiguration)
         try {
@@ -278,13 +320,6 @@ class QuestSenderService : Service() {
                 mediaProjection = projection,
                 tcpStreamer = currentStreamer
             )
-            // Push the video first-frame anchor into the audio
-            // encoder. From this moment on, audio input PTS lives in
-            // the same domain as the video MediaCodec output PTS, so
-            // a/v stays in lockstep on both the live stream and the
-            // recorded MP4. AudioEncoder's capture thread holds
-            // captured PCM in a bounded buffer while it waits for
-            // this callback (500 ms timeout fallback).
             enc.onFirstFrameCaptured = {
                 audioEnc.videoStartPtsUs = enc.firstFramePtsUs
                 audioEnc.videoStartRealNs = enc.firstFrameRealNs
@@ -307,12 +342,16 @@ class QuestSenderService : Service() {
             return
         }
 
-        AppLogger.i(TAG, "Creating VirtualDisplay with resolution $effWidth x $effHeight, DPI ${metrics.densityDpi}")
+        val dm = android.util.DisplayMetrics()
+        defaultDisplay?.getRealMetrics(dm)
+        val densityDpi = if (dm.densityDpi > 0) dm.densityDpi else resources.displayMetrics.densityDpi
+
+        AppLogger.i(TAG, "Creating VirtualDisplay with resolution $effWidth x $effHeight, DPI $densityDpi")
         virtualDisplay = projection.createVirtualDisplay(
             "Quest3ScreenCast",
             effWidth,
             effHeight,
-            metrics.densityDpi,
+            densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
             surface,
             null,
@@ -333,6 +372,23 @@ class QuestSenderService : Service() {
         dispMgr?.registerDisplayListener(listener, android.os.Handler(android.os.Looper.getMainLooper()))
         displayListener = listener
 
+        // Supplementary: Register OrientationEventListener for immediate physical tilt response
+        try {
+            val orientationListener = object : android.view.OrientationEventListener(this, android.hardware.SensorManager.SENSOR_DELAY_NORMAL) {
+                override fun onOrientationChanged(orientation: Int) {
+                    if (orientation != ORIENTATION_UNKNOWN) {
+                        checkScreenSizeChange()
+                    }
+                }
+            }
+            if (orientationListener.canDetectOrientation()) {
+                orientationListener.enable()
+                orientationEventListener = orientationListener
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Could not enable OrientationEventListener: ${e.message}")
+        }
+
         isStreaming = true
         AppLogger.i(TAG, "QuestSenderService streaming started successfully.")
     }
@@ -340,6 +396,13 @@ class QuestSenderService : Service() {
     fun stopStreaming() {
         AppLogger.i(TAG, "stopStreaming requested.")
         isStreaming = false
+
+        try {
+            orientationEventListener?.disable()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error disabling orientationEventListener", e)
+        }
+        orientationEventListener = null
 
         displayListener?.let { listener ->
             val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
@@ -372,6 +435,8 @@ class QuestSenderService : Service() {
             AppLogger.e(TAG, "Error stopping encoder", e)
         }
         encoder = null
+        currentEncoderWidth = 0
+        currentEncoderHeight = 0
 
         try {
             streamer?.sendStreamStopSignal()
@@ -402,14 +467,14 @@ class QuestSenderService : Service() {
         if (!isStreaming) return
         val config = savedConfig ?: return
 
-        val metrics = resources.displayMetrics
-        val currentScreenWidth = metrics.widthPixels
-        val currentScreenHeight = metrics.heightPixels
+        val (currentScreenWidth, currentScreenHeight) = getRealDisplayMetrics()
+        val currentRotation = getDisplayRotation()
 
-        if (currentScreenWidth != lastWidth || currentScreenHeight != lastHeight) {
-            AppLogger.i(TAG, "Screen rotation/size change detected: from ${lastWidth}x${lastHeight} to ${currentScreenWidth}x${currentScreenHeight}")
+        if (currentScreenWidth != lastWidth || currentScreenHeight != lastHeight || currentRotation != lastRotation) {
+            AppLogger.i(TAG, "Screen rotation/size change detected: from ${lastWidth}x${lastHeight} (rot=$lastRotation) to ${currentScreenWidth}x${currentScreenHeight} (rot=$currentRotation)")
             lastWidth = currentScreenWidth
             lastHeight = currentScreenHeight
+            lastRotation = currentRotation
 
             recreateEncoderAndVirtualDisplay(currentScreenWidth, currentScreenHeight)
         }
@@ -419,7 +484,14 @@ class QuestSenderService : Service() {
         val config = savedConfig ?: return
         val projection = mediaProjection ?: return
 
-        AppLogger.i(TAG, "Recreating VideoEncoder for new screen dimensions ${screenWidth}x${screenHeight}...")
+        val (effWidth, effHeight) = computeEffectiveResolution(config, screenWidth, screenHeight)
+
+        if (effWidth == currentEncoderWidth && effHeight == currentEncoderHeight) {
+            AppLogger.i(TAG, "Effective resolution $effWidth x $effHeight unchanged on rotation event.")
+            return
+        }
+
+        AppLogger.i(TAG, "Recreating VideoEncoder for new screen dimensions ${screenWidth}x${screenHeight} -> target resolution ${effWidth}x${effHeight}...")
 
         // 1. Stop old VideoEncoder safely
         try {
@@ -429,39 +501,6 @@ class QuestSenderService : Service() {
             AppLogger.e(TAG, "Error stopping old VideoEncoder", e)
         }
         encoder = null
-
-        // 2. Compute new effective width and height
-        val rawWidth = if (config.resolution.width > 0) config.resolution.width else screenWidth
-        val rawHeight = if (config.resolution.height > 0) config.resolution.height else screenHeight
-
-        val isPhysicalLandscape = screenWidth >= screenHeight
-        var effWidth = if (isPhysicalLandscape) {
-            maxOf(rawWidth, rawHeight)
-        } else {
-            minOf(rawWidth, rawHeight)
-        }
-        var effHeight = if (isPhysicalLandscape) {
-            minOf(rawWidth, rawHeight)
-        } else {
-            maxOf(rawWidth, rawHeight)
-        }
-
-        // Align to 16 pixels
-        effWidth = ((effWidth / 16) * 16).coerceAtLeast(16)
-        effHeight = ((effHeight / 16) * 16).coerceAtLeast(16)
-
-        // Query capabilities & clamp dynamically
-        val caps = com.cath.screencast.model.EncoderCapabilities.query(config.codec, config.bitrateMode)
-        if (effWidth > caps.maxWidth) {
-            val clampedWidth = (caps.maxWidth / 16) * 16
-            AppLogger.w(TAG, "Width $effWidth exceeds encoder maximum ${caps.maxWidth}, clamping to $clampedWidth")
-            effWidth = clampedWidth
-        }
-        if (effHeight > caps.maxHeight) {
-            val clampedHeight = (caps.maxHeight / 16) * 16
-            AppLogger.w(TAG, "Height $effHeight exceeds encoder maximum ${caps.maxHeight}, clamping to $clampedHeight")
-            effHeight = clampedHeight
-        }
 
         val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
@@ -473,7 +512,7 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Recreating stream parameters: $effWidth x $effHeight @ $effFps FPS, BitrateMode: ${config.bitrateMode.name}, Bitrate: ${config.bitrateKbps}Kbps")
 
-        // 3. Initialize and start new VideoEncoder
+        // 2. Initialize and start new VideoEncoder
         val currentStreamer = streamer ?: return
         val enc = VideoEncoder(
             config = config,
@@ -486,13 +525,15 @@ class QuestSenderService : Service() {
         try {
             enc.start()
             encoder = enc
+            currentEncoderWidth = effWidth
+            currentEncoderHeight = effHeight
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to start new VideoEncoder", e)
             stopStreaming()
             return
         }
 
-        // 4. Update existing VirtualDisplay using setSurface & resize without releasing MediaProjection token
+        // 3. Recreate VirtualDisplay with new input surface
         val surface = enc.inputSurface
         if (surface == null) {
             AppLogger.e(TAG, "New Encoder inputSurface is null! Cannot update VirtualDisplay.")
@@ -500,28 +541,33 @@ class QuestSenderService : Service() {
             return
         }
 
-        val metrics = resources.displayMetrics
-        if (virtualDisplay == null) {
-            virtualDisplay = projection.createVirtualDisplay(
-                "Quest3ScreenCast",
-                effWidth,
-                effHeight,
-                metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-                surface,
-                null,
-                null
-            )
-        } else {
-            virtualDisplay?.setSurface(surface)
-            virtualDisplay?.resize(effWidth, effHeight, metrics.densityDpi)
+        val dm = android.util.DisplayMetrics()
+        defaultDisplay?.getRealMetrics(dm)
+        val densityDpi = if (dm.densityDpi > 0) dm.densityDpi else resources.displayMetrics.densityDpi
+
+        try {
+            virtualDisplay?.release()
+            virtualDisplay = null
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error releasing old virtualDisplay", e)
         }
-        AppLogger.i(TAG, "VirtualDisplay updated successfully with size: $effWidth x $effHeight.")
+
+        virtualDisplay = projection.createVirtualDisplay(
+            "Quest3ScreenCast",
+            effWidth,
+            effHeight,
+            densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+            surface,
+            null,
+            null
+        )
+        AppLogger.i(TAG, "VirtualDisplay recreated successfully with size: $effWidth x $effHeight, DPI $densityDpi.")
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
-        AppLogger.i(TAG, "onConfigurationChanged triggered.")
+        AppLogger.i(TAG, "onConfigurationChanged triggered: orientation=${newConfig.orientation}")
         checkScreenSizeChange()
     }
 

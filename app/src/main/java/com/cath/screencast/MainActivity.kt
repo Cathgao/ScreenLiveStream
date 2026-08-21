@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.ContextCompat
@@ -164,7 +165,7 @@ class MainActivity : ComponentActivity() {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(innerPadding)
+                            .padding(if (currentMode == AppMode.MOBILE_RECEIVER && isReceiverListeningState) PaddingValues(0.dp) else innerPadding)
                     ) {
                         when (currentMode) {
                             AppMode.QUEST_SENDER -> {

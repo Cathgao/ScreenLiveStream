@@ -26,6 +26,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import android.view.WindowManager
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -113,9 +116,9 @@ fun ReceiverScreen(
         if (isListening && videoWidth > 0 && videoHeight > 0) {
             val isVideoLandscape = videoWidth > videoHeight
             activity?.requestedOrientation = if (isVideoLandscape) {
-                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             } else {
-                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
             }
         } else if (!isListening) {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -130,26 +133,40 @@ fun ReceiverScreen(
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, isListening) {
+        val window = activity?.window
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+
+        fun setImmersiveMode(enable: Boolean) {
+            if (window == null || insetsController == null) return
+            if (enable) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                insetsController.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                insetsController.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 if (isListening) {
-                    activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    setImmersiveMode(true)
                 }
             } else if (event == Lifecycle.Event.ON_PAUSE) {
-                activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (isListening) {
+                    window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
 
-        if (isListening) {
-            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+        setImmersiveMode(isListening)
 
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            setImmersiveMode(false)
         }
     }
 
