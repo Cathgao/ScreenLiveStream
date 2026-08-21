@@ -6,6 +6,13 @@
 > 本软件仅在[本仓库](https://github.com/Cathgao/ScreenLiveStream)发布，未发布在其他网站、未上架任何商店，更没有在任何平台销售。
 > 若你是付费获得本软件，那么你已经遭到诈骗，请立即向卖家或平台投诉，并要求全额退款。
 
+
+
+## 🎉现在已经支持Windows
+- **Windows 客户端**：[ScreenLiveStream-Windows](https://github.com/Cathgao/ScreenLiveStream-Windows) (QuestCast VR for Windows) — 专为 Windows 平台打造的超低延迟硬件加速投屏客户端，支持 Windows.Graphics.Capture 采集、全链路 D3D11 + MFT 硬件编解码，与 Android 端 100% 协议互通，可互相作为发送端或接收端。
+
+
+
 # QuestCast VR
 
 > 在局域网内，将 Meta Quest 画面低延迟投送到 Android 手机或平板。
@@ -13,6 +20,9 @@
 > 支持硬件 H.264/H.265 编码、TCP/UDP 传输和接收端本地录制。
 
 QuestCast VR 是一个无需云端服务的 Android 投屏工具：一台Android设备作为发送端捕获画面与系统音频，另一台Android设备作为接收端解码、播放并可选录制。两台设备只需要连接到同一个可互通的 Wi-Fi/LAN。
+
+> [!TIP]
+> **Windows 客户端**：如需在 Windows 电脑上进行屏幕推流或接收投屏播放，请访问配套的 Windows 端仓库：[ScreenLiveStream-Windows](https://github.com/Cathgao/ScreenLiveStream-Windows)。
 
 ## 主要功能
 
@@ -173,6 +183,7 @@ Release 工作流需要仓库配置签名相关 secrets（例如 `KEYSTORE_BASE6
 - 可用编码格式和分辨率取决于设备上的 MediaCodec 硬件能力。
 - Meta Quest 固件对相关系统属性的支持。
 - 音频捕获受 Android 版本、MediaProjection 授权和应用音频策略限制。
+
 
 ## 许可证
 
