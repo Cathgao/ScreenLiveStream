@@ -1,6 +1,18 @@
 package com.cath.screencast.model
 
 import android.media.MediaCodecInfo
+import android.os.Build
+
+object DeviceUtils {
+    val isQuestDevice: Boolean
+        get() {
+            val model = Build.MODEL ?: ""
+            val manufacturer = Build.MANUFACTURER ?: ""
+            return manufacturer.equals("Oculus", ignoreCase = true) ||
+                   manufacturer.equals("Meta", ignoreCase = true) ||
+                   model.contains("Quest", ignoreCase = true)
+        }
+}
 
 enum class VideoCodec(val displayName: String, val mimeType: String) {
     H264("H.264 / AVC", "video/avc"),

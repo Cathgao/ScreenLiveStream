@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.cath.screencast.model.BitrateMode
+import com.cath.screencast.model.DeviceUtils
 import com.cath.screencast.model.DiscoveredDevice
 import com.cath.screencast.model.EncoderCapabilities
 import com.cath.screencast.model.EyeCrop
@@ -31,13 +32,7 @@ enum class AppMode {
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     val isQuestDevice: Boolean
-        get() {
-            val model = Build.MODEL ?: ""
-            val manufacturer = Build.MANUFACTURER ?: ""
-            return manufacturer.equals("Oculus", ignoreCase = true) ||
-                   manufacturer.equals("Meta", ignoreCase = true) ||
-                   model.contains("Quest", ignoreCase = true)
-        }
+        get() = DeviceUtils.isQuestDevice
 
     private val _currentMode = MutableStateFlow(AppMode.QUEST_SENDER)
     val currentMode: StateFlow<AppMode> = _currentMode.asStateFlow()

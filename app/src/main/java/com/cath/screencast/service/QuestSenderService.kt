@@ -22,6 +22,7 @@ import com.cath.screencast.encoder.AudioEncoder
 import com.cath.screencast.encoder.VideoEncoder
 import com.cath.screencast.log.AppLogger
 import com.cath.screencast.model.BitrateMode
+import com.cath.screencast.model.DeviceUtils
 import com.cath.screencast.model.EyeCrop
 import com.cath.screencast.model.StreamConfig
 import com.cath.screencast.model.StreamStats
@@ -165,21 +166,27 @@ class QuestSenderService : Service() {
         val rawWidth = if (config.resolution.width > 0) config.resolution.width else screenWidth
         val rawHeight = if (config.resolution.height > 0) config.resolution.height else screenHeight
 
-        val isPhysicalLandscape = screenWidth >= screenHeight
-        
         var effWidth: Int
         var effHeight: Int
 
-        // If it's a 1:1 aspect ratio (e.g. Quest square crop), keep width == height
-        if (rawWidth == rawHeight) {
+        if (DeviceUtils.isQuestDevice) {
+            // For Quest devices (VR headset), the capture FOV is determined by user selection (1:1, 16:9, 2:1)
+            // and must NOT be inverted based on the 2D window's display metrics.
+            effWidth = if (config.resolution.width > 0) config.resolution.width else 1920
+            effHeight = if (config.resolution.height > 0) config.resolution.height else 1080
+        } else if (rawWidth == rawHeight) {
+            // If it's a 1:1 aspect ratio (e.g. square crop), keep width == height
             effWidth = rawWidth
             effHeight = rawHeight
-        } else if (isPhysicalLandscape) {
-            effWidth = maxOf(rawWidth, rawHeight)
-            effHeight = minOf(rawWidth, rawHeight)
         } else {
-            effWidth = minOf(rawWidth, rawHeight)
-            effHeight = maxOf(rawWidth, rawHeight)
+            val isPhysicalLandscape = screenWidth >= screenHeight
+            if (isPhysicalLandscape) {
+                effWidth = maxOf(rawWidth, rawHeight)
+                effHeight = minOf(rawWidth, rawHeight)
+            } else {
+                effWidth = minOf(rawWidth, rawHeight)
+                effHeight = maxOf(rawWidth, rawHeight)
+            }
         }
 
         // Align to 16 pixels
@@ -440,6 +447,9 @@ class QuestSenderService : Service() {
 
     private fun checkScreenSizeChange() {
         if (!isStreaming) return
+        // Quest 3 is a VR headset. The VR compositor stream resolution is determined
+        // by debug.oculus.capture.width / height and does not change when the 2D window is resized/moved.
+        if (DeviceUtils.isQuestDevice) return
         val config = savedConfig ?: return
 
         val (currentScreenWidth, currentScreenHeight) = getRealDisplayMetrics()
