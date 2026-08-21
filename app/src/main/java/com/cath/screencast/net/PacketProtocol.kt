@@ -139,17 +139,32 @@ object PacketProtocol {
      * one-way broadcast of rolling RTT / loss-percent statistics. Read them
      * via [readPingStatsPayload] instead.
      */
+    const val FLAG_IDR_REQUEST: Byte = 0x80.toByte()
+
+    /**
+     * Parse a ping sequence header from a raw UDP datagram.
+     * Returns null if the magic doesn't match or the packet is too short.
+     * Use [readPingStatsPayload] for FLAG_PING_STATS beacons.
+     */
+    data class ProbeType(val isReply: Boolean, val seq: Int, val echoedNanos: Long, val isIdrRequest: Boolean = false)
+
     fun readProbeSequence(data: ByteArray, length: Int): ProbeType? {
-        if (length < HEADER_SIZE + 8) return null
+        if (length < HEADER_SIZE) return null
         if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
         val flags = data[3].toInt() and 0xFF
+
+        if ((flags and FLAG_IDR_REQUEST.toInt()) != 0) {
+            return ProbeType(isReply = false, seq = 0, echoedNanos = 0L, isIdrRequest = true)
+        }
+
+        if (length < HEADER_SIZE + 8) return null
         return when {
             (flags and FLAG_PING.toInt()) != 0 -> {
                 val seq = ((data[4].toInt() and 0xFF) shl 24) or
                           ((data[5].toInt() and 0xFF) shl 16) or
                           ((data[6].toInt() and 0xFF) shl 8) or
                           (data[7].toInt() and 0xFF)
-                ProbeType(isReply = false, seq = seq, echoedNanos = 0L)
+                ProbeType(isReply = false, seq = seq, echoedNanos = 0L, isIdrRequest = false)
             }
             (flags and FLAG_PING_REPLY.toInt()) != 0 -> {
                 val seq = ((data[4].toInt() and 0xFF) shl 24) or
@@ -165,7 +180,7 @@ object PacketProtocol {
                                   ((data[21].toLong() and 0xFFL) shl 16) or
                                   ((data[22].toLong() and 0xFFL) shl 8) or
                                   (data[23].toLong() and 0xFFL)
-                ProbeType(isReply = true, seq = seq, echoedNanos = echoedNanos)
+                ProbeType(isReply = true, seq = seq, echoedNanos = echoedNanos, isIdrRequest = false)
             }
             else -> null
         }
@@ -211,8 +226,6 @@ object PacketProtocol {
         bb.putInt(lossPercentX100.coerceIn(0, 10000))
         return packet
     }
-
-    data class ProbeType(val isReply: Boolean, val seq: Int, val echoedNanos: Long)
 
     class ParsedPacket(
         val frameSeq: Int,

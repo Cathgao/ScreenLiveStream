@@ -38,6 +38,7 @@ class RttProbe {
 
     /** Stats callback fired whenever the window rolls (≈ every second). */
     var onStats: ((ProbeStats) -> Unit)? = null
+    var onIdrRequest: (() -> Unit)? = null
 
     data class ProbeStats(
         val lastRttMs: Int,           // newest sample; 0 if no reply yet
@@ -76,7 +77,10 @@ class RttProbe {
                         pkt.length = buf.size
                         (this.socket ?: break).receive(pkt)
                         val probe = PacketProtocol.readProbeSequence(pkt.data, pkt.length) ?: continue
-                        if (probe.isReply) {
+                        if (probe.isIdrRequest) {
+                            SessionLog.i(TAG, "Received instant IDR Keyframe Request (PLI) via RTT probe channel! Forcing keyframe...")
+                            onIdrRequest?.invoke()
+                        } else if (probe.isReply) {
                             handleReply(probe.seq, probe.echoedNanos)
                         }
                     } catch (_: java.net.SocketTimeoutException) {

@@ -85,7 +85,7 @@ class VideoEncoder(
             )
             format.setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1000)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // Keyframe every 2s
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // 1-second safety net interval to guarantee instant reference recovery from packet drops
             format.setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
                 config.bitrateMode.modeInt
@@ -101,6 +101,10 @@ class VideoEncoder(
                 format.setInteger(MediaFormat.KEY_LATENCY, 0)
             }
             format.setInteger("max-bframes", 0)
+            try {
+                format.setInteger("vendor.qti-ext-enc-caps.low-latency.enable", 1)
+                format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
+            } catch (_: Exception) {}
 
             AppLogger.i(TAG, "Configuring MediaCodec with format: $format")
 
@@ -188,14 +192,14 @@ class VideoEncoder(
 
     private fun startEncodeLoop() {
         encoderThread = thread(start = true, name = "QuestVideoEncoderThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val bufferInfo = MediaCodec.BufferInfo()
             var tempBuffer = ByteArray(512 * 1024)
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
             streamStartNs = 0L
-            AppLogger.i(TAG, "Encoder loop thread running at background priority...")
+            AppLogger.i(TAG, "Encoder loop thread running at URGENT_DISPLAY priority...")
 
             while (isEncoding) {
                 try {

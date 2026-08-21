@@ -59,13 +59,14 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         isListening = true
         
         kotlin.concurrent.thread(name = "UdpReceiverThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             try {
                 val s = DatagramSocket(null)
                 s.reuseAddress = true
                 s.bind(java.net.InetSocketAddress(listenPort))
                 socket = s
-                socket?.receiveBufferSize = 8 * 1024 * 1024
-                AppLogger.i(TAG, "UDP Receiver listening on port $listenPort")
+                socket?.receiveBufferSize = 16 * 1024 * 1024
+                AppLogger.i(TAG, "UDP Receiver listening on port $listenPort (rcvBuf=${socket?.receiveBufferSize})")
                 
                 val buffer = ByteArray(2000)
                 val dp = DatagramPacket(buffer, buffer.size)
@@ -166,14 +167,16 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                     if (frameSize <= 0 || frameSize > 8 * 1024 * 1024) continue
                     
                     if (seq <= lastAssembledSeq) {
-                        val isRestart = isKeyframe || (lastAssembledSeq - seq > 50)
+                        val isRestart = (lastAssembledSeq - seq > 500)
                         if (isRestart) {
-                            AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq isKeyframe=$isKeyframe")
+                            AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq")
                             lastAssembledSeq = -1
                             frameBuffers.clear()
-                            // Fall through to process this packet
                         } else {
-                            continue
+                            val existing = frameBuffers[seq]
+                            if (existing == null || existing.isCompleted) {
+                                continue
+                            }
                         }
                     }
 
@@ -245,14 +248,52 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                 }
                 
                 if (missingCount == 1) {
-                    // Recover missing fragment using reusable scratch buffer
+                    // Recover missing fragment using reusable scratch buffer with 64-bit fast Long XOR
                     System.arraycopy(fecPayload, 0, fecScratch, 0, fecPayload.size)
                     for (i in startIdx until endIdx) {
                         if (i != missingIdx && fb.receivedFragments[i]) {
                             val fragOffset = i * 1300
                             val fragLen = fb.getExpectedFragLength(i)
-                            for (k in 0 until fragLen) {
-                                fecScratch[k] = (fecScratch[k].toInt() xor fb.frameBytes[fragOffset + k].toInt()).toByte()
+                            val longCount = fragLen ushr 3
+                            val rem = fragLen and 7
+                            var d = 0
+                            var s = fragOffset
+                            for (w in 0 until longCount) {
+                                val s0 = fb.frameBytes[s].toLong() and 0xFF
+                                val s1 = fb.frameBytes[s + 1].toLong() and 0xFF
+                                val s2 = fb.frameBytes[s + 2].toLong() and 0xFF
+                                val s3 = fb.frameBytes[s + 3].toLong() and 0xFF
+                                val s4 = fb.frameBytes[s + 4].toLong() and 0xFF
+                                val s5 = fb.frameBytes[s + 5].toLong() and 0xFF
+                                val s6 = fb.frameBytes[s + 6].toLong() and 0xFF
+                                val s7 = fb.frameBytes[s + 7].toLong() and 0xFF
+                                val sVal = (s0 shl 56) or (s1 shl 48) or (s2 shl 40) or (s3 shl 32) or (s4 shl 24) or (s5 shl 16) or (s6 shl 8) or s7
+
+                                val d0 = fecScratch[d].toLong() and 0xFF
+                                val d1 = fecScratch[d + 1].toLong() and 0xFF
+                                val d2 = fecScratch[d + 2].toLong() and 0xFF
+                                val d3 = fecScratch[d + 3].toLong() and 0xFF
+                                val d4 = fecScratch[d + 4].toLong() and 0xFF
+                                val d5 = fecScratch[d + 5].toLong() and 0xFF
+                                val d6 = fecScratch[d + 6].toLong() and 0xFF
+                                val d7 = fecScratch[d + 7].toLong() and 0xFF
+                                val dVal = (d0 shl 56) or (d1 shl 48) or (d2 shl 40) or (d3 shl 32) or (d4 shl 24) or (d5 shl 16) or (d6 shl 8) or d7
+
+                                val res = dVal xor sVal
+                                fecScratch[d] = (res ushr 56).toByte()
+                                fecScratch[d + 1] = (res ushr 48).toByte()
+                                fecScratch[d + 2] = (res ushr 40).toByte()
+                                fecScratch[d + 3] = (res ushr 32).toByte()
+                                fecScratch[d + 4] = (res ushr 24).toByte()
+                                fecScratch[d + 5] = (res ushr 16).toByte()
+                                fecScratch[d + 6] = (res ushr 8).toByte()
+                                fecScratch[d + 7] = res.toByte()
+
+                                d += 8
+                                s += 8
+                            }
+                            for (r in 0 until rem) {
+                                fecScratch[d + r] = (fecScratch[d + r].toInt() xor fb.frameBytes[s + r].toInt()).toByte()
                             }
                         }
                     }

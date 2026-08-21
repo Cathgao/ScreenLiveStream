@@ -15,6 +15,8 @@ import android.media.projection.MediaProjectionManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.view.Display
 import androidx.core.app.NotificationCompat
 import com.cath.screencast.MainActivity
@@ -42,6 +44,8 @@ class QuestSenderService : Service() {
     private var encoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
     private var streamer: IStreamer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private val rttProbe = RttProbe()
     @Volatile
     private var latestRttStats: RttProbe.ProbeStats? = null
@@ -222,6 +226,26 @@ class QuestSenderService : Service() {
         lastRotation = getDisplayRotation()
 
         AppLogger.i(TAG, "Requesting MediaProjection from projectionManager...")
+
+        // Acquire WakeLock and Full Low-Latency WifiLock to prevent Qualcomm Wi-Fi chip from entering power-save DTIM sleep
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ScreenLiveStream:SenderWakeLock")
+            wakeLock?.acquire(24 * 60 * 60 * 1000L)
+
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ScreenLiveStream:SenderWifiLock")
+            } else {
+                @Suppress("DEPRECATION")
+                wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ScreenLiveStream:SenderWifiLock")
+            }
+            wifiLock?.acquire()
+            AppLogger.i(TAG, "Acquired WakeLock and Low-Latency WifiLock successfully.")
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Failed to acquire WakeLock or WifiLock: ${e.message}")
+        }
+
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
         if (projection == null) {
@@ -249,6 +273,10 @@ class QuestSenderService : Service() {
         val currentStreamer = streamer!!
 
         currentStreamer.onRequestKeyframe = {
+            encoder?.requestKeyFrame()
+        }
+        rttProbe.onIdrRequest = {
+            AppLogger.i(TAG, "Instant IDR requested via RTT control channel! Forcing keyframe...")
             encoder?.requestKeyFrame()
         }
         currentStreamer.start(config.targetIp, config.targetPort)
@@ -288,14 +316,7 @@ class QuestSenderService : Service() {
         }
         rttProbe.start(config.targetIp, config.targetPort)
 
-        // Apply EyeCrop to System Properties for Quest
-        setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
-
         val (effWidth, effHeight) = computeEffectiveResolution(config, screenWidth, screenHeight)
-
-        // Apply Resolution to System Properties for Quest
-        setSystemProperty("debug.oculus.capture.width", effWidth.toString())
-        setSystemProperty("debug.oculus.capture.height", effHeight.toString())
 
         val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
@@ -304,6 +325,16 @@ class QuestSenderService : Service() {
         } else {
             defaultDisplay?.refreshRate?.toInt() ?: 90
         }
+
+        // Apply Resolution & FPS to System Properties for Quest
+        setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
+        setSystemProperty("debug.oculus.capture.width", effWidth.toString())
+        setSystemProperty("debug.oculus.capture.height", effHeight.toString())
+        setSystemProperty("debug.oculus.fullRateCapture", "1")
+        if (config.frameRate > 0) {
+            setSystemProperty("debug.oculus.capture.fps", effFps.toString())
+        }
+        setSystemProperty("debug.oculus.capture.bitrate", (config.bitrateKbps * 1000).toString())
 
         AppLogger.i(TAG, "Stream parameters computed: $effWidth x $effHeight @ $effFps FPS (Screen: ${screenWidth}x${screenHeight}, Rotation: $lastRotation)")
 
@@ -358,7 +389,7 @@ class QuestSenderService : Service() {
             effWidth,
             effHeight,
             densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
             surface,
             null,
             null
@@ -442,6 +473,17 @@ class QuestSenderService : Service() {
             AppLogger.e(TAG, "Error stopping MediaProjection", e)
         }
         mediaProjection = null
+
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (_: Exception) {}
+        wifiLock = null
+
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {}
+        wakeLock = null
+
         AppLogger.i(TAG, "QuestSenderService streaming stopped completed.")
     }
 
@@ -529,7 +571,7 @@ class QuestSenderService : Service() {
                 effWidth,
                 effHeight,
                 densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
                 surface,
                 null,
                 null

@@ -79,14 +79,14 @@ class TcpStreamer : IStreamer {
         taskQueue.clear()
 
         connectThread = thread(start = true, name = "TcpStreamerConnectThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
             while (isConnected) {
                 if (socket == null || socket?.isClosed == true || socket?.isConnected == false) {
                     try {
                         SessionLog.i(TAG, "Connecting TCP stream to $targetIp:$targetPort...")
                         val s = Socket()
                         s.tcpNoDelay = true
-                        s.sendBufferSize = 512 * 1024
+                        s.sendBufferSize = 4 * 1024 * 1024
                         s.connect(InetSocketAddress(targetIp, targetPort), 3000)
                         val dos = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 32 * 1024))
                         socket = s
@@ -146,7 +146,10 @@ class TcpStreamer : IStreamer {
         }
 
         sendThread = thread(start = true, name = "TcpStreamerSendThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            val headerData = ByteArray(20)
+            val headerBuf = java.nio.ByteBuffer.wrap(headerData)
+
             while (isConnected) {
                 try {
                     val task = taskQueue.take()
@@ -155,25 +158,29 @@ class TcpStreamer : IStreamer {
                         try {
                             if (task.isStreamStop) {
                                 val flags = PacketProtocol.FLAG_STREAM_STOP
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte(flags.toInt())
-                                dos.writeInt(0)
-                                dos.writeLong(0L)
-                                dos.writeInt(0)
+                                headerBuf.clear()
+                                headerBuf.put(PacketProtocol.MAGIC_0)
+                                headerBuf.put(PacketProtocol.MAGIC_1)
+                                headerBuf.put(PacketProtocol.VERSION)
+                                headerBuf.put(flags)
+                                headerBuf.putInt(0)
+                                headerBuf.putLong(0L)
+                                headerBuf.putInt(0)
+                                dos.write(headerData, 0, 20)
                                 dos.flush()
                             } else if (task.isBeacon) {
                                 val flags = PacketProtocol.FLAG_PING_STATS
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte(flags.toInt())
-                                dos.writeInt(0)
-                                dos.writeLong(0L)
-                                dos.writeInt(8)
-                                dos.writeInt(task.rttMs)
+                                headerBuf.clear()
+                                headerBuf.put(PacketProtocol.MAGIC_0)
+                                headerBuf.put(PacketProtocol.MAGIC_1)
+                                headerBuf.put(PacketProtocol.VERSION)
+                                headerBuf.put(flags)
+                                headerBuf.putInt(0)
+                                headerBuf.putLong(0L)
+                                headerBuf.putInt(8)
+                                dos.write(headerData, 0, 20)
                                 val lossBp = (task.lossPercent * 100f).toInt().coerceIn(0, 10000)
+                                dos.writeInt(task.rttMs)
                                 dos.writeInt(lossBp)
                                 dos.flush()
                             } else if (task.isAudio) {
@@ -181,14 +188,18 @@ class TcpStreamer : IStreamer {
                                 var flags: Byte = PacketProtocol.FLAG_AUDIO
                                 if (task.isCodecConfig) flags = (flags.toInt() or PacketProtocol.FLAG_CODEC_CONFIG.toInt()).toByte()
 
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte(flags.toInt())
-                                dos.writeInt(frameSeq)
-                                dos.writeLong(task.timestampMs)
-                                dos.writeInt(task.size)
-                                dos.write(task.data, 0, task.size)
+                                headerBuf.clear()
+                                headerBuf.put(PacketProtocol.MAGIC_0)
+                                headerBuf.put(PacketProtocol.MAGIC_1)
+                                headerBuf.put(PacketProtocol.VERSION)
+                                headerBuf.put(flags)
+                                headerBuf.putInt(frameSeq)
+                                headerBuf.putLong(task.timestampMs)
+                                headerBuf.putInt(task.size)
+                                dos.write(headerData, 0, 20)
+                                if (task.size > 0) {
+                                    dos.write(task.data, 0, task.size)
+                                }
                                 dos.flush()
                             } else {
                                 val frameSeq = videoSeqCounter++
@@ -200,14 +211,18 @@ class TcpStreamer : IStreamer {
                                 if (task.isCodecConfig) flags = (flags.toInt() or PacketProtocol.FLAG_CODEC_CONFIG.toInt()).toByte()
                                 if (task.codec == VideoCodec.H265) flags = (flags.toInt() or PacketProtocol.FLAG_CODEC_HEVC.toInt()).toByte()
 
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte(flags.toInt())
-                                dos.writeInt(frameSeq)
-                                dos.writeLong(task.timestampMs)
-                                dos.writeInt(task.size)
-                                dos.write(task.data, 0, task.size)
+                                headerBuf.clear()
+                                headerBuf.put(PacketProtocol.MAGIC_0)
+                                headerBuf.put(PacketProtocol.MAGIC_1)
+                                headerBuf.put(PacketProtocol.VERSION)
+                                headerBuf.put(flags)
+                                headerBuf.putInt(frameSeq)
+                                headerBuf.putLong(task.timestampMs)
+                                headerBuf.putInt(task.size)
+                                dos.write(headerData, 0, 20)
+                                if (task.size > 0) {
+                                    dos.write(task.data, 0, task.size)
+                                }
                                 dos.flush()
                             }
                         } catch (e: Exception) {
