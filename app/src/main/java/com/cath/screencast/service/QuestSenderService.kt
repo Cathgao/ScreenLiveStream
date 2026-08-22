@@ -279,6 +279,14 @@ class QuestSenderService : Service() {
             AppLogger.i(TAG, "Instant IDR requested via RTT control channel! Forcing keyframe...")
             encoder?.requestKeyFrame()
         }
+        val effFpsInit = if (config.frameRate > 0) {
+            config.frameRate
+        } else {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+            defaultDisplay?.refreshRate?.toInt() ?: 90
+        }
+        currentStreamer.setBitrate(config.bitrateKbps, effFpsInit)
         currentStreamer.start(config.targetIp, config.targetPort)
         // RTT probe uses its own UDP socket (separate from streamer
         // so media traffic and probe traffic don't compete for buffers).
@@ -534,6 +542,7 @@ class QuestSenderService : Service() {
 
         // 1. Initialize and start new VideoEncoder
         val currentStreamer = streamer ?: return
+        currentStreamer.setBitrate(config.bitrateKbps, effFps)
         val enc = VideoEncoder(
             config = config,
             tcpStreamer = currentStreamer,

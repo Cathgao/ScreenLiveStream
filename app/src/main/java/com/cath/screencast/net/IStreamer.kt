@@ -25,6 +25,8 @@ interface IStreamer {
     
     var onRequestKeyframe: (() -> Unit)?
     
+    fun setBitrate(bitrateKbps: Int, fps: Int = 90) {}
+    
     fun start(targetIp: String, port: Int)
     fun stop()
 }

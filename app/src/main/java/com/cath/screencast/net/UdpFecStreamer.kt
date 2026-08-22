@@ -7,11 +7,15 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.locks.LockSupport
 import kotlin.concurrent.thread
 
 import com.cath.screencast.model.VideoCodec
 
-class UdpFecStreamer : IStreamer {
+class UdpFecStreamer(
+    @Volatile private var targetBitrateKbps: Int = 16000,
+    @Volatile private var targetFps: Int = 90
+) : IStreamer {
     private val TAG = "UdpFecStreamer"
     private var socket: DatagramSocket? = null
     private var targetAddress: InetAddress? = null
@@ -32,6 +36,16 @@ class UdpFecStreamer : IStreamer {
     override var onRequestKeyframe: (() -> Unit)? = null
     
     private var sendThread: Thread? = null
+
+    override fun setBitrate(bitrateKbps: Int, fps: Int) {
+        if (bitrateKbps > 0) {
+            this.targetBitrateKbps = bitrateKbps
+        }
+        if (fps > 0) {
+            this.targetFps = fps
+        }
+        AppLogger.i(TAG, "Global Pacer updated: targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps")
+    }
 
     private class FrameTask {
         var data: ByteArray = ByteArray(0)
@@ -65,12 +79,88 @@ class UdpFecStreamer : IStreamer {
 
     private var recvThread: Thread? = null
 
+    // Pacer state: scheduled nanosecond timestamp when next packet may be transmitted
+    private var nextSendTimeNs = 0L
+
+    /**
+     * Dynamically computes the target pacing transmission rate (in bits per second) for a frame or task.
+     * Incorporates baseline rate (1.25x headroom) and adapts for large keyframes or congested queues.
+     */
+    private fun computePacingRateBps(frameTotalWireBytes: Int, queueDepth: Int): Long {
+        val bitrateBps = targetBitrateKbps.toLong() * 1000L
+        val fps = targetFps.coerceIn(30, 144)
+        val frameIntervalMs = (1000f / fps).coerceAtLeast(6f)
+
+        // Baseline pacing rate: 1.25x target bitrate with a 4 Mbps floor
+        val basePacingRateBps = maxOf(4_000_000L, (bitrateBps * 1.25).toLong())
+        // Absolute maximum burst rate ceiling to prevent Wi-Fi AP downlink queue overflow (capped at 150 Mbps)
+        val maxPacingRateBps = maxOf(80_000_000L, minOf(150_000_000L, (bitrateBps * 2.5).toLong()))
+
+        val isLargeOrCongested = frameTotalWireBytes > 30 * 1024 || queueDepth > 0
+        if (!isLargeOrCongested) {
+            return basePacingRateBps
+        }
+
+        // Target drain time: 70% of frame duration, clamped between 5ms and 12ms
+        val targetDrainSec = ((frameIntervalMs * 0.70f).coerceIn(5f, 12f)) / 1000.0
+        val neededDrainRateBps = (frameTotalWireBytes * 8L / targetDrainSec).toLong()
+
+        return neededDrainRateBps.coerceIn(basePacingRateBps, maxPacingRateBps)
+    }
+
+    /**
+     * Micro-paces and transmits a single UDP datagram with sub-microsecond precision.
+     */
+    private fun paceAndSend(
+        sock: DatagramSocket,
+        packet: DatagramPacket,
+        payloadSize: Int,
+        pacingRateBps: Long
+    ) {
+        val nowNs = System.nanoTime()
+        // Prevent massive catch-up bursts after idle period between frames (clamp max idle credit to 50µs)
+        val maxLagNs = 50_000L
+        if (nextSendTimeNs < nowNs - maxLagNs) {
+            nextSendTimeNs = nowNs - maxLagNs
+        }
+
+        val waitNanos = nextSendTimeNs - nowNs
+        if (waitNanos > 0) {
+            paceSleepNanos(waitNanos)
+        }
+
+        sock.send(packet)
+
+        // Account for total on-the-wire UDP frame: payload + 28 bytes IP/UDP headers
+        val totalWireBytes = payloadSize + 28
+        val packetIntervalNanos = (totalWireBytes * 8L * 1_000_000_000L) / pacingRateBps.coerceAtLeast(1_000_000L)
+        
+        nextSendTimeNs = maxOf(nextSendTimeNs, System.nanoTime()) + packetIntervalNanos
+    }
+
+    /**
+     * High-precision hybrid pacer sleep:
+     * - Uses LockSupport.parkNanos for large delays (>1.5ms) to conserve CPU.
+     * - Uses Thread.onSpinWait() for sub-millisecond precision without OS scheduler latency.
+     */
+    private fun paceSleepNanos(nanos: Long) {
+        if (nanos <= 0) return
+        val target = System.nanoTime() + nanos
+        if (nanos > 1_500_000L) {
+            LockSupport.parkNanos(nanos - 1_000_000L)
+        }
+        while (System.nanoTime() < target) {
+            Thread.onSpinWait()
+        }
+    }
+
     override fun start(targetIp: String, port: Int) {
         if (isStreaming) return
         isStreaming = true
         ready = false
         this.targetPort = port
         taskQueue.clear()
+        nextSendTimeNs = System.nanoTime()
 
         thread(name = "UdpStreamerThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
@@ -83,7 +173,7 @@ class UdpFecStreamer : IStreamer {
                 socket = s
                 targetAddress = InetAddress.getByName(targetIp)
                 ready = true
-                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xB8, FEC_GROUP_SIZE=$FEC_GROUP_SIZE)")
+                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xB8, FEC_GROUP_SIZE=$FEC_GROUP_SIZE, targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps)")
 
                 // Start control packet listener (IDR request / Ping echo) on stream socket
                 recvThread = thread(start = true, name = "UdpFecStreamerRecvThread") {
@@ -132,6 +222,9 @@ class UdpFecStreamer : IStreamer {
             val fragBuf = ByteBuffer.wrap(fragData)
             val reusablePacket = DatagramPacket(fragData, 0)
 
+            var frameCount = 0L
+            var lastLogTime = System.currentTimeMillis()
+
             while (isStreaming) {
                 try {
                     val task = taskQueue.take()
@@ -147,7 +240,7 @@ class UdpFecStreamer : IStreamer {
                                 packetBuf.put(PacketProtocol.buildStreamStopPacket())
                                 reusablePacket.setData(packetBuf.array(), 0, PacketProtocol.HEADER_SIZE)
                                 for (i in 0 until 10) {
-                                    sock.send(reusablePacket)
+                                    paceAndSend(sock, reusablePacket, PacketProtocol.HEADER_SIZE, 8_000_000L)
                                 }
                             } else if (task.isBeacon) {
                                 val flags = 64 // 64 = Beacon
@@ -169,7 +262,8 @@ class UdpFecStreamer : IStreamer {
                                 packetBuf.putInt(lossBp)
                                 
                                 reusablePacket.setData(packetBuf.array(), 0, 28 + 8)
-                                sock.send(reusablePacket)
+                                val pacingRate = computePacingRateBps(36, taskQueue.size)
+                                paceAndSend(sock, reusablePacket, 8, pacingRate)
                             } else if (task.isAudio) {
                                 var flags = 16 // 16 = Audio
                                 if (task.isCodecConfig) flags = flags or 32
@@ -191,7 +285,8 @@ class UdpFecStreamer : IStreamer {
                                 packetBuf.put(task.data, 0, task.size)
                                 
                                 reusablePacket.setData(packetBuf.array(), 0, 28 + task.size)
-                                sock.send(reusablePacket)
+                                val pacingRate = computePacingRateBps(task.size + 28, taskQueue.size)
+                                paceAndSend(sock, reusablePacket, task.size, pacingRate)
                             } else {
                                 val frameSize = task.size
                                 val totalFragments = (frameSize + MAX_PAYLOAD - 1) / MAX_PAYLOAD
@@ -213,8 +308,8 @@ class UdpFecStreamer : IStreamer {
                                 }
 
                                 val taskBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
-                                val isLargeFrame = totalFragments > 4
-                                val paceNanos = if (isLargeFrame) 30_000L else 0L
+                                val totalFrameWireBytes = frameSize + (numFecGroups * MAX_PAYLOAD) + ((totalFragments + numFecGroups) * 28)
+                                val taskPacingRateBps = computePacingRateBps(totalFrameWireBytes, taskQueue.size)
 
                                 for (i in 0 until totalFragments) {
                                     val fragOffset = task.offset + i * MAX_PAYLOAD
@@ -249,7 +344,7 @@ class UdpFecStreamer : IStreamer {
                                         }
                                     }
 
-                                    // 1. Send Data Fragment
+                                    // 1. Send Data Fragment with Global Adaptive Pacer
                                     fragBuf.clear()
                                     fragBuf.putInt(0x55445056) // magic
                                     fragBuf.putInt(seq)
@@ -264,15 +359,10 @@ class UdpFecStreamer : IStreamer {
                                     fragBuf.put(task.data, fragOffset, length)
 
                                     reusablePacket.setData(fragData, 0, 28 + length)
-                                    sock.send(reusablePacket)
-
-                                    // Smooth micro-pacing per packet
-                                    if (paceNanos > 0 && i < totalFragments - 1) {
-                                        spinPacingNanos(paceNanos)
-                                    }
+                                    paceAndSend(sock, reusablePacket, length, taskPacingRateBps)
                                 }
 
-                                // 2. Send Interleaved FEC Parity Packets
+                                // 2. Send Interleaved FEC Parity Packets with Global Adaptive Pacer
                                 if (numFecGroups > 0) {
                                     for (g in 0 until numFecGroups) {
                                         if (!fecGroupInitialized[g]) continue
@@ -292,12 +382,15 @@ class UdpFecStreamer : IStreamer {
                                         packetBuf.put(fecPayloads[g], 0, MAX_PAYLOAD)
 
                                         reusablePacket.setData(packetBuf.array(), 0, 28 + MAX_PAYLOAD)
-                                        sock.send(reusablePacket)
-
-                                        if (paceNanos > 0 && g < numFecGroups - 1) {
-                                            spinPacingNanos(paceNanos)
-                                        }
+                                        paceAndSend(sock, reusablePacket, MAX_PAYLOAD, taskPacingRateBps)
                                     }
+                                }
+
+                                frameCount++
+                                val now = System.currentTimeMillis()
+                                if (now - lastLogTime >= 3000) {
+                                    lastLogTime = now
+                                    AppLogger.i(TAG, "Pacer Stats: frames=$frameCount, targetRate=${targetBitrateKbps}Kbps, activePacingRate=${taskPacingRateBps / 1000}Kbps, queue=${taskQueue.size}")
                                 }
                             }
                         } catch (e: Exception) {
@@ -383,13 +476,6 @@ class UdpFecStreamer : IStreamer {
         task.isStreamStop = true
         if (!taskQueue.offer(task)) {
             recycleTask(task)
-        }
-    }
-
-    private fun spinPacingNanos(nanos: Long) {
-        val target = System.nanoTime() + nanos
-        while (System.nanoTime() < target) {
-            Thread.onSpinWait()
         }
     }
     
