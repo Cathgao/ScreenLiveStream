@@ -32,7 +32,7 @@ data class VideoResolution(val displayName: String, val width: Int, val height: 
 }
 
 enum class BitrateMode(val displayName: String, val modeInt: Int) {
-    CBR("CBR 恒定码率 (推荐 - 运动画面不卡顿)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR),
+    CBR("CBR 恒定码率 (网络平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR),
     VBR("VBR 动态码率 (省资源)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR),
     CQ("CQ 恒定质量 (画质平稳)", MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
 }
@@ -45,7 +45,7 @@ enum class TransportProtocol(val displayName: String) {
 data class StreamConfig(
     val codec: VideoCodec = VideoCodec.H265,
     val bitrateKbps: Int = 16000, // 16 Mbps default
-    val bitrateMode: BitrateMode = BitrateMode.CBR, // CBR default for smooth motion without bitrate spikes
+    val bitrateMode: BitrateMode = BitrateMode.VBR, // VBR default
     val frameRate: Int = 0, // 0 = Match Native (72/90/120 FPS)
     val eyeCrop: EyeCrop = EyeCrop.BOTH,
     val resolution: VideoResolution = VideoResolution.DEFAULT,
@@ -195,8 +195,8 @@ data class EncoderCapabilities(
 data class ReceiverConfig(
     val listenPort: Int = 8888,
     val autoAnnounce: Boolean = true,
-    val lowLatencyMode: Boolean = true,
-    val jitterBufferMs: Int = 50,
+    val lowLatencyMode: Boolean = false,
+    val jitterBufferMs: Int = 2000,
     val protocol: TransportProtocol = TransportProtocol.UDP
 )
 

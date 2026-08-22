@@ -88,7 +88,7 @@ class TcpStreamer : IStreamer {
                         s.tcpNoDelay = true
                         s.sendBufferSize = 4 * 1024 * 1024
                         s.connect(InetSocketAddress(targetIp, targetPort), 3000)
-                        val dos = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 32 * 1024))
+                        val dos = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 512 * 1024))
                         socket = s
                         dataOutputStream = dos
                         SessionLog.i(TAG, "TCP Streamer connected successfully to $targetIp:$targetPort (sndBuf=${s.sendBufferSize})")

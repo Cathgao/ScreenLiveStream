@@ -97,14 +97,16 @@ class TcpReceiver : IReceiver {
                         currentClientSocket = clientSocket
                         
                         clientSocket.tcpNoDelay = true
-                        clientSocket.receiveBufferSize = 512 * 1024
+                        clientSocket.receiveBufferSize = 4 * 1024 * 1024
                         val clientIp = clientSocket.inetAddress.hostAddress
                         SessionLog.i(TAG, "TCP Receiver accepted stream connection from $clientIp")
 
                         kotlin.concurrent.thread(start = true, name = "TcpReceiverClientThread") {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
                             try {
-                                val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 32 * 1024))
+                                val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 512 * 1024))
                                 val headerBuf = ByteArray(20)
+                                var reusablePayloadBuf = ByteArray(512 * 1024)
 
                                 while (isListening && !clientSocket.isClosed && currentClientSocket == clientSocket) {
                                     if (totalReceivedFrames <= 5L) {
@@ -153,8 +155,11 @@ class TcpReceiver : IReceiver {
                                         break
                                     }
 
-                                    val payload = ByteArray(payloadSize)
-                                    dis.readFully(payload, 0, payloadSize)
+                                    if (reusablePayloadBuf.size < payloadSize) {
+                                        reusablePayloadBuf = ByteArray(Math.max(payloadSize, reusablePayloadBuf.size * 2))
+                                    }
+                                    dis.readFully(reusablePayloadBuf, 0, payloadSize)
+                                    val payload = reusablePayloadBuf.copyOf(payloadSize)
 
                                     totalBytesReceived += 20 + payloadSize
                                     windowBytesReceived += 20 + payloadSize

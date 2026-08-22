@@ -62,7 +62,14 @@ class LanDiscovery(private val context: Context? = null) {
         }
     }
 
+    private var cachedBroadcastAddrs: List<InetAddress> = emptyList()
+    private var lastBroadcastAddrRefresh = 0L
+
     private fun getBroadcastAddresses(): List<InetAddress> {
+        val now = System.currentTimeMillis()
+        if (cachedBroadcastAddrs.isNotEmpty() && now - lastBroadcastAddrRefresh < 30_000L) {
+            return cachedBroadcastAddrs
+        }
         val list = mutableListOf<InetAddress>()
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -82,7 +89,10 @@ class LanDiscovery(private val context: Context? = null) {
         try {
             list.add(InetAddress.getByName("255.255.255.255"))
         } catch (e: Exception) {}
-        return list.distinct()
+        val distinct = list.distinct()
+        cachedBroadcastAddrs = distinct
+        lastBroadcastAddrRefresh = now
+        return distinct
     }
 
     fun startScanning() {

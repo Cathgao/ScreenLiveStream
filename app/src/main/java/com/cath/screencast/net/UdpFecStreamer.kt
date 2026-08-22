@@ -121,8 +121,11 @@ class UdpFecStreamer : IStreamer {
         sendThread = thread(start = true, name = "UdpStreamerSendThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD).order(java.nio.ByteOrder.nativeOrder())
-            val fecPayload = ByteArray(MAX_PAYLOAD)
-            val fecBuf = ByteBuffer.wrap(fecPayload).order(java.nio.ByteOrder.nativeOrder())
+            val MAX_FEC_GROUPS = 64
+            val fecPayloads = Array(MAX_FEC_GROUPS) { ByteArray(MAX_PAYLOAD) }
+            val fecBufs = Array(MAX_FEC_GROUPS) { ByteBuffer.wrap(fecPayloads[it]).order(java.nio.ByteOrder.nativeOrder()) }
+            val fecGroupInitialized = BooleanArray(MAX_FEC_GROUPS)
+            val fecGroupLengths = IntArray(MAX_FEC_GROUPS)
 
             // Single fragment scratch buffer (frames are processed sequentially in this thread).
             val fragData = ByteArray(28 + MAX_PAYLOAD)
@@ -198,29 +201,51 @@ class UdpFecStreamer : IStreamer {
                                 if (task.codec == VideoCodec.H265) flags = flags or 4
                                 
                                 val seq = videoSeqCounter++
-                                var fecGroupId = 0
+                                val numFecGroups = if (totalFragments > 1) {
+                                    ((totalFragments + FEC_GROUP_SIZE - 1) / FEC_GROUP_SIZE).coerceIn(1, MAX_FEC_GROUPS)
+                                } else {
+                                    0
+                                }
+
+                                for (g in 0 until numFecGroups) {
+                                    fecGroupInitialized[g] = false
+                                    fecGroupLengths[g] = 0
+                                }
+
                                 val taskBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
-                                
+                                val isLargeFrame = totalFragments > 4
+                                val paceNanos = if (isLargeFrame) 30_000L else 0L
+
                                 for (i in 0 until totalFragments) {
                                     val fragOffset = task.offset + i * MAX_PAYLOAD
                                     val length = Math.min(MAX_PAYLOAD, frameSize - i * MAX_PAYLOAD)
 
-                                    // Fast 64-bit Long native XOR for FEC across FEC_GROUP_SIZE fragments
-                                    val groupIdx = i % FEC_GROUP_SIZE
-                                    if (groupIdx == 0) {
-                                        System.arraycopy(task.data, fragOffset, fecPayload, 0, length)
-                                        if (length < MAX_PAYLOAD) {
-                                            fecPayload.fill(0, length, MAX_PAYLOAD)
-                                        }
-                                    } else {
-                                        val longsCount = length ushr 3
-                                        for (k in 0 until longsCount) {
-                                            val pos = k shl 3
-                                            fecBuf.putLong(pos, fecBuf.getLong(pos) xor taskBuf.getLong(fragOffset + pos))
-                                        }
-                                        val remStart = longsCount shl 3
-                                        for (b in remStart until length) {
-                                            fecPayload[b] = (fecPayload[b].toInt() xor task.data[fragOffset + b].toInt()).toByte()
+                                    // Interleaved FEC: Map fragment i -> group (i % numFecGroups)
+                                    if (numFecGroups > 0) {
+                                        val g = i % numFecGroups
+                                        val fecPayload = fecPayloads[g]
+                                        val fecBuf = fecBufs[g]
+
+                                        if (!fecGroupInitialized[g]) {
+                                            System.arraycopy(task.data, fragOffset, fecPayload, 0, length)
+                                            if (length < MAX_PAYLOAD) {
+                                                fecPayload.fill(0, length, MAX_PAYLOAD)
+                                            }
+                                            fecGroupInitialized[g] = true
+                                            fecGroupLengths[g] = length
+                                        } else {
+                                            val longsCount = length ushr 3
+                                            for (k in 0 until longsCount) {
+                                                val pos = k shl 3
+                                                fecBuf.putLong(pos, fecBuf.getLong(pos) xor taskBuf.getLong(fragOffset + pos))
+                                            }
+                                            val remStart = longsCount shl 3
+                                            for (b in remStart until length) {
+                                                fecPayload[b] = (fecPayload[b].toInt() xor task.data[fragOffset + b].toInt()).toByte()
+                                            }
+                                            if (length > fecGroupLengths[g]) {
+                                                fecGroupLengths[g] = length
+                                            }
                                         }
                                     }
 
@@ -241,14 +266,16 @@ class UdpFecStreamer : IStreamer {
                                     reusablePacket.setData(fragData, 0, 28 + length)
                                     sock.send(reusablePacket)
 
-                                    // Sub-burst micro-pacing (25µs) to prevent Wi-Fi router AP queue overflow on large motion frames (>16 frags)
-                                    if (totalFragments > 16 && (i + 1) % 8 == 0 && (i + 1) < totalFragments) {
-                                        java.util.concurrent.locks.LockSupport.parkNanos(25_000)
+                                    // Smooth micro-pacing per packet
+                                    if (paceNanos > 0 && i < totalFragments - 1) {
+                                        spinPacingNanos(paceNanos)
                                     }
+                                }
 
-                                    // 2. Interleave FEC: emit FEC packet immediately upon group completion
-                                    val isEndOfGroup = (groupIdx == FEC_GROUP_SIZE - 1) || (i == totalFragments - 1)
-                                    if (isEndOfGroup && totalFragments > 1) {
+                                // 2. Send Interleaved FEC Parity Packets
+                                if (numFecGroups > 0) {
+                                    for (g in 0 until numFecGroups) {
+                                        if (!fecGroupInitialized[g]) continue
                                         packetBuf.clear()
                                         packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                         packetBuf.putInt(0x55445056)
@@ -256,17 +283,20 @@ class UdpFecStreamer : IStreamer {
                                         packetBuf.putLong(task.timestampMs)
                                         val fecFlags = flags or 8 // FEC flag
                                         packetBuf.put(fecFlags.toByte())
-                                        packetBuf.putShort(fecGroupId.toShort())
+                                        packetBuf.putShort(g.toShort()) // fragIndex = groupId
                                         packetBuf.putShort(totalFragments.toShort())
                                         packetBuf.putInt(frameSize)
                                         packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize = 10
                                         packetBuf.put(0.toByte())
                                         packetBuf.put(0.toByte()) // pad
-                                        packetBuf.put(fecPayload, 0, MAX_PAYLOAD)
+                                        packetBuf.put(fecPayloads[g], 0, MAX_PAYLOAD)
 
                                         reusablePacket.setData(packetBuf.array(), 0, 28 + MAX_PAYLOAD)
                                         sock.send(reusablePacket)
-                                        fecGroupId++
+
+                                        if (paceNanos > 0 && g < numFecGroups - 1) {
+                                            spinPacingNanos(paceNanos)
+                                        }
                                     }
                                 }
                             }

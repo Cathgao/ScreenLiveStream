@@ -13,4 +13,5 @@ interface IReceiver {
     
     fun start(port: Int)
     fun stop()
+    fun requestKeyframe() {}
 }
