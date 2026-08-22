@@ -116,6 +116,9 @@ class QuestReceiverService : Service() {
         videoDecoder.onVideoFrameRendered = { ptsMs ->
             audioDecoder.syncWithVideoPts(ptsMs)
         }
+        videoDecoder.onPlaybackAnchorSet = { wallTimeNs, ptsMs ->
+            audioDecoder.setPlaybackAnchor(wallTimeNs, ptsMs)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -164,6 +167,7 @@ class QuestReceiverService : Service() {
         stopListening()
         
         videoDecoder.jitterBufferMs = jitterBufferMs
+        audioDecoder.jitterBufferMs = jitterBufferMs
         audioDecoder.isLowLatencyMode = lowLatencyMode
         
         if (isRecordEnabled) {
@@ -327,6 +331,7 @@ class QuestReceiverService : Service() {
         
         currentReceiver.jitterBufferMs = jitterBufferMs
         videoDecoder.jitterBufferMs = jitterBufferMs
+        audioDecoder.jitterBufferMs = jitterBufferMs
         currentReceiver.start(port)
         if (autoAnnounce) {
             lanDiscovery.startAnnouncing(port, protocol)

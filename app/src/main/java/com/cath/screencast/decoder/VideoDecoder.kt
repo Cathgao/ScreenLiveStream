@@ -53,6 +53,7 @@ class VideoDecoder {
     var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
     var onRequestKeyframe: (() -> Unit)? = null
     var onVideoFrameRendered: ((ptsMs: Long) -> Unit)? = null
+    var onPlaybackAnchorSet: ((wallTimeNs: Long, ptsMs: Long) -> Unit)? = null
 
     private class DecodeTask {
         var data: ByteArray = ByteArray(0)
@@ -381,6 +382,7 @@ class VideoDecoder {
             while (isFeeding) {
                 try {
                     if (isPrebuffering) {
+                        val prebufferStartNs = System.nanoTime()
                         while (isFeeding && isPrebuffering) {
                             if (taskQueue.isEmpty()) {
                                 Thread.sleep(2)
@@ -389,11 +391,19 @@ class VideoDecoder {
                             val first = taskQueue.peek()
                             val last = taskQueue.lastOrNull()
                             val accumulatedMs = if (first != null && last != null) (last.timestampMs - first.timestampMs) else 0L
-                            val minFrames = if (targetJitterMs <= 50) 2 else 20
-                            if (accumulatedMs >= targetJitterMs || taskQueue.size >= minFrames) {
+                            val elapsedMs = (System.nanoTime() - prebufferStartNs) / 1_000_000L
+
+                            val isReady = if (targetJitterMs <= 50) {
+                                accumulatedMs >= targetJitterMs || taskQueue.size >= 2
+                            } else {
+                                accumulatedMs >= targetJitterMs || (elapsedMs >= targetJitterMs + 500L && accumulatedMs >= 100L)
+                            }
+
+                            if (isReady) {
                                 isPrebuffering = false
                                 anchorWallTimeNs = System.nanoTime()
                                 anchorPtsMs = first?.timestampMs ?: -1L
+                                onPlaybackAnchorSet?.invoke(anchorWallTimeNs, anchorPtsMs)
                                 AppLogger.i(TAG, "Video prebuffering complete (${taskQueue.size} frames, span=${accumulatedMs}ms, target=${targetJitterMs}ms). Starting smooth paced playback.")
                                 break
                             }
@@ -406,11 +416,13 @@ class VideoDecoder {
                         if (anchorPtsMs < 0) {
                             anchorPtsMs = task.timestampMs
                             anchorWallTimeNs = System.nanoTime()
+                            onPlaybackAnchorSet?.invoke(anchorWallTimeNs, anchorPtsMs)
                         }
                         val relPtsMs = task.timestampMs - anchorPtsMs
                         if (relPtsMs < 0 || relPtsMs > 3600000) {
                             anchorPtsMs = task.timestampMs
                             anchorWallTimeNs = System.nanoTime()
+                            onPlaybackAnchorSet?.invoke(anchorWallTimeNs, anchorPtsMs)
                         } else {
                             val targetTimeNs = anchorWallTimeNs + relPtsMs * 1_000_000L
                             val now = System.nanoTime()
@@ -498,16 +510,6 @@ class VideoDecoder {
         }
         lastTimestampMs = timestampMs
 
-        val finalBytes = if (isKeyframe && lastCodecConfigData != null && !containsParameterSets(frameBytes, isHevc)) {
-            val config = lastCodecConfigData!!
-            val combined = ByteArray(config.size + frameBytes.size)
-            System.arraycopy(config, 0, combined, 0, config.size)
-            System.arraycopy(frameBytes, 0, combined, config.size, frameBytes.size)
-            combined
-        } else {
-            frameBytes
-        }
-
         if (isKeyframe) {
             if (!hasReceivedFirstKeyframe) {
                 AppLogger.i(TAG, "First video Keyframe received (seq=$seq). Starting decoding!")
@@ -516,7 +518,7 @@ class VideoDecoder {
             referenceLost = false
             lastFrameSeq = seq
 
-            val dropThreshold = if (jitterBufferMs > 500) 250 else 60
+            val dropThreshold = if (jitterBufferMs > 500) 350 else 60
             if (taskQueue.size > dropThreshold) {
                 while (taskQueue.isNotEmpty()) {
                     val task = taskQueue.poll()
@@ -550,9 +552,18 @@ class VideoDecoder {
             notifyReferenceLost()
         }
 
-        val task = obtainTask(finalBytes.size)
-        System.arraycopy(finalBytes, 0, task.data, 0, finalBytes.size)
-        task.size = finalBytes.size
+        val needsConfig = isKeyframe && lastCodecConfigData != null && !containsParameterSets(frameBytes, isHevc)
+        val configBytes = if (needsConfig) lastCodecConfigData else null
+        val totalSize = (configBytes?.size ?: 0) + frameBytes.size
+
+        val task = obtainTask(totalSize)
+        if (configBytes != null) {
+            System.arraycopy(configBytes, 0, task.data, 0, configBytes.size)
+            System.arraycopy(frameBytes, 0, task.data, configBytes.size, frameBytes.size)
+        } else {
+            System.arraycopy(frameBytes, 0, task.data, 0, frameBytes.size)
+        }
+        task.size = totalSize
         task.isKeyframe = isKeyframe
         task.isCodecConfig = isCodecConfig
         task.isHevc = isHevc
