@@ -63,6 +63,8 @@ class UdpFecStreamer : IStreamer {
         taskPool.offer(task)
     }
 
+    private var recvThread: Thread? = null
+
     override fun start(targetIp: String, port: Int) {
         if (isStreaming) return
         isStreaming = true
@@ -81,7 +83,35 @@ class UdpFecStreamer : IStreamer {
                 socket = s
                 targetAddress = InetAddress.getByName(targetIp)
                 ready = true
-                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xB8)")
+                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xB8, FEC_GROUP_SIZE=$FEC_GROUP_SIZE)")
+
+                // Start control packet listener (IDR request / Ping echo) on stream socket
+                recvThread = thread(start = true, name = "UdpFecStreamerRecvThread") {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    val buf = ByteArray(128)
+                    val dp = DatagramPacket(buf, buf.size)
+                    while (isStreaming && !s.isClosed) {
+                        try {
+                            dp.length = buf.size
+                            s.receive(dp)
+                            val len = dp.length
+                            if (len >= PacketProtocol.HEADER_SIZE) {
+                                val probe = PacketProtocol.readProbeSequence(buf, len)
+                                if (probe != null) {
+                                    if (probe.isIdrRequest) {
+                                        AppLogger.i(TAG, "Received instant IDR Keyframe Request (PLI) on stream socket! Forcing keyframe...")
+                                        onRequestKeyframe?.invoke()
+                                    } else if (!probe.isReply) {
+                                        val reply = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
+                                        s.send(DatagramPacket(reply, reply.size, dp.address, dp.port))
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                            if (!isStreaming) break
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Error starting UDP streamer", e)
                 isStreaming = false
@@ -90,11 +120,11 @@ class UdpFecStreamer : IStreamer {
 
         sendThread = thread(start = true, name = "UdpStreamerSendThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD)
+            val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD).order(java.nio.ByteOrder.nativeOrder())
             val fecPayload = ByteArray(MAX_PAYLOAD)
-            val fecLongArray = LongArray(FEC_LONGS)
-            // Single fragment scratch buffer (frames are processed
-            // sequentially in this thread).
+            val fecBuf = ByteBuffer.wrap(fecPayload).order(java.nio.ByteOrder.nativeOrder())
+
+            // Single fragment scratch buffer (frames are processed sequentially in this thread).
             val fragData = ByteArray(28 + MAX_PAYLOAD)
             val fragBuf = ByteBuffer.wrap(fragData)
             val reusablePacket = DatagramPacket(fragData, 0)
@@ -119,6 +149,7 @@ class UdpFecStreamer : IStreamer {
                             } else if (task.isBeacon) {
                                 val flags = 64 // 64 = Beacon
                                 packetBuf.clear()
+                                packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                 packetBuf.putInt(0x55445056)
                                 packetBuf.putInt(0)
                                 packetBuf.putLong(0L)
@@ -143,6 +174,7 @@ class UdpFecStreamer : IStreamer {
                                 val seq = audioSeqCounter++
                                 
                                 packetBuf.clear()
+                                packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                 packetBuf.putInt(0x55445056)
                                 packetBuf.putInt(seq)
                                 packetBuf.putLong(task.timestampMs)
@@ -167,36 +199,29 @@ class UdpFecStreamer : IStreamer {
                                 
                                 val seq = videoSeqCounter++
                                 var fecGroupId = 0
+                                val taskBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
                                 
                                 for (i in 0 until totalFragments) {
                                     val fragOffset = task.offset + i * MAX_PAYLOAD
                                     val length = Math.min(MAX_PAYLOAD, frameSize - i * MAX_PAYLOAD)
 
-                                    // Accumulate FEC across FEC_GROUP_SIZE fragments using 64-bit Long SIMD operations
-                                    if (i % FEC_GROUP_SIZE == 0) {
-                                        fecLongArray.fill(0L)
-                                    }
-                                    val longsCount = length / 8
-                                    var srcIdx = fragOffset
-                                    for (k in 0 until longsCount) {
-                                        val word = ((task.data[srcIdx].toLong() and 0xFF) shl 56) or
-                                                   ((task.data[srcIdx + 1].toLong() and 0xFF) shl 48) or
-                                                   ((task.data[srcIdx + 2].toLong() and 0xFF) shl 40) or
-                                                   ((task.data[srcIdx + 3].toLong() and 0xFF) shl 32) or
-                                                   ((task.data[srcIdx + 4].toLong() and 0xFF) shl 24) or
-                                                   ((task.data[srcIdx + 5].toLong() and 0xFF) shl 16) or
-                                                   ((task.data[srcIdx + 6].toLong() and 0xFF) shl 8) or
-                                                   (task.data[srcIdx + 7].toLong() and 0xFF)
-                                        fecLongArray[k] = fecLongArray[k] xor word
-                                        srcIdx += 8
-                                    }
-                                    val rem = length % 8
-                                    if (rem > 0) {
-                                        var tailWord = 0L
-                                        for (b in 0 until rem) {
-                                            tailWord = tailWord or ((task.data[srcIdx + b].toLong() and 0xFF) shl ((7 - b) * 8))
+                                    // Fast 64-bit Long native XOR for FEC across FEC_GROUP_SIZE fragments
+                                    val groupIdx = i % FEC_GROUP_SIZE
+                                    if (groupIdx == 0) {
+                                        System.arraycopy(task.data, fragOffset, fecPayload, 0, length)
+                                        if (length < MAX_PAYLOAD) {
+                                            fecPayload.fill(0, length, MAX_PAYLOAD)
                                         }
-                                        fecLongArray[longsCount] = fecLongArray[longsCount] xor tailWord
+                                    } else {
+                                        val longsCount = length ushr 3
+                                        for (k in 0 until longsCount) {
+                                            val pos = k shl 3
+                                            fecBuf.putLong(pos, fecBuf.getLong(pos) xor taskBuf.getLong(fragOffset + pos))
+                                        }
+                                        val remStart = longsCount shl 3
+                                        for (b in remStart until length) {
+                                            fecPayload[b] = (fecPayload[b].toInt() xor task.data[fragOffset + b].toInt()).toByte()
+                                        }
                                     }
 
                                     // 1. Send Data Fragment
@@ -208,7 +233,7 @@ class UdpFecStreamer : IStreamer {
                                     fragBuf.putShort(i.toShort())
                                     fragBuf.putShort(totalFragments.toShort())
                                     fragBuf.putInt(frameSize)
-                                    fragBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
+                                    fragBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize = 10
                                     fragBuf.put(0.toByte())
                                     fragBuf.put(0.toByte()) // pad to 28 bytes
                                     fragBuf.put(task.data, fragOffset, length)
@@ -222,28 +247,10 @@ class UdpFecStreamer : IStreamer {
                                     }
 
                                     // 2. Interleave FEC: emit FEC packet immediately upon group completion
-                                    val isEndOfGroup = ((i + 1) % FEC_GROUP_SIZE == 0) || (i == totalFragments - 1)
-                                    if (isEndOfGroup) {
-                                        for (k in 0 until FEC_LONGS) {
-                                            val word = fecLongArray[k]
-                                            val byteOffset = k * 8
-                                            if (byteOffset + 7 < MAX_PAYLOAD) {
-                                                fecPayload[byteOffset] = (word ushr 56).toByte()
-                                                fecPayload[byteOffset + 1] = (word ushr 48).toByte()
-                                                fecPayload[byteOffset + 2] = (word ushr 40).toByte()
-                                                fecPayload[byteOffset + 3] = (word ushr 32).toByte()
-                                                fecPayload[byteOffset + 4] = (word ushr 24).toByte()
-                                                fecPayload[byteOffset + 5] = (word ushr 16).toByte()
-                                                fecPayload[byteOffset + 6] = (word ushr 8).toByte()
-                                                fecPayload[byteOffset + 7] = (word and 0xFF).toByte()
-                                            } else {
-                                                for (b in 0 until (MAX_PAYLOAD - byteOffset)) {
-                                                    fecPayload[byteOffset + b] = (word ushr ((7 - b) * 8)).toByte()
-                                                }
-                                            }
-                                        }
-
+                                    val isEndOfGroup = (groupIdx == FEC_GROUP_SIZE - 1) || (i == totalFragments - 1)
+                                    if (isEndOfGroup && totalFragments > 1) {
                                         packetBuf.clear()
+                                        packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                         packetBuf.putInt(0x55445056)
                                         packetBuf.putInt(seq)
                                         packetBuf.putLong(task.timestampMs)
@@ -252,10 +259,10 @@ class UdpFecStreamer : IStreamer {
                                         packetBuf.putShort(fecGroupId.toShort())
                                         packetBuf.putShort(totalFragments.toShort())
                                         packetBuf.putInt(frameSize)
-                                        packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
+                                        packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize = 10
                                         packetBuf.put(0.toByte())
                                         packetBuf.put(0.toByte()) // pad
-                                        packetBuf.put(fecPayload)
+                                        packetBuf.put(fecPayload, 0, MAX_PAYLOAD)
 
                                         reusablePacket.setData(packetBuf.array(), 0, 28 + MAX_PAYLOAD)
                                         sock.send(reusablePacket)
@@ -359,6 +366,8 @@ class UdpFecStreamer : IStreamer {
     override fun stop() {
         isStreaming = false
         ready = false
+        recvThread?.interrupt()
+        recvThread = null
         sendThread?.interrupt()
         val sendThreadRef = sendThread
         if (sendThreadRef != null && sendThreadRef.isAlive) {

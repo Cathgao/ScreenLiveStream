@@ -164,22 +164,29 @@ object PacketProtocol {
                           ((data[5].toInt() and 0xFF) shl 16) or
                           ((data[6].toInt() and 0xFF) shl 8) or
                           (data[7].toInt() and 0xFF)
-                ProbeType(isReply = false, seq = seq, echoedNanos = 0L, isIdrRequest = false)
+                val echoedNanos = ((data[HEADER_SIZE].toLong() and 0xFFL) shl 56) or
+                                  ((data[HEADER_SIZE + 1].toLong() and 0xFFL) shl 48) or
+                                  ((data[HEADER_SIZE + 2].toLong() and 0xFFL) shl 40) or
+                                  ((data[HEADER_SIZE + 3].toLong() and 0xFFL) shl 32) or
+                                  ((data[HEADER_SIZE + 4].toLong() and 0xFFL) shl 24) or
+                                  ((data[HEADER_SIZE + 5].toLong() and 0xFFL) shl 16) or
+                                  ((data[HEADER_SIZE + 6].toLong() and 0xFFL) shl 8) or
+                                  (data[HEADER_SIZE + 7].toLong() and 0xFFL)
+                ProbeType(isReply = false, seq = seq, echoedNanos = echoedNanos, isIdrRequest = false)
             }
             (flags and FLAG_PING_REPLY.toInt()) != 0 -> {
                 val seq = ((data[4].toInt() and 0xFF) shl 24) or
                           ((data[5].toInt() and 0xFF) shl 16) or
                           ((data[6].toInt() and 0xFF) shl 8) or
                           (data[7].toInt() and 0xFF)
-                // skip 8B wall-clock field after frameSeq, echoedNanos starts at byte index 16
-                val echoedNanos = ((data[16].toLong() and 0xFFL) shl 56) or
-                                  ((data[17].toLong() and 0xFFL) shl 48) or
-                                  ((data[18].toLong() and 0xFFL) shl 40) or
-                                  ((data[19].toLong() and 0xFFL) shl 32) or
-                                  ((data[20].toLong() and 0xFFL) shl 24) or
-                                  ((data[21].toLong() and 0xFFL) shl 16) or
-                                  ((data[22].toLong() and 0xFFL) shl 8) or
-                                  (data[23].toLong() and 0xFFL)
+                val echoedNanos = ((data[HEADER_SIZE].toLong() and 0xFFL) shl 56) or
+                                  ((data[HEADER_SIZE + 1].toLong() and 0xFFL) shl 48) or
+                                  ((data[HEADER_SIZE + 2].toLong() and 0xFFL) shl 40) or
+                                  ((data[HEADER_SIZE + 3].toLong() and 0xFFL) shl 32) or
+                                  ((data[HEADER_SIZE + 4].toLong() and 0xFFL) shl 24) or
+                                  ((data[HEADER_SIZE + 5].toLong() and 0xFFL) shl 16) or
+                                  ((data[HEADER_SIZE + 6].toLong() and 0xFFL) shl 8) or
+                                  (data[HEADER_SIZE + 7].toLong() and 0xFFL)
                 ProbeType(isReply = true, seq = seq, echoedNanos = echoedNanos, isIdrRequest = false)
             }
             else -> null
@@ -190,21 +197,38 @@ object PacketProtocol {
      * Read the payload of a FLAG_PING_STATS beacon. Returns
      * (rttMs, lossPercent×100) where lossPercent×100 is an integer
      * in [0..10000] → divide by 100f to get the percentage.
+     * Supports both 22-byte QC and 28-byte UDPV formats.
      */
     fun readPingStatsPayload(data: ByteArray, length: Int): Pair<Int, Int>? {
-        if (length < HEADER_SIZE + 8) return null
-        if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
-        val flags = data[3].toInt() and 0xFF
-        if ((flags and FLAG_PING_STATS.toInt()) == 0) return null
-        val rttMs = (((data[HEADER_SIZE].toInt() and 0xFF) shl 24) or
-                    ((data[HEADER_SIZE + 1].toInt() and 0xFF) shl 16) or
-                    ((data[HEADER_SIZE + 2].toInt() and 0xFF) shl 8) or
-                    (data[HEADER_SIZE + 3].toInt() and 0xFF)) and 0x7FFFFFFF
-        val lossBps = (((data[HEADER_SIZE + 4].toInt() and 0xFF) shl 24) or
-                      ((data[HEADER_SIZE + 5].toInt() and 0xFF) shl 16) or
-                      ((data[HEADER_SIZE + 6].toInt() and 0xFF) shl 8) or
-                      (data[HEADER_SIZE + 7].toInt() and 0xFF)) and 0x7FFFFFFF
-        return Pair(rttMs, lossBps)
+        if (length >= HEADER_SIZE + 8 && data[0] == MAGIC_0 && data[1] == MAGIC_1) {
+            val flags = data[3].toInt() and 0xFF
+            if ((flags and FLAG_PING_STATS.toInt()) != 0) {
+                val rttMs = (((data[HEADER_SIZE].toInt() and 0xFF) shl 24) or
+                            ((data[HEADER_SIZE + 1].toInt() and 0xFF) shl 16) or
+                            ((data[HEADER_SIZE + 2].toInt() and 0xFF) shl 8) or
+                            (data[HEADER_SIZE + 3].toInt() and 0xFF)) and 0x7FFFFFFF
+                val lossBps = (((data[HEADER_SIZE + 4].toInt() and 0xFF) shl 24) or
+                              ((data[HEADER_SIZE + 5].toInt() and 0xFF) shl 16) or
+                              ((data[HEADER_SIZE + 6].toInt() and 0xFF) shl 8) or
+                              (data[HEADER_SIZE + 7].toInt() and 0xFF)) and 0x7FFFFFFF
+                return Pair(rttMs, lossBps)
+            }
+        }
+        if (length >= 28 + 8 && data[0] == 'U'.code.toByte() && data[1] == 'D'.code.toByte() && data[2] == 'P'.code.toByte() && data[3] == 'V'.code.toByte()) {
+            val flags = data[16].toInt() and 0xFF
+            if ((flags and 64) != 0) {
+                val rttMs = (((data[28].toInt() and 0xFF) shl 24) or
+                            ((data[29].toInt() and 0xFF) shl 16) or
+                            ((data[30].toInt() and 0xFF) shl 8) or
+                            (data[31].toInt() and 0xFF)) and 0x7FFFFFFF
+                val lossBps = (((data[32].toInt() and 0xFF) shl 24) or
+                              ((data[33].toInt() and 0xFF) shl 16) or
+                              ((data[34].toInt() and 0xFF) shl 8) or
+                              (data[35].toInt() and 0xFF)) and 0x7FFFFFFF
+                return Pair(rttMs, lossBps)
+            }
+        }
+        return null
     }
 
     /** Build a sender-side beacon carrying the latest rolling RTT and
