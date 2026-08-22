@@ -30,7 +30,7 @@ class UdpFecStreamer(
     private var ready = false
 
     private val MAX_PAYLOAD = 1300
-    private val FEC_GROUP_SIZE = 10
+    private val FEC_GROUP_SIZE = 8
     private val FEC_LONGS = (MAX_PAYLOAD + 7) / 8
     
     override var onRequestKeyframe: (() -> Unit)? = null
@@ -81,35 +81,37 @@ class UdpFecStreamer(
 
     // Pacer state: scheduled nanosecond timestamp when next packet may be transmitted
     private var nextSendTimeNs = 0L
+    private val BURST_WINDOW_NS = 500_000L // 0.5ms burst credit (~6KB burst headroom to protect Wi-Fi hardware FIFO)
 
     /**
      * Dynamically computes the target pacing transmission rate (in bits per second) for a frame or task.
-     * Incorporates baseline rate (1.25x headroom) and adapts for large keyframes or congested queues.
+     * Incorporates baseline rate (2.5x headroom) and adapts for large keyframes or congested queues.
      */
     private fun computePacingRateBps(frameTotalWireBytes: Int, queueDepth: Int): Long {
         val bitrateBps = targetBitrateKbps.toLong() * 1000L
         val fps = targetFps.coerceIn(30, 144)
         val frameIntervalMs = (1000f / fps).coerceAtLeast(6f)
 
-        // Baseline pacing rate: 1.25x target bitrate with a 4 Mbps floor
-        val basePacingRateBps = maxOf(4_000_000L, (bitrateBps * 1.25).toLong())
-        // Absolute maximum burst rate ceiling to prevent Wi-Fi AP downlink queue overflow (capped at 150 Mbps)
-        val maxPacingRateBps = maxOf(80_000_000L, minOf(150_000_000L, (bitrateBps * 2.5).toLong()))
+        // Baseline pacing rate: 2.5x target bitrate with a 50 Mbps floor
+        val basePacingRateBps = maxOf(50_000_000L, (bitrateBps * 2.5).toLong())
+        // Burst rate ceiling (up to 200 Mbps)
+        val maxPacingRateBps = maxOf(100_000_000L, minOf(200_000_000L, (bitrateBps * 4.0).toLong()))
 
-        val isLargeOrCongested = frameTotalWireBytes > 30 * 1024 || queueDepth > 0
+        val isLargeOrCongested = frameTotalWireBytes > 40 * 1024 || queueDepth > 0
         if (!isLargeOrCongested) {
             return basePacingRateBps
         }
 
-        // Target drain time: 70% of frame duration, clamped between 5ms and 12ms
-        val targetDrainSec = ((frameIntervalMs * 0.70f).coerceIn(5f, 12f)) / 1000.0
+        // Target drain time: 50% of frame duration, clamped between 3ms and 10ms
+        val targetDrainSec = ((frameIntervalMs * 0.50f).coerceIn(3f, 10f)) / 1000.0
         val neededDrainRateBps = (frameTotalWireBytes * 8L / targetDrainSec).toLong()
 
         return neededDrainRateBps.coerceIn(basePacingRateBps, maxPacingRateBps)
     }
 
     /**
-     * Micro-paces and transmits a single UDP datagram with sub-microsecond precision.
+     * Token Bucket / Burst Pacer: transmits a UDP datagram while honoring burst credit
+     * and avoiding syscall duration accumulation.
      */
     private fun paceAndSend(
         sock: DatagramSocket,
@@ -118,10 +120,10 @@ class UdpFecStreamer(
         pacingRateBps: Long
     ) {
         val nowNs = System.nanoTime()
-        // Prevent massive catch-up bursts after idle period between frames (clamp max idle credit to 50µs)
-        val maxLagNs = 50_000L
-        if (nextSendTimeNs < nowNs - maxLagNs) {
-            nextSendTimeNs = nowNs - maxLagNs
+        // Clamp nextSendTimeNs so idle gaps between frames provide burst credit up to BURST_WINDOW_NS
+        val minAllowedTimeNs = nowNs - BURST_WINDOW_NS
+        if (nextSendTimeNs < minAllowedTimeNs) {
+            nextSendTimeNs = minAllowedTimeNs
         }
 
         val waitNanos = nextSendTimeNs - nowNs
@@ -133,9 +135,10 @@ class UdpFecStreamer(
 
         // Account for total on-the-wire UDP frame: payload + 28 bytes IP/UDP headers
         val totalWireBytes = payloadSize + 28
-        val packetIntervalNanos = (totalWireBytes * 8L * 1_000_000_000L) / pacingRateBps.coerceAtLeast(1_000_000L)
+        val packetIntervalNanos = (totalWireBytes * 8L * 1_000_000_000L) / pacingRateBps.coerceAtLeast(10_000_000L)
         
-        nextSendTimeNs = maxOf(nextSendTimeNs, System.nanoTime()) + packetIntervalNanos
+        // Virtual schedule progression: advances time without stacking syscall latency
+        nextSendTimeNs += packetIntervalNanos
     }
 
     /**
@@ -168,12 +171,12 @@ class UdpFecStreamer(
                 val s = DatagramSocket()
                 s.sendBufferSize = 8 * 1024 * 1024
                 try {
-                    s.trafficClass = 0xB8 // DSCP EF (Expedited Forwarding) -> WMM AC_VO (Highest priority Wi-Fi EDCA queue)
+                    s.trafficClass = 0xA0 // DSCP AF41 -> WMM AC_VI (Video Access Category, 256-packet buffer, prevents Voice queue tail-drops)
                 } catch (_: Exception) {}
                 socket = s
                 targetAddress = InetAddress.getByName(targetIp)
                 ready = true
-                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xB8, FEC_GROUP_SIZE=$FEC_GROUP_SIZE, targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps)")
+                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xA0 AC_VI, FEC_GROUP_SIZE=$FEC_GROUP_SIZE, targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps)")
 
                 // Start control packet listener (IDR request / Ping echo) on stream socket
                 recvThread = thread(start = true, name = "UdpFecStreamerRecvThread") {
@@ -240,7 +243,7 @@ class UdpFecStreamer(
                                 packetBuf.put(PacketProtocol.buildStreamStopPacket())
                                 reusablePacket.setData(packetBuf.array(), 0, PacketProtocol.HEADER_SIZE)
                                 for (i in 0 until 10) {
-                                    paceAndSend(sock, reusablePacket, PacketProtocol.HEADER_SIZE, 8_000_000L)
+                                    sock.send(reusablePacket)
                                 }
                             } else if (task.isBeacon) {
                                 val flags = 64 // 64 = Beacon
@@ -262,8 +265,7 @@ class UdpFecStreamer(
                                 packetBuf.putInt(lossBp)
                                 
                                 reusablePacket.setData(packetBuf.array(), 0, 28 + 8)
-                                val pacingRate = computePacingRateBps(36, taskQueue.size)
-                                paceAndSend(sock, reusablePacket, 8, pacingRate)
+                                sock.send(reusablePacket)
                             } else if (task.isAudio) {
                                 var flags = 16 // 16 = Audio
                                 if (task.isCodecConfig) flags = flags or 32
@@ -285,8 +287,7 @@ class UdpFecStreamer(
                                 packetBuf.put(task.data, 0, task.size)
                                 
                                 reusablePacket.setData(packetBuf.array(), 0, 28 + task.size)
-                                val pacingRate = computePacingRateBps(task.size + 28, taskQueue.size)
-                                paceAndSend(sock, reusablePacket, task.size, pacingRate)
+                                sock.send(reusablePacket)
                             } else {
                                 val frameSize = task.size
                                 val totalFragments = (frameSize + MAX_PAYLOAD - 1) / MAX_PAYLOAD
@@ -302,20 +303,19 @@ class UdpFecStreamer(
                                     0
                                 }
 
-                                for (g in 0 until numFecGroups) {
-                                    fecGroupInitialized[g] = false
-                                    fecGroupLengths[g] = 0
-                                }
-
                                 val taskBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
                                 val totalFrameWireBytes = frameSize + (numFecGroups * MAX_PAYLOAD) + ((totalFragments + numFecGroups) * 28)
                                 val taskPacingRateBps = computePacingRateBps(totalFrameWireBytes, taskQueue.size)
 
+                                for (g in 0 until numFecGroups) {
+                                    fecGroupInitialized[g] = false
+                                }
+
+                                // 1. Send all data fragments and accumulate Interleaved XOR parity: group = i % numFecGroups
                                 for (i in 0 until totalFragments) {
                                     val fragOffset = task.offset + i * MAX_PAYLOAD
                                     val length = Math.min(MAX_PAYLOAD, frameSize - i * MAX_PAYLOAD)
 
-                                    // Interleaved FEC: Map fragment i -> group (i % numFecGroups)
                                     if (numFecGroups > 0) {
                                         val g = i % numFecGroups
                                         val fecPayload = fecPayloads[g]
@@ -327,7 +327,6 @@ class UdpFecStreamer(
                                                 fecPayload.fill(0, length, MAX_PAYLOAD)
                                             }
                                             fecGroupInitialized[g] = true
-                                            fecGroupLengths[g] = length
                                         } else {
                                             val longsCount = length ushr 3
                                             for (k in 0 until longsCount) {
@@ -338,13 +337,9 @@ class UdpFecStreamer(
                                             for (b in remStart until length) {
                                                 fecPayload[b] = (fecPayload[b].toInt() xor task.data[fragOffset + b].toInt()).toByte()
                                             }
-                                            if (length > fecGroupLengths[g]) {
-                                                fecGroupLengths[g] = length
-                                            }
                                         }
                                     }
 
-                                    // 1. Send Data Fragment with Global Adaptive Pacer
                                     fragBuf.clear()
                                     fragBuf.putInt(0x55445056) // magic
                                     fragBuf.putInt(seq)
@@ -353,7 +348,7 @@ class UdpFecStreamer(
                                     fragBuf.putShort(i.toShort())
                                     fragBuf.putShort(totalFragments.toShort())
                                     fragBuf.putInt(frameSize)
-                                    fragBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize = 10
+                                    fragBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
                                     fragBuf.put(0.toByte())
                                     fragBuf.put(0.toByte()) // pad to 28 bytes
                                     fragBuf.put(task.data, fragOffset, length)
@@ -362,7 +357,7 @@ class UdpFecStreamer(
                                     paceAndSend(sock, reusablePacket, length, taskPacingRateBps)
                                 }
 
-                                // 2. Send Interleaved FEC Parity Packets with Global Adaptive Pacer
+                                // 2. Send Interleaved FEC Parity Packets immediately following data fragments
                                 if (numFecGroups > 0) {
                                     for (g in 0 until numFecGroups) {
                                         if (!fecGroupInitialized[g]) continue
@@ -376,7 +371,7 @@ class UdpFecStreamer(
                                         packetBuf.putShort(g.toShort()) // fragIndex = groupId
                                         packetBuf.putShort(totalFragments.toShort())
                                         packetBuf.putInt(frameSize)
-                                        packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize = 10
+                                        packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
                                         packetBuf.put(0.toByte())
                                         packetBuf.put(0.toByte()) // pad
                                         packetBuf.put(fecPayloads[g], 0, MAX_PAYLOAD)

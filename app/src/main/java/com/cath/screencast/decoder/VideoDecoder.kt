@@ -80,7 +80,12 @@ class VideoDecoder {
         taskPool.offer(task)
     }
 
+    private var lastIdrRequestTime = 0L
+
     fun notifyReferenceLost() {
+        val now = System.currentTimeMillis()
+        if (now - lastIdrRequestTime < 400L) return
+        lastIdrRequestTime = now
         // Request IDR Keyframe instantly from sender without dropping all subsequent frames
         AppLogger.w(TAG, "Reference loss / gap detected. Requesting IDR Keyframe from sender.")
         onRequestKeyframe?.invoke()
@@ -467,9 +472,13 @@ class VideoDecoder {
                             AppLogger.w(TAG, "Input buffer unavailable after timeout on seq=${task.seq}. Requesting IDR keyframe.")
                             notifyReferenceLost()
                         }
+                    } catch (e: InterruptedException) {
+                        break
                     } catch (e: Exception) {
-                        AppLogger.e(TAG, "Error decoding frame seq=${task.seq}", e)
-                        notifyReferenceLost()
+                        if (isFeeding) {
+                            AppLogger.e(TAG, "Error decoding frame seq=${task.seq}", e)
+                            notifyReferenceLost()
+                        }
                     }
                     recycleTask(task)
                 } catch (e: InterruptedException) {
