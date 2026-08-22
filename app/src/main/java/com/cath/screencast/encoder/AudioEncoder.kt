@@ -122,6 +122,7 @@ class AudioEncoder(
             // Read standard AAC frame chunk size: 1024 samples * 2 channels * 2 bytes = 4096 bytes (~21.3ms per read)
             val pcmChunkSize = 4096
             val audioBuffer = ByteArray(pcmChunkSize)
+            var aacTempBuffer = ByteArray(4096)
             val bufferInfo = MediaCodec.BufferInfo()
             var audioFrameCount = 0L
 
@@ -157,9 +158,11 @@ class AudioEncoder(
                                 onEncodedSample?.invoke(outputBuffer, bufferInfo)
                                 val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
 
-                                val data = ByteArray(bufferInfo.size)
+                                if (aacTempBuffer.size < bufferInfo.size) {
+                                    aacTempBuffer = ByteArray(bufferInfo.size * 2)
+                                }
                                 outputBuffer.position(bufferInfo.offset)
-                                outputBuffer.get(data)
+                                outputBuffer.get(aacTempBuffer, 0, bufferInfo.size)
 
                                 val rawPtsUs = bufferInfo.presentationTimeUs
                                 if (audioStartPtsUs < 0L && rawPtsUs > 0L) {
@@ -175,14 +178,14 @@ class AudioEncoder(
 
                                 if (isConfig) {
                                     AppLogger.i(TAG, "Audio Encoder produced AAC CodecConfig, size: ${bufferInfo.size} bytes")
-                                    tcpStreamer?.sendAudioFrame(data, data.size, networkPtsMs, true)
+                                    tcpStreamer?.sendAudioFrame(aacTempBuffer, bufferInfo.size, networkPtsMs, true)
                                 } else {
                                     audioFrameCount++
                                     if (audioFrameCount == 1L || audioFrameCount % 200L == 0L) {
                                         AppLogger.i(TAG, "Audio Encoder captured & encoded AAC frame #$audioFrameCount, size: ${bufferInfo.size} bytes, rawPtsUs=$rawPtsUs, networkPtsMs=$networkPtsMs")
                                     }
 
-                                    tcpStreamer?.sendAudioFrame(data, data.size, networkPtsMs, false)
+                                    tcpStreamer?.sendAudioFrame(aacTempBuffer, bufferInfo.size, networkPtsMs, false)
                                 }
                             }
                             codec.releaseOutputBuffer(outputBufferIndex, false)

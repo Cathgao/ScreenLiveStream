@@ -52,6 +52,7 @@ class VideoDecoder {
 
     var onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
     var onRequestKeyframe: (() -> Unit)? = null
+    var onVideoFrameRendered: ((ptsMs: Long) -> Unit)? = null
 
     private class DecodeTask {
         var data: ByteArray = ByteArray(0)
@@ -63,7 +64,7 @@ class VideoDecoder {
         var seq: Int = 0
     }
 
-    private val taskQueue = ArrayBlockingQueue<DecodeTask>(60) // Max 60 frames in queue (~1 sec at 60fps)
+    private val taskQueue = ArrayBlockingQueue<DecodeTask>(400) // Max 400 frames in queue (~3.5-5.5 sec)
     private val taskPool = ConcurrentLinkedQueue<DecodeTask>()
 
     private fun obtainTask(minSize: Int): DecodeTask {
@@ -79,12 +80,8 @@ class VideoDecoder {
     }
 
     fun notifyReferenceLost() {
-        referenceLost = true
-        while (taskQueue.isNotEmpty()) {
-            val task = taskQueue.poll()
-            if (task != null) recycleTask(task)
-        }
-        AppLogger.w(TAG, "Reference frame lost notified! Dropped queued frames. Requesting IDR Keyframe.")
+        // Request IDR Keyframe instantly from sender without dropping all subsequent frames
+        AppLogger.w(TAG, "Reference loss / gap detected. Requesting IDR Keyframe from sender.")
         onRequestKeyframe?.invoke()
     }
 
@@ -131,6 +128,8 @@ class VideoDecoder {
             }
             try {
                 format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                format.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
+                format.setInteger("low-latency", 1)
             } catch (_: Exception) {}
 
             if (codecConfigData != null && codecConfigData.isNotEmpty()) {
@@ -317,49 +316,24 @@ class VideoDecoder {
         return false
     }
 
-    @Volatile
-    var receiverStartNs = 0L
-    @Volatile
-    var streamStartPtsUs = 0L
-
     private fun startDrainThread(mc: MediaCodec) {
         stopDrainThread()
         isDraining = true
         drainThread = kotlin.concurrent.thread(start = true, name = "VideoDecoderDrainThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val bufferInfo = MediaCodec.BufferInfo()
             while (isDraining) {
                 try {
                     var outputIndex = mc.dequeueOutputBuffer(bufferInfo, 10_000)
                     while (outputIndex >= 0 && isDraining) {
                         val doRender = bufferInfo.size != 0
-                        if (doRender) {
-                            if (jitterBufferMs <= 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || receiverStartNs == 0L) {
-                                // Direct ultra-low-latency mode: immediately release buffer to surface
-                                mc.releaseOutputBuffer(outputIndex, true)
-                            } else {
-                                val deltaUs = bufferInfo.presentationTimeUs - streamStartPtsUs
-                                val targetBufferNs = (jitterBufferMs * 1_000_000L).coerceIn(10_000_000L, 200_000_000L)
-                                val renderTimeNs = receiverStartNs + deltaUs * 1000L
-                                val now = System.nanoTime()
-
-                                val scheduledTimeNs = if (renderTimeNs < now) {
-                                    // Frame arrived late, smoothly catch up without pushing whole buffer forward
-                                    receiverStartNs = now - deltaUs * 1000L + (targetBufferNs / 2)
-                                    now
-                                } else if (renderTimeNs > now + targetBufferNs * 3) {
-                                    // Timestamp jump or drift -> smoothly re-anchor
-                                    receiverStartNs = now - deltaUs * 1000L + targetBufferNs
-                                    now + targetBufferNs
-                                } else {
-                                    renderTimeNs
-                                }
-
-                                mc.releaseOutputBuffer(outputIndex, scheduledTimeNs)
-                            }
-                        } else {
-                            mc.releaseOutputBuffer(outputIndex, false)
+                        // Always release output buffer immediately to present frame
+                        mc.releaseOutputBuffer(outputIndex, doRender)
+                        val ptsMs = bufferInfo.presentationTimeUs / 1000L
+                        if (doRender && ptsMs > 0) {
+                            onVideoFrameRendered?.invoke(ptsMs)
                         }
-                        outputIndex = mc.dequeueOutputBuffer(bufferInfo, 10_000)
+                        outputIndex = mc.dequeueOutputBuffer(bufferInfo, 0)
                     }
                     if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         try {
@@ -398,10 +372,61 @@ class VideoDecoder {
         stopFeedThread()
         isFeeding = true
         feedThread = thread(start = true, name = "VideoDecoderFeedThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            val targetJitterMs = if (jitterBufferMs > 0) jitterBufferMs else 25
+            var isPrebuffering = true
+            var anchorWallTimeNs = 0L
+            var anchorPtsMs = -1L
+
             while (isFeeding) {
                 try {
+                    if (isPrebuffering) {
+                        while (isFeeding && isPrebuffering) {
+                            if (taskQueue.isEmpty()) {
+                                Thread.sleep(2)
+                                continue
+                            }
+                            val first = taskQueue.peek()
+                            val last = taskQueue.lastOrNull()
+                            val accumulatedMs = if (first != null && last != null) (last.timestampMs - first.timestampMs) else 0L
+                            val minFrames = if (targetJitterMs <= 50) 2 else 20
+                            if (accumulatedMs >= targetJitterMs || taskQueue.size >= minFrames) {
+                                isPrebuffering = false
+                                anchorWallTimeNs = System.nanoTime()
+                                anchorPtsMs = first?.timestampMs ?: -1L
+                                AppLogger.i(TAG, "Video prebuffering complete (${taskQueue.size} frames, span=${accumulatedMs}ms, target=${targetJitterMs}ms). Starting smooth paced playback.")
+                                break
+                            }
+                            Thread.sleep(2)
+                        }
+                    }
+
                     val task = taskQueue.take()
                     try {
+                        if (anchorPtsMs < 0) {
+                            anchorPtsMs = task.timestampMs
+                            anchorWallTimeNs = System.nanoTime()
+                        }
+                        val relPtsMs = task.timestampMs - anchorPtsMs
+                        if (relPtsMs < 0 || relPtsMs > 3600000) {
+                            anchorPtsMs = task.timestampMs
+                            anchorWallTimeNs = System.nanoTime()
+                        } else {
+                            val targetTimeNs = anchorWallTimeNs + relPtsMs * 1_000_000L
+                            val now = System.nanoTime()
+                            val waitNs = targetTimeNs - now
+                            if (waitNs > 0) {
+                                val waitMs = waitNs / 1_000_000L
+                                val waitRemainderNs = (waitNs % 1_000_000L).toInt()
+                                if (waitMs > 0 || waitRemainderNs > 0) {
+                                    Thread.sleep(waitMs, waitRemainderNs)
+                                }
+                            } else if (waitNs < -150_000_000L) {
+                                // If fell behind by >150ms, advance wall clock anchor to catch up immediately
+                                anchorWallTimeNs = now - relPtsMs * 1_000_000L
+                            }
+                        }
+
                         var inputIndex = mc.dequeueInputBuffer(10_000)
                         var retryCount = 0
                         while (inputIndex < 0 && retryCount < 50 && isFeeding) {
@@ -417,11 +442,6 @@ class VideoDecoder {
 
                                 val flags = if (task.isKeyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
                                 val ptsUs = if (task.timestampMs >= 0) task.timestampMs * 1000L else System.nanoTime() / 1000L
-
-                                if (receiverStartNs == 0L) {
-                                    receiverStartNs = System.nanoTime()
-                                    streamStartPtsUs = ptsUs
-                                }
 
                                 mc.queueInputBuffer(
                                     inputIndex,
@@ -496,10 +516,12 @@ class VideoDecoder {
             referenceLost = false
             lastFrameSeq = seq
 
-            // Clear obsolete queued frames so keyframe decodes immediately
-            while (taskQueue.isNotEmpty()) {
-                val task = taskQueue.poll()
-                if (task != null) recycleTask(task)
+            val dropThreshold = if (jitterBufferMs > 500) 250 else 60
+            if (taskQueue.size > dropThreshold) {
+                while (taskQueue.isNotEmpty()) {
+                    val task = taskQueue.poll()
+                    if (task != null) recycleTask(task)
+                }
             }
         }
 
@@ -514,10 +536,6 @@ class VideoDecoder {
                 notifyReferenceLost()
             }
 
-            if (referenceLost) {
-                return
-            }
-
             if (lastFrameSeq != -1 && seq < lastFrameSeq) {
                 return
             }
@@ -526,6 +544,11 @@ class VideoDecoder {
         lastFrameSeq = seq
 
         if (!isDecoderReady) return
+
+        // In low latency mode, if taskQueue has accumulated excessive backlog (> 50 frames, ~700ms), request Keyframe to catch up cleanly
+        if (jitterBufferMs <= 100 && taskQueue.size >= 50) {
+            notifyReferenceLost()
+        }
 
         val task = obtainTask(finalBytes.size)
         System.arraycopy(finalBytes, 0, task.data, 0, finalBytes.size)
@@ -551,7 +574,6 @@ class VideoDecoder {
         lastFrameSeq = -1
         lastTimestampMs = -1L
         referenceLost = false
-        receiverStartNs = 0L
         lastCodecConfigData = null
         activeDecoderName = "未运行"
         while (taskQueue.isNotEmpty()) {
@@ -578,8 +600,6 @@ class VideoDecoder {
             hasReceivedFirstKeyframe = false
             lastFrameSeq = -1
             referenceLost = false
-            receiverStartNs = 0L
-            streamStartPtsUs = 0L
             AppLogger.i(TAG, "Decoder flushed successfully.")
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error flushing decoder", e)
