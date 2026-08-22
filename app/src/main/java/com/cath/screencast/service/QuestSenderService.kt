@@ -346,13 +346,16 @@ class QuestSenderService : Service() {
 
         AppLogger.i(TAG, "Stream parameters computed: $effWidth x $effHeight @ $effFps FPS (Screen: ${screenWidth}x${screenHeight}, Rotation: $lastRotation)")
 
+        val sessionStartNs = System.nanoTime()
+
         val enc = VideoEncoder(
             config = config,
             tcpStreamer = currentStreamer,
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
-            context = this
+            context = this,
+            streamStartRealNs = sessionStartNs
         )
         enc.start()
         encoder = enc
@@ -363,20 +366,12 @@ class QuestSenderService : Service() {
         try {
             val audioEnc = AudioEncoder(
                 mediaProjection = projection,
-                tcpStreamer = currentStreamer
+                tcpStreamer = currentStreamer,
+                streamStartRealNs = sessionStartNs
             )
-            enc.onFirstFrameCaptured = {
-                audioEnc.videoStartPtsUs = enc.firstFramePtsUs
-                audioEnc.videoStartRealNs = enc.firstFrameRealNs
-                AppLogger.i(
-                    TAG,
-                    "Audio encoder rebased to video anchor: " +
-                        "videoStartPtsUs=${enc.firstFramePtsUs}, " +
-                        "videoStartRealNs=${enc.firstFrameRealNs}"
-                )
-            }
             audioEnc.start()
             audioEncoder = audioEnc
+            AppLogger.i(TAG, "Internal AudioEncoder started with unified session start anchor: $sessionStartNs")
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to start internal AudioEncoder", e)
         }

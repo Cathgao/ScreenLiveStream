@@ -21,7 +21,8 @@ class VideoEncoder(
     private val overrideWidth: Int = 0,
     private val overrideHeight: Int = 0,
     private val overrideFps: Int = 0,
-    private val context: Context? = null
+    private val context: Context? = null,
+    @Volatile var streamStartRealNs: Long = 0L
 ) {
     // Local-recording sink. Invoked once per output buffer; the
     // consumer must duplicate the ByteBuffer (muxers do) or read it
@@ -41,7 +42,6 @@ class VideoEncoder(
     private var encoderThread: Thread? = null
     @Volatile
     private var lastCodecConfigData: ByteArray? = null
-    private var streamStartNs = 0L
 
     val inputSurface: Surface?
         get() = codecSurface
@@ -66,6 +66,7 @@ class VideoEncoder(
     // output frame is produced. Sender wires this to AudioEncoder so
     // the audio PTS domain can be rebased to the video's zero point.
     var onFirstFrameCaptured: (() -> Unit)? = null
+    var onVideoStart: ((startNs: Long) -> Unit)? = null
 
     fun start() {
         try {
@@ -198,7 +199,6 @@ class VideoEncoder(
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
-            streamStartNs = 0L
             AppLogger.i(TAG, "Encoder loop thread running at URGENT_DISPLAY priority...")
 
             while (isEncoding) {
@@ -234,18 +234,19 @@ class VideoEncoder(
                                 }
                                 outputBuffer.get(tempBuffer, 0, dataSize)
 
-                                val frameNs = if (bufferInfo.presentationTimeUs > 0) bufferInfo.presentationTimeUs * 1000L else System.nanoTime()
-                                if (streamStartNs == 0L) {
-                                    streamStartNs = frameNs
-                                    // Record the first-frame coordinates so
-                                    // AudioEncoder can rebase its PTS to
-                                    // share the same zero point.
-                                    firstFramePtsUs = bufferInfo.presentationTimeUs
-                                    firstFrameRealNs = System.nanoTime()
+                                val nowNs = System.nanoTime()
+                                if (streamStartRealNs == 0L) {
+                                    streamStartRealNs = nowNs
+                                    onVideoStart?.invoke(nowNs)
+                                    AppLogger.i(TAG, "VideoEncoder established stream start time anchor: $nowNs")
+                                }
+                                if (!firstFrameCaptured) {
                                     firstFrameCaptured = true
+                                    firstFramePtsUs = bufferInfo.presentationTimeUs
+                                    firstFrameRealNs = nowNs
                                     onFirstFrameCaptured?.invoke()
                                 }
-                                val timestampMs = ((frameNs - streamStartNs) / 1_000_000L).coerceAtLeast(0L)
+                                val timestampMs = ((nowNs - streamStartRealNs) / 1_000_000L).coerceAtLeast(0L)
 
                                 if (isCodecConfig) {
                                     lastCodecConfigData = tempBuffer.copyOf(dataSize)
