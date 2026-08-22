@@ -153,7 +153,9 @@ class UdpFecStreamer(
             LockSupport.parkNanos(nanos - 1_000_000L)
         }
         while (System.nanoTime() < target) {
-            Thread.onSpinWait()
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                Thread.onSpinWait()
+            }
         }
     }
 
