@@ -286,8 +286,49 @@ fun ReceiverScreen(
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     
+                    // Low Latency Mode switch (Unchecked by default, uses 2-second large buffer)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Bolt,
+                                contentDescription = null,
+                                tint = if (receiverConfig.lowLatencyMode) NeonCyan else TextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = "低延迟模式",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = if (receiverConfig.lowLatencyMode) "极速直出 (~20ms)" else "已开启2秒大缓冲 (抗弱网与剧烈运动卡顿)",
+                                    fontSize = 10.sp,
+                                    color = if (receiverConfig.lowLatencyMode) NeonCyan else TextSecondary
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = receiverConfig.lowLatencyMode,
+                            onCheckedChange = { viewModel.updateReceiverLowLatency(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.Black,
+                                checkedTrackColor = NeonCyan
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
                     // Recording switch above start button
                     Row(
                         modifier = Modifier

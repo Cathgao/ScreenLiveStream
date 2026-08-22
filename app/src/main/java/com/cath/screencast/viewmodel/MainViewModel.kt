@@ -263,6 +263,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _receiverConfig.value = _receiverConfig.value.copy(listenPort = port)
     }
 
+    fun updateReceiverLowLatency(enabled: Boolean) {
+        _receiverConfig.value = _receiverConfig.value.copy(
+            lowLatencyMode = enabled,
+            jitterBufferMs = if (enabled) 25 else 2000
+        )
+    }
+
     fun selectDiscoveredDevice(device: DiscoveredDevice) {
         _streamConfig.value = _streamConfig.value.copy(
             targetIp = device.ipAddress,

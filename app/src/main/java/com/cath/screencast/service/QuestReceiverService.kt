@@ -113,12 +113,17 @@ class QuestReceiverService : Service() {
         videoDecoder.onVideoSizeChanged = { w, h ->
             onVideoSizeChanged?.invoke(w, h)
         }
+        videoDecoder.onVideoFrameRendered = { ptsMs ->
+            audioDecoder.syncWithVideoPts(ptsMs)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val port = intent?.getIntExtra(EXTRA_LISTEN_PORT, 8888) ?: 8888
         val autoAnnounce = intent?.getBooleanExtra(EXTRA_AUTO_ANNOUNCE, true) ?: true
-        val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, 50) ?: 50
+        val lowLatencyMode = intent?.getBooleanExtra(EXTRA_LOW_LATENCY_MODE, false) ?: false
+        val defaultJitter = if (lowLatencyMode) 25 else 2000
+        val jitterBufferMs = intent?.getIntExtra(EXTRA_JITTER_BUFFER_MS, defaultJitter) ?: defaultJitter
         val protocolName = intent?.getStringExtra(EXTRA_PROTOCOL) ?: TransportProtocol.UDP.name
         val protocol = try { TransportProtocol.valueOf(protocolName) } catch (e: Exception) { TransportProtocol.UDP }
         val isRecordEnabled = intent?.getBooleanExtra(EXTRA_RECORD_ENABLED, false) ?: false
@@ -133,7 +138,7 @@ class QuestReceiverService : Service() {
             startForeground(NOTIFICATION_ID, createNotification(port))
         }
 
-        startListening(port, autoAnnounce, jitterBufferMs, protocol, isRecordEnabled)
+        startListening(port, autoAnnounce, jitterBufferMs, protocol, isRecordEnabled, lowLatencyMode)
 
         return START_STICKY
     }
@@ -151,11 +156,15 @@ class QuestReceiverService : Service() {
     fun startListening(
         port: Int = 8888,
         autoAnnounce: Boolean = true,
-        jitterBufferMs: Int = 50,
+        jitterBufferMs: Int = 2000,
         protocol: TransportProtocol = TransportProtocol.UDP,
-        isRecordEnabled: Boolean = false
+        isRecordEnabled: Boolean = false,
+        lowLatencyMode: Boolean = false
     ) {
         stopListening()
+        
+        videoDecoder.jitterBufferMs = jitterBufferMs
+        audioDecoder.isLowLatencyMode = lowLatencyMode
         
         if (isRecordEnabled) {
             try {
@@ -199,6 +208,10 @@ class QuestReceiverService : Service() {
             UdpFecReceiver(port)
         }
         val currentReceiver = receiver!!
+
+        videoDecoder.onRequestKeyframe = {
+            currentReceiver.requestKeyframe()
+        }
 
         // Reset stream timeout state
         hasReceivedFirstFrame = false
@@ -397,6 +410,7 @@ class QuestReceiverService : Service() {
 
         const val EXTRA_LISTEN_PORT = "EXTRA_LISTEN_PORT"
         const val EXTRA_AUTO_ANNOUNCE = "EXTRA_AUTO_ANNOUNCE"
+        const val EXTRA_LOW_LATENCY_MODE = "EXTRA_LOW_LATENCY_MODE"
         const val EXTRA_JITTER_BUFFER_MS = "EXTRA_JITTER_BUFFER_MS"
         const val EXTRA_PROTOCOL = "EXTRA_PROTOCOL"
         const val EXTRA_RECORD_ENABLED = "EXTRA_RECORD_ENABLED"
