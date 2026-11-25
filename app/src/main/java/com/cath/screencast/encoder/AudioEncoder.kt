@@ -105,7 +105,7 @@ class AudioEncoder(
 
     private fun startAudioLoop(record: AudioRecord, codec: MediaCodec, bufferSize: Int) {
         captureThread = Thread({
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             // Read standard AAC frame chunk size: 1024 samples * 2 channels * 2 bytes = 4096 bytes (~21.3ms per read)
             val pcmChunkSize = 4096
             val audioBuffer = ByteArray(pcmChunkSize)
@@ -189,13 +189,28 @@ class AudioEncoder(
         if (!isRunning.getAndSet(false)) return
         AppLogger.i(TAG, "Stopping AudioEncoder...")
 
+        // Stop AudioRecord first to unblock any pending read(), then wait for captureThread before releasing codec
         try {
             audioRecord?.stop()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error stopping AudioRecord", e)
+        }
+
+        val threadRef = captureThread
+        threadRef?.interrupt()
+        if (threadRef != null && threadRef.isAlive && Thread.currentThread() != threadRef) {
+            try {
+                threadRef.join(1_000L)
+            } catch (_: InterruptedException) {}
+        }
+        captureThread = null
+
+        try {
             audioRecord?.release()
             audioRecord = null
             AppLogger.i(TAG, "AudioRecord released.")
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error stopping AudioRecord", e)
+            AppLogger.e(TAG, "Error releasing AudioRecord", e)
         }
 
         try {
@@ -206,9 +221,6 @@ class AudioEncoder(
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error stopping Audio MediaCodec", e)
         }
-
-        captureThread?.interrupt()
-        captureThread = null
     }
 
     companion object {

@@ -393,7 +393,7 @@ fun ReceiverScreen(
                                     onValueChange = { 
                                         portText = it
                                         val p = it.toIntOrNull()
-                                        if (p != null) {
+                                        if (p != null && p in 1..65535) {
                                             viewModel.updateReceiverPort(p)
                                         }
                                     },

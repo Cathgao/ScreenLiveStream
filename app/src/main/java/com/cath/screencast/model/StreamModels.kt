@@ -68,7 +68,15 @@ data class EncoderCapabilities(
     val supportedBitrateModes: List<BitrateMode>
 ) {
     companion object {
+        private val cache = java.util.concurrent.ConcurrentHashMap<Pair<VideoCodec, BitrateMode>, EncoderCapabilities>()
+
         fun query(codec: VideoCodec, bitrateMode: BitrateMode): EncoderCapabilities {
+            return cache.getOrPut(codec to bitrateMode) {
+                queryInternal(codec, bitrateMode)
+            }
+        }
+
+        private fun queryInternal(codec: VideoCodec, bitrateMode: BitrateMode): EncoderCapabilities {
             val mimeType = codec.mimeType
             var selectedInfo: MediaCodecInfo? = null
 

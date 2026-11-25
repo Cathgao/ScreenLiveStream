@@ -54,13 +54,7 @@ class RttProbe {
     fun start(targetIp: String, port: Int, socket: DatagramSocket? = null) {
         stop()
         try {
-            val target = InetAddress.getByName(targetIp)
-            this.targetAddress = target
             this.targetPort = port
-
-            this.socket = socket ?: DatagramSocket().also {
-                it.soTimeout = 200
-            }
             // Reset window
             synchronized(rttWindowLock) { rttWindowNanos.clear() }
             inFlight.clear()
@@ -68,45 +62,60 @@ class RttProbe {
             totalLost = 0
 
             isRunning = true
-            listenerThread = thread(start = true, name = "RttProbeReplyThread") {
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                val buf = ByteArray(64)
-                val pkt = DatagramPacket(buf, buf.size)
-                while (isRunning) {
-                    try {
-                        pkt.length = buf.size
-                        (this.socket ?: break).receive(pkt)
-                        val probe = PacketProtocol.readProbeSequence(pkt.data, pkt.length) ?: continue
-                        if (probe.isIdrRequest) {
-                            SessionLog.i(TAG, "Received instant IDR Keyframe Request (PLI) via RTT probe channel! Forcing keyframe...")
-                            onIdrRequest?.invoke()
-                        } else if (probe.isReply) {
-                            handleReply(probe.seq, probe.echoedNanos)
-                        }
-                    } catch (_: java.net.SocketTimeoutException) {
-                        // heart-beat: check for probe timeouts
-                        sweepTimeouts()
-                    } catch (e: Exception) {
-                        if (isRunning) {
-                            SessionLog.w(TAG, "RTT probe listener error: ${e.message}")
-                        }
-                    }
-                }
-            }
-
             scheduler = Executors.newSingleThreadScheduledExecutor { r ->
                 Thread({
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                     r.run()
                 }, "RttProbeSenderThread").also { it.isDaemon = true }
             }
-            scheduler!!.scheduleAtFixedRate({
-                sendOneProbe()
-            }, 0L, pingIntervalMs, TimeUnit.MILLISECONDS)
 
-            scheduler!!.scheduleAtFixedRate({ publishStats() }, 1L, 1L, TimeUnit.SECONDS)
+            // Initialize socket and resolve targetAddress on background thread to avoid NetworkOnMainThreadException
+            scheduler!!.execute {
+                try {
+                    val target = InetAddress.getByName(targetIp)
+                    this.targetAddress = target
+                    val ds = socket ?: DatagramSocket().also {
+                        it.soTimeout = 200
+                    }
+                    this.socket = ds
 
-            SessionLog.i(TAG, "RttProbe started → $targetIp:$port pingInterval=${pingIntervalMs}ms")
+                    listenerThread = thread(start = true, name = "RttProbeReplyThread") {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                        val buf = ByteArray(64)
+                        val pkt = DatagramPacket(buf, buf.size)
+                        while (isRunning) {
+                            try {
+                                pkt.length = buf.size
+                                ds.receive(pkt)
+                                val probe = PacketProtocol.readProbeSequence(pkt.data, pkt.length) ?: continue
+                                if (probe.isIdrRequest) {
+                                    SessionLog.i(TAG, "Received instant IDR Keyframe Request (PLI) via RTT probe channel! Forcing keyframe...")
+                                    onIdrRequest?.invoke()
+                                } else if (probe.isReply) {
+                                    handleReply(probe.seq, probe.echoedNanos)
+                                }
+                            } catch (_: java.net.SocketTimeoutException) {
+                                sweepTimeouts()
+                            } catch (e: Exception) {
+                                if (isRunning) {
+                                    SessionLog.w(TAG, "RTT probe listener error: ${e.message}")
+                                }
+                            }
+                        }
+                    }
+
+                    scheduler?.scheduleAtFixedRate({
+                        sendOneProbe()
+                    }, 0L, pingIntervalMs, TimeUnit.MILLISECONDS)
+
+                    scheduler?.scheduleAtFixedRate({ publishStats() }, 1L, 1L, TimeUnit.SECONDS)
+
+                    SessionLog.i(TAG, "RttProbe started → $targetIp:$port pingInterval=${pingIntervalMs}ms")
+                } catch (e: Exception) {
+                    SessionLog.e(TAG, "RttProbe background init failed", e)
+                    stop()
+                }
+            }
         } catch (e: Exception) {
             SessionLog.e(TAG, "RttProbe start failed", e)
             stop()
@@ -220,13 +229,16 @@ class RttProbe {
         }
         scheduler = null
         listenerThread?.interrupt()
-        listenerThread = null
         try {
             socket?.close()
         } catch (_: Exception) {
             // ignore
         }
         socket = null
+        try {
+            listenerThread?.join(500L)
+        } catch (_: Exception) {}
+        listenerThread = null
         targetAddress = null
         inFlight.clear()
         synchronized(rttWindowLock) { rttWindowNanos.clear() }

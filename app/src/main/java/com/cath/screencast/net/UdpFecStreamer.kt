@@ -31,10 +31,11 @@ class UdpFecStreamer(
 
     private val MAX_PAYLOAD = 1300
     private val FEC_GROUP_SIZE = 8
-    private val FEC_LONGS = (MAX_PAYLOAD + 7) / 8
-    
+    // 250 groups × 8 fragments = 2000 fragments (~2.6 MB max frame), matching receiver's max fragment bound
+    private val MAX_FEC_GROUPS = 250
+
     override var onRequestKeyframe: (() -> Unit)? = null
-    
+
     private var sendThread: Thread? = null
 
     override fun setBitrate(bitrateKbps: Int, fps: Int) {
@@ -49,6 +50,7 @@ class UdpFecStreamer(
 
     private class FrameTask {
         var data: ByteArray = ByteArray(0)
+        var nativeOrderBuf: ByteBuffer = ByteBuffer.wrap(data).order(java.nio.ByteOrder.nativeOrder())
         var size: Int = 0
         var offset: Int = 0
         var timestampMs: Long = 0
@@ -69,6 +71,7 @@ class UdpFecStreamer(
         val task = taskPool.poll() ?: FrameTask()
         if (task.data.size < minSize) {
             task.data = ByteArray(Math.max(minSize, 512 * 1024))
+            task.nativeOrderBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
         }
         return task
     }
@@ -81,7 +84,7 @@ class UdpFecStreamer(
 
     // Pacer state: scheduled nanosecond timestamp when next packet may be transmitted
     private var nextSendTimeNs = 0L
-    private val BURST_WINDOW_NS = 500_000L // 0.5ms burst credit (~6KB burst headroom to protect Wi-Fi hardware FIFO)
+    private val BURST_WINDOW_NS = 1_200_000L // 1.2ms micro-burst window (~15KB headroom) to batch parkNanos sleeps without CPU spin
 
     /**
      * Dynamically computes the target pacing transmission rate (in bits per second) for a frame or task.
@@ -92,10 +95,10 @@ class UdpFecStreamer(
         val fps = targetFps.coerceIn(30, 144)
         val frameIntervalMs = (1000f / fps).coerceAtLeast(6f)
 
-        // Baseline pacing rate: 2.5x target bitrate with a 50 Mbps floor
-        val basePacingRateBps = maxOf(50_000_000L, (bitrateBps * 2.5).toLong())
-        // Burst rate ceiling (up to 200 Mbps)
-        val maxPacingRateBps = maxOf(100_000_000L, minOf(200_000_000L, (bitrateBps * 4.0).toLong()))
+        // Baseline pacing rate: 2.0x target bitrate with a 50 Mbps floor
+        val basePacingRateBps = maxOf(50_000_000L, (bitrateBps * 2.0).toLong())
+        // Burst rate ceiling (capped at 120 Mbps to avoid saturating mobile Wi-Fi RX FIFOs on large keyframes)
+        val maxPacingRateBps = maxOf(80_000_000L, minOf(120_000_000L, (bitrateBps * 3.0).toLong()))
 
         val isLargeOrCongested = frameTotalWireBytes > 40 * 1024 || queueDepth > 0
         if (!isLargeOrCongested) {
@@ -142,20 +145,13 @@ class UdpFecStreamer(
     }
 
     /**
-     * High-precision hybrid pacer sleep:
-     * - Uses LockSupport.parkNanos for large delays (>1.5ms) to conserve CPU.
-     * - Uses Thread.onSpinWait() for sub-millisecond precision without OS scheduler latency.
+     * CPU-friendly pacer sleep:
+     * Uses LockSupport.parkNanos without busy-spin so the sender thread never
+     * starves foreground VR game threads or causes thermal throttling on Quest.
      */
     private fun paceSleepNanos(nanos: Long) {
-        if (nanos <= 0) return
-        val target = System.nanoTime() + nanos
-        if (nanos > 1_500_000L) {
-            LockSupport.parkNanos(nanos - 1_000_000L)
-        }
-        while (System.nanoTime() < target) {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                Thread.onSpinWait()
-            }
+        if (nanos >= 200_000L) {
+            LockSupport.parkNanos(nanos)
         }
     }
 
@@ -167,8 +163,8 @@ class UdpFecStreamer(
         taskQueue.clear()
         nextSendTimeNs = System.nanoTime()
 
-        thread(name = "UdpStreamerThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        sendThread = thread(start = true, name = "UdpStreamerSendThread") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
             try {
                 val s = DatagramSocket()
                 s.sendBufferSize = 8 * 1024 * 1024
@@ -178,7 +174,7 @@ class UdpFecStreamer(
                 socket = s
                 targetAddress = InetAddress.getByName(targetIp)
                 ready = true
-                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xA0 AC_VI, FEC_GROUP_SIZE=$FEC_GROUP_SIZE, targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps)")
+                AppLogger.i(TAG, "UDP Streamer started targeting $targetIp:$port (trafficClass=0xA0 AC_VI, FEC_GROUP_SIZE=$FEC_GROUP_SIZE, MAX_FEC_GROUPS=$MAX_FEC_GROUPS, targetBitrate=${targetBitrateKbps}Kbps, targetFps=$targetFps)")
 
                 // Start control packet listener (IDR request / Ping echo) on stream socket
                 recvThread = thread(start = true, name = "UdpFecStreamerRecvThread") {
@@ -210,17 +206,13 @@ class UdpFecStreamer(
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Error starting UDP streamer", e)
                 isStreaming = false
+                return@thread
             }
-        }
 
-        sendThread = thread(start = true, name = "UdpStreamerSendThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD).order(java.nio.ByteOrder.nativeOrder())
-            val MAX_FEC_GROUPS = 64
+            val packetBuf = ByteBuffer.allocate(28 + MAX_PAYLOAD).order(java.nio.ByteOrder.BIG_ENDIAN)
             val fecPayloads = Array(MAX_FEC_GROUPS) { ByteArray(MAX_PAYLOAD) }
             val fecBufs = Array(MAX_FEC_GROUPS) { ByteBuffer.wrap(fecPayloads[it]).order(java.nio.ByteOrder.nativeOrder()) }
             val fecGroupInitialized = BooleanArray(MAX_FEC_GROUPS)
-            val fecGroupLengths = IntArray(MAX_FEC_GROUPS)
 
             // Single fragment scratch buffer (frames are processed sequentially in this thread).
             val fragData = ByteArray(28 + MAX_PAYLOAD)
@@ -250,7 +242,6 @@ class UdpFecStreamer(
                             } else if (task.isBeacon) {
                                 val flags = 64 // 64 = Beacon
                                 packetBuf.clear()
-                                packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                 packetBuf.putInt(0x55445056)
                                 packetBuf.putInt(0)
                                 packetBuf.putLong(0L)
@@ -269,27 +260,30 @@ class UdpFecStreamer(
                                 reusablePacket.setData(packetBuf.array(), 0, 28 + 8)
                                 sock.send(reusablePacket)
                             } else if (task.isAudio) {
-                                var flags = 16 // 16 = Audio
-                                if (task.isCodecConfig) flags = flags or 32
-                                
-                                val seq = audioSeqCounter++
-                                
-                                packetBuf.clear()
-                                packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
-                                packetBuf.putInt(0x55445056)
-                                packetBuf.putInt(seq)
-                                packetBuf.putLong(task.timestampMs)
-                                packetBuf.put(flags.toByte())
-                                packetBuf.putShort(0.toShort()) // fragIndex
-                                packetBuf.putShort(1.toShort()) // totalFragments
-                                packetBuf.putInt(task.size) // frameSize
-                                packetBuf.put(0.toByte())
-                                packetBuf.put(0.toByte())
-                                packetBuf.put(0.toByte()) // pad
-                                packetBuf.put(task.data, 0, task.size)
-                                
-                                reusablePacket.setData(packetBuf.array(), 0, 28 + task.size)
-                                sock.send(reusablePacket)
+                                if (task.size > MAX_PAYLOAD) {
+                                    AppLogger.w(TAG, "Audio frame size ${task.size} exceeds MAX_PAYLOAD $MAX_PAYLOAD, dropping")
+                                } else {
+                                    var flags = 16 // 16 = Audio
+                                    if (task.isCodecConfig) flags = flags or 32
+
+                                    val seq = audioSeqCounter++
+
+                                    packetBuf.clear()
+                                    packetBuf.putInt(0x55445056)
+                                    packetBuf.putInt(seq)
+                                    packetBuf.putLong(task.timestampMs)
+                                    packetBuf.put(flags.toByte())
+                                    packetBuf.putShort(0.toShort()) // fragIndex
+                                    packetBuf.putShort(1.toShort()) // totalFragments
+                                    packetBuf.putInt(task.size) // frameSize
+                                    packetBuf.put(0.toByte())
+                                    packetBuf.put(0.toByte())
+                                    packetBuf.put(0.toByte()) // pad
+                                    packetBuf.put(task.data, 0, task.size)
+
+                                    reusablePacket.setData(packetBuf.array(), 0, 28 + task.size)
+                                    sock.send(reusablePacket)
+                                }
                             } else {
                                 val frameSize = task.size
                                 val totalFragments = (frameSize + MAX_PAYLOAD - 1) / MAX_PAYLOAD
@@ -305,7 +299,7 @@ class UdpFecStreamer(
                                     0
                                 }
 
-                                val taskBuf = ByteBuffer.wrap(task.data).order(java.nio.ByteOrder.nativeOrder())
+                                val taskBuf = task.nativeOrderBuf
                                 val totalFrameWireBytes = frameSize + (numFecGroups * MAX_PAYLOAD) + ((totalFragments + numFecGroups) * 28)
                                 val taskPacingRateBps = computePacingRateBps(totalFrameWireBytes, taskQueue.size)
 
@@ -351,8 +345,8 @@ class UdpFecStreamer(
                                     fragBuf.putShort(totalFragments.toShort())
                                     fragBuf.putInt(frameSize)
                                     fragBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
-                                    fragBuf.put(0.toByte())
-                                    fragBuf.put(0.toByte()) // pad to 28 bytes
+                                    fragBuf.put((numFecGroups and 0xFF).toByte()) // byte 26: explicit numFecGroups
+                                    fragBuf.put(0.toByte()) // byte 27: pad to 28 bytes
                                     fragBuf.put(task.data, fragOffset, length)
 
                                     reusablePacket.setData(fragData, 0, 28 + length)
@@ -364,7 +358,6 @@ class UdpFecStreamer(
                                     for (g in 0 until numFecGroups) {
                                         if (!fecGroupInitialized[g]) continue
                                         packetBuf.clear()
-                                        packetBuf.order(java.nio.ByteOrder.BIG_ENDIAN)
                                         packetBuf.putInt(0x55445056)
                                         packetBuf.putInt(seq)
                                         packetBuf.putLong(task.timestampMs)
@@ -374,8 +367,8 @@ class UdpFecStreamer(
                                         packetBuf.putShort(totalFragments.toShort())
                                         packetBuf.putInt(frameSize)
                                         packetBuf.put(FEC_GROUP_SIZE.toByte()) // byte 25: fecGroupSize
-                                        packetBuf.put(0.toByte())
-                                        packetBuf.put(0.toByte()) // pad
+                                        packetBuf.put((numFecGroups and 0xFF).toByte()) // byte 26: explicit numFecGroups
+                                        packetBuf.put(0.toByte()) // byte 27: pad
                                         packetBuf.put(fecPayloads[g], 0, MAX_PAYLOAD)
 
                                         reusablePacket.setData(packetBuf.array(), 0, 28 + MAX_PAYLOAD)
@@ -479,27 +472,32 @@ class UdpFecStreamer(
     override fun stop() {
         isStreaming = false
         ready = false
-        recvThread?.interrupt()
+        val recvRef = recvThread
+        recvRef?.interrupt()
         recvThread = null
-        sendThread?.interrupt()
         val sendThreadRef = sendThread
+        sendThreadRef?.interrupt()
+        try {
+            socket?.close()
+        } catch (_: Exception) {}
+        socket = null
         if (sendThreadRef != null && sendThreadRef.isAlive) {
             try {
                 sendThreadRef.join(2_000L)
                 if (sendThreadRef.isAlive) {
-                    AppLogger.w(TAG, "UdpFecStreamer sendThread did not terminate within 2s; closing socket anyway")
+                    AppLogger.w(TAG, "UdpFecStreamer sendThread did not terminate within 2s")
                 }
             } catch (_: InterruptedException) {
-                // Caller interrupted; proceed with cleanup.
             } catch (e: Exception) {
                 AppLogger.w(TAG, "Error joining UdpFecStreamer sendThread: ${e.message}")
             }
         }
         sendThread = null
-        try {
-            socket?.close()
-        } catch (e: Exception) {}
-        socket = null
+        if (recvRef != null && recvRef.isAlive) {
+            try {
+                recvRef.join(500L)
+            } catch (_: Exception) {}
+        }
         taskQueue.clear()
     }
 }

@@ -18,6 +18,7 @@ import com.cath.screencast.model.TransportProtocol
 import com.cath.screencast.model.VideoCodec
 import com.cath.screencast.model.VideoResolution
 import com.cath.screencast.net.LanDiscovery
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -152,6 +153,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setAppMode(mode: AppMode) {
         _currentMode.value = mode
+        if (mode == AppMode.MOBILE_RECEIVER) {
+            stopLanScan()
+        } else {
+            startLanScan()
+        }
     }
 
     fun updateCodec(codec: VideoCodec) {
@@ -191,16 +197,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun setSystemProperty(key: String, value: String) {
-        try {
-            val process = Runtime.getRuntime().exec("setprop $key $value")
-            process.waitFor()
-        } catch (e: Exception) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
                 val clazz = Class.forName("android.os.SystemProperties")
                 val setMethod = clazz.getMethod("set", String::class.java, String::class.java)
                 setMethod.invoke(null, key, value)
-            } catch (ex: Exception) {
-                // Ignore
+                return@launch
+            } catch (_: Exception) {
+            }
+            var process: Process? = null
+            try {
+                process = Runtime.getRuntime().exec(arrayOf("setprop", key, value))
+                process.waitFor()
+            } catch (_: Exception) {
+            } finally {
+                process?.destroy()
             }
         }
     }
@@ -286,8 +297,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lanDiscovery.startScanning()
     }
 
+    fun stopLanScan() {
+        lanDiscovery.stopScanning()
+    }
+
     private fun fetchLocalIp() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
                 val wifiManager = getApplication<Application>().getSystemService(Context.WIFI_SERVICE) as WifiManager
                 @Suppress("DEPRECATION")

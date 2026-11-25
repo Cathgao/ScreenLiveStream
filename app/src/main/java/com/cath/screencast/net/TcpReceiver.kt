@@ -18,11 +18,13 @@ class TcpReceiver : IReceiver {
     
     @Volatile
     private var currentClientSocket: Socket? = null
+    @Volatile
+    private var currentClientThread: Thread? = null
 
-    // Callback for decoded frames: (frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
-    override var onFrameAssembled: ((ByteArray, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
-    // Callback for completed audio frames: (aacBytes, isCodecConfig, timestampMs)
-    override var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
+    // Callback for decoded frames: (frameBytes, size, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
+    override var onFrameAssembled: ((ByteArray, Int, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
+    // Callback for completed audio frames: (aacBytes, size, isCodecConfig, timestampMs)
+    override var onAudioFrame: ((ByteArray, Int, Boolean, Long) -> Unit)? = null
     override var onStatsUpdated: ((StreamStats) -> Unit)? = null
     override var onReferenceLost: (() -> Unit)? = null
     override var onStreamStop: (() -> Unit)? = null
@@ -67,9 +69,9 @@ class TcpReceiver : IReceiver {
                     dp.length = buffer.size
                     ds.receive(dp)
                     val length = dp.length
-                    if (length >= PacketProtocol.HEADER_SIZE + 8) {
+                    if (length >= PacketProtocol.HEADER_SIZE) {
                         val probe = PacketProtocol.readProbeSequence(buffer, length)
-                        if (probe != null && !probe.isReply) {
+                        if (probe != null && !probe.isReply && !probe.isIdrRequest) {
                             val reply = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
                             ds.send(java.net.DatagramPacket(reply, reply.size, dp.address, dp.port))
                         }
@@ -92,8 +94,13 @@ class TcpReceiver : IReceiver {
                     try {
                         val clientSocket = ss.accept()
                         
-                        // Close previous connection to drop old deadlocked senders
-                        currentClientSocket?.close()
+                        // Close previous connection to drop old deadlocked senders and wait briefly for old thread to exit
+                        val oldClientThread = currentClientThread
+                        try { currentClientSocket?.close() } catch (_: Exception) {}
+                        oldClientThread?.interrupt()
+                        if (oldClientThread != null && oldClientThread.isAlive) {
+                            try { oldClientThread.join(500L) } catch (_: Exception) {}
+                        }
                         currentClientSocket = clientSocket
                         
                         clientSocket.tcpNoDelay = true
@@ -101,7 +108,7 @@ class TcpReceiver : IReceiver {
                         val clientIp = clientSocket.inetAddress.hostAddress
                         SessionLog.i(TAG, "TCP Receiver accepted stream connection from $clientIp")
 
-                        kotlin.concurrent.thread(start = true, name = "TcpReceiverClientThread") {
+                        currentClientThread = kotlin.concurrent.thread(start = true, name = "TcpReceiverClientThread") {
                             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
                             try {
                                 val dis = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 512 * 1024))
@@ -159,19 +166,18 @@ class TcpReceiver : IReceiver {
                                         reusablePayloadBuf = ByteArray(Math.max(payloadSize, reusablePayloadBuf.size * 2))
                                     }
                                     dis.readFully(reusablePayloadBuf, 0, payloadSize)
-                                    val payload = reusablePayloadBuf.copyOf(payloadSize)
 
                                     totalBytesReceived += 20 + payloadSize
                                     windowBytesReceived += 20 + payloadSize
 
                                     if (isAudio) {
-                                        onAudioFrame?.invoke(payload, isCodecConfig, timestampMs)
+                                        onAudioFrame?.invoke(reusablePayloadBuf, payloadSize, isCodecConfig, timestampMs)
                                     } else {
                                         if (!isCodecConfig) {
                                             totalReceivedFrames++
                                             windowReceivedFrames++
                                         }
-                                        onFrameAssembled?.invoke(payload, isKeyframe, isCodecConfig, isHevc, timestampMs, frameSeq)
+                                        onFrameAssembled?.invoke(reusablePayloadBuf, payloadSize, isKeyframe, isCodecConfig, isHevc, timestampMs, frameSeq)
                                     }
 
                                     tickStats()
@@ -233,25 +239,26 @@ class TcpReceiver : IReceiver {
 
     override fun stop() {
         isListening = false
-        try {
-            serverSocket?.close()
-        } catch (e: Exception) {
-            // Ignore
-        }
+        val listenerRef = listenerThread
+        val probeRef = udpProbeThread
+        val clientRef = currentClientThread
+        try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
-        try {
-            udpProbeSocket?.close()
-        } catch (e: Exception) {}
+        try { udpProbeSocket?.close() } catch (_: Exception) {}
         udpProbeSocket = null
-        try {
-            udpProbeThread?.interrupt()
-        } catch (e: Exception) {}
-        udpProbeThread = null
-        try {
-            currentClientSocket?.close()
-        } catch (e: Exception) {}
+        try { currentClientSocket?.close() } catch (_: Exception) {}
         currentClientSocket = null
-        
+
+        listenerRef?.interrupt()
+        probeRef?.interrupt()
+        clientRef?.interrupt()
+        try { listenerRef?.join(500L) } catch (_: Exception) {}
+        try { probeRef?.join(500L) } catch (_: Exception) {}
+        try { clientRef?.join(500L) } catch (_: Exception) {}
+        listenerThread = null
+        udpProbeThread = null
+        currentClientThread = null
+
         totalReceivedFrames = 0
         totalBytesReceived = 0
         windowReceivedFrames = 0

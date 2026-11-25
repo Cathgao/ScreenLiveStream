@@ -111,7 +111,9 @@ class QuestReceiverService : Service() {
         createNotificationChannel()
 
         videoDecoder.onVideoSizeChanged = { w, h ->
-            onVideoSizeChanged?.invoke(w, h)
+            mainHandler.post {
+                onVideoSizeChanged?.invoke(w, h)
+            }
         }
         videoDecoder.onVideoFrameRendered = { ptsMs ->
             audioDecoder.syncWithVideoPts(ptsMs)
@@ -134,11 +136,11 @@ class QuestReceiverService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
-                createNotification(port),
+                createNotification(port, protocol),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
         } else {
-            startForeground(NOTIFICATION_ID, createNotification(port))
+            startForeground(NOTIFICATION_ID, createNotification(port, protocol))
         }
 
         startListening(port, autoAnnounce, jitterBufferMs, protocol, isRecordEnabled, lowLatencyMode)
@@ -225,7 +227,7 @@ class QuestReceiverService : Service() {
         mainHandler.removeCallbacks(timeoutCheckRunnable)
         mainHandler.postDelayed(timeoutCheckRunnable, 1000L)
         
-        currentReceiver.onFrameAssembled = { frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq ->
+        currentReceiver.onFrameAssembled = { frameBytes, frameSize, isKeyframe, isCodecConfig, isHevc, timestampMs, seq ->
             val now = System.currentTimeMillis()
             hasReceivedFirstFrame = true
             lastDataFrameTimeMs = now
@@ -242,32 +244,21 @@ class QuestReceiverService : Service() {
                         val w = if (videoDecoder.videoWidth > 0) videoDecoder.videoWidth else 1280
                         val h = if (videoDecoder.videoHeight > 0) videoDecoder.videoHeight else 720
                         val format = android.media.MediaFormat.createVideoFormat(mime, w, h)
-                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
+                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes.copyOf(frameSize)))
                         mgr.setVideoFormat(format)
                     } else {
-                        if (!mgr.isStarted) {
-                            val mime = if (isHevc) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
-                            val w = if (videoDecoder.videoWidth > 0) videoDecoder.videoWidth else 1280
-                            val h = if (videoDecoder.videoHeight > 0) videoDecoder.videoHeight else 720
-                            val format = android.media.MediaFormat.createVideoFormat(mime, w, h)
-                            format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
-                            mgr.setVideoFormat(format)
-                        }
-                        val buffer = java.nio.ByteBuffer.wrap(frameBytes)
-                        val bufferInfo = android.media.MediaCodec.BufferInfo().apply {
-                            set(0, frameBytes.size, ptsUs, if (isKeyframe) android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
-                        }
-                        mgr.writeVideoSample(buffer, bufferInfo)
+                        val flags = if (isKeyframe) android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                        mgr.writeVideoSampleAsync(frameBytes, frameSize, ptsUs, flags)
                     }
                 } catch (e: Exception) {
                     AppLogger.e(TAG, "Error writing video sample to receiver muxer", e)
                 }
             }
 
-            videoDecoder.decodeFrame(frameBytes, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
+            videoDecoder.decodeFrame(frameBytes, frameSize, isKeyframe, isCodecConfig, isHevc, timestampMs, seq)
         }
 
-        currentReceiver.onAudioFrame = { frameBytes, isCodecConfig, timestampMs ->
+        currentReceiver.onAudioFrame = { frameBytes, frameSize, isCodecConfig, timestampMs ->
             val now = System.currentTimeMillis()
             hasReceivedFirstFrame = true
             lastDataFrameTimeMs = now
@@ -280,21 +271,17 @@ class QuestReceiverService : Service() {
                     val ptsUs = (timestampMs * 1000L).coerceAtLeast(0L)
                     if (isCodecConfig) {
                         val format = android.media.MediaFormat.createAudioFormat(android.media.MediaFormat.MIMETYPE_AUDIO_AAC, 48000, 2)
-                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes))
+                        format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(frameBytes.copyOf(frameSize)))
                         mgr.setAudioFormat(format)
                     } else {
-                        val buffer = java.nio.ByteBuffer.wrap(frameBytes)
-                        val bufferInfo = android.media.MediaCodec.BufferInfo().apply {
-                            set(0, frameBytes.size, ptsUs, 0)
-                        }
-                        mgr.writeAudioSample(buffer, bufferInfo)
+                        mgr.writeAudioSampleAsync(frameBytes, frameSize, ptsUs, 0)
                     }
                 } catch (e: Exception) {
                     AppLogger.e(TAG, "Error writing audio sample to receiver muxer", e)
                 }
             }
 
-            audioDecoder.decodeFrame(frameBytes, isCodecConfig, timestampMs)
+            audioDecoder.decodeFrame(frameBytes, frameSize, isCodecConfig, timestampMs)
         }
 
         currentReceiver.onReferenceLost = {
@@ -390,7 +377,7 @@ class QuestReceiverService : Service() {
         }
     }
 
-    private fun createNotification(port: Int): Notification {
+    private fun createNotification(port: Int, protocol: TransportProtocol): Notification {
         val mainIntent = Intent(this, MainActivity::class.java)
         val mainPendingIntent = PendingIntent.getActivity(
             this, 0, mainIntent, PendingIntent.FLAG_IMMUTABLE
@@ -398,7 +385,7 @@ class QuestReceiverService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("QuestCast 接收端运行中")
-            .setContentText("已在 TCP 端口 $port 启动监听...")
+            .setContentText("已在 ${protocol.name} 端口 $port 启动监听...")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setContentIntent(mainPendingIntent)
             .setOngoing(true)

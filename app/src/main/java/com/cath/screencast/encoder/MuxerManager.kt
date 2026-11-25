@@ -16,6 +16,9 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.concurrent.thread
 
 class MuxerManager(
     private val context: Context?,
@@ -57,8 +60,67 @@ class MuxerManager(
     private val lock = Any()
     private val startTimeMs = System.currentTimeMillis()
 
+    private class SampleTask {
+        var data: ByteArray = ByteArray(0)
+        var size: Int = 0
+        var ptsUs: Long = 0L
+        var flags: Int = 0
+        var isVideo: Boolean = true
+    }
+
+    private val writeQueue = ArrayBlockingQueue<SampleTask>(256)
+    private val taskPool = ConcurrentLinkedQueue<SampleTask>()
+    @Volatile
+    private var isWriterRunning = false
+    private var writerThread: Thread? = null
+
+    private fun obtainSampleTask(minSize: Int): SampleTask {
+        val task = taskPool.poll() ?: SampleTask()
+        if (task.data.size < minSize) {
+            task.data = ByteArray(Math.max(minSize, 64 * 1024))
+        }
+        return task
+    }
+
+    private fun recycleSampleTask(task: SampleTask) {
+        taskPool.offer(task)
+    }
+
     init {
         initMuxer()
+        if (mediaMuxer != null) {
+            startWriterThread()
+        }
+    }
+
+    private fun startWriterThread() {
+        isWriterRunning = true
+        writerThread = thread(start = true, name = "MuxerWriterThread") {
+            val bufferInfo = MediaCodec.BufferInfo()
+            while (isWriterRunning || writeQueue.isNotEmpty()) {
+                val task = try {
+                    if (isWriterRunning) {
+                        writeQueue.poll(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    } else {
+                        writeQueue.poll()
+                    }
+                } catch (_: InterruptedException) {
+                    if (!isWriterRunning) writeQueue.poll() else null
+                } ?: continue
+
+                try {
+                    val buf = ByteBuffer.wrap(task.data, 0, task.size)
+                    bufferInfo.set(0, task.size, task.ptsUs, task.flags)
+                    if (task.isVideo) {
+                        writeVideoSample(buf, bufferInfo)
+                    } else {
+                        writeAudioSample(buf, bufferInfo)
+                    }
+                } finally {
+                    recycleSampleTask(task)
+                }
+            }
+        }
     }
 
     private fun initMuxer() {
@@ -81,11 +143,13 @@ class MuxerManager(
                 if (uri != null) {
                     val pfd = resolver.openFileDescriptor(uri, "rw")
                     if (pfd != null) {
-                        muxerUri = uri
-                        mediaMuxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                        videoTrackIndex = -1
-                        audioTrackIndex = -1
-                        isStarted = false
+                        pfd.use { fd ->
+                            muxerUri = uri
+                            mediaMuxer = MediaMuxer(fd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                            videoTrackIndex = -1
+                            audioTrackIndex = -1
+                            isStarted = false
+                        }
                         AppLogger.i(TAG, "MediaMuxer initialized via MediaStore in public Movies: /sdcard/Movies/QuestCast/$fileName")
                         return
                     }
@@ -153,11 +217,37 @@ class MuxerManager(
 
     fun setAudioFormat(format: MediaFormat) {
         synchronized(lock) {
-            if (audioFormat == null) {
+            if (!isStarted) {
                 audioFormat = format
                 AppLogger.i(TAG, "MuxerManager received Audio Format: $format")
                 tryStartMuxerLocked()
             }
+        }
+    }
+
+    fun writeVideoSampleAsync(bytes: ByteArray, size: Int, ptsUs: Long, flags: Int) {
+        if (!isWriterRunning || size <= 0 || size > bytes.size) return
+        val task = obtainSampleTask(size)
+        System.arraycopy(bytes, 0, task.data, 0, size)
+        task.size = size
+        task.ptsUs = ptsUs
+        task.flags = flags
+        task.isVideo = true
+        if (!writeQueue.offer(task)) {
+            recycleSampleTask(task)
+        }
+    }
+
+    fun writeAudioSampleAsync(bytes: ByteArray, size: Int, ptsUs: Long, flags: Int) {
+        if (!isWriterRunning || size <= 0 || size > bytes.size) return
+        val task = obtainSampleTask(size)
+        System.arraycopy(bytes, 0, task.data, 0, size)
+        task.size = size
+        task.ptsUs = ptsUs
+        task.flags = flags
+        task.isVideo = false
+        if (!writeQueue.offer(task)) {
+            recycleSampleTask(task)
         }
     }
 
@@ -287,6 +377,14 @@ class MuxerManager(
     }
 
     fun stop() {
+        isWriterRunning = false
+        val writerRef = writerThread
+        if (writerRef != null && writerRef.isAlive && Thread.currentThread() != writerRef) {
+            try {
+                writerRef.join(2_000L)
+            } catch (_: InterruptedException) {}
+        }
+        writerThread = null
         synchronized(lock) {
             if (isStarted) {
                 try {

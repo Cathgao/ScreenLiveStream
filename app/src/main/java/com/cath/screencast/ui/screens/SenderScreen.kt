@@ -42,6 +42,9 @@ import com.cath.screencast.model.VideoResolution
 import com.cath.screencast.service.QuestSenderService
 import com.cath.screencast.ui.theme.*
 import com.cath.screencast.viewmodel.MainViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SenderScreen(
@@ -51,6 +54,7 @@ fun SenderScreen(
     onStopStreamRequested: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val config by viewModel.streamConfig.collectAsState()
     val caps by viewModel.encoderCapabilities.collectAsState()
     val resolutionOptions by viewModel.resolutionOptions.collectAsState()
@@ -70,6 +74,13 @@ fun SenderScreen(
         val portStr = config.targetPort.toString()
         if (portInput != portStr) {
             portInput = portStr
+        }
+    }
+    LaunchedEffect(isStreaming) {
+        if (isStreaming) {
+            viewModel.stopLanScan()
+        } else {
+            viewModel.startLanScan()
         }
     }
 
@@ -793,9 +804,13 @@ fun SenderScreen(
         ) {
             Button(
                 onClick = {
-                    val result = AppLogger.exportLogs(context)
-                    logExportResult = result
-                    android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            AppLogger.exportLogs(context)
+                        }
+                        logExportResult = result
+                        android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+                    }
                 },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = NeonCyan,

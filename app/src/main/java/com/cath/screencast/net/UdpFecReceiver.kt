@@ -18,8 +18,9 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         private set
         
     private var socket: DatagramSocket? = null
-    override var onFrameAssembled: ((ByteArray, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
-    override var onAudioFrame: ((ByteArray, Boolean, Long) -> Unit)? = null
+    private var receiverThread: Thread? = null
+    override var onFrameAssembled: ((ByteArray, Int, Boolean, Boolean, Boolean, Long, Int) -> Unit)? = null
+    override var onAudioFrame: ((ByteArray, Int, Boolean, Long) -> Unit)? = null
     override var onReferenceLost: (() -> Unit)? = null
     override var onStatsUpdated: ((StreamStats) -> Unit)? = null
     override var onStreamStop: (() -> Unit)? = null
@@ -46,6 +47,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     private var lastSenderAddress: InetAddress? = null
     private var lastSenderPort: Int = 0
     private var lastKeyframeRequestTime = 0L
+    private var lastKeyframeReceivedTime = 0L
     
     private class FrameBuffer {
         var seq: Int = 0
@@ -55,18 +57,28 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         var flags: Byte = 0
         var fecGroupSize: Int = 8
         var frameBytes: ByteArray = ByteArray(0)
+        var frameNativeBuf: ByteBuffer = ByteBuffer.wrap(frameBytes).order(ByteOrder.nativeOrder())
         var receivedFragments: BooleanArray = BooleanArray(0)
         var receivedDataCount = 0
         var maxGroups = 0
         var fecPackets = Array(32) { ByteArray(1300) }
         var fecLengths = IntArray(32)
         var fecReceived = BooleanArray(32)
+        var groupReceivedCount = IntArray(32)
         var fecCount = 0
         var fecRecoveredCount = 0
         var lastUpdate = 0L
         var isCompleted = false
 
-        fun init(seq: Int, totalFragments: Int, frameSize: Int, timestampMs: Long, flags: Byte, fecGroupSize: Int) {
+        fun init(
+            seq: Int,
+            totalFragments: Int,
+            frameSize: Int,
+            timestampMs: Long,
+            flags: Byte,
+            fecGroupSize: Int,
+            explicitGroups: Int
+        ) {
             this.seq = seq
             this.totalFragments = totalFragments
             this.frameSize = frameSize
@@ -76,6 +88,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
             this.fecGroupSize = gSize
             if (frameBytes.size < frameSize) {
                 frameBytes = ByteArray(Math.max(frameSize, 256 * 1024))
+                frameNativeBuf = ByteBuffer.wrap(frameBytes).order(ByteOrder.nativeOrder())
             }
             if (receivedFragments.size < totalFragments) {
                 receivedFragments = BooleanArray(Math.max(totalFragments, 128))
@@ -83,15 +96,21 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                 java.util.Arrays.fill(receivedFragments, 0, totalFragments, false)
             }
             this.receivedDataCount = 0
-            this.maxGroups = if (totalFragments > 1) ((totalFragments + gSize - 1) / gSize).coerceAtLeast(1) else 0
+            this.maxGroups = if (totalFragments > 1) {
+                if (explicitGroups > 0) explicitGroups else ((totalFragments + gSize - 1) / gSize).coerceAtLeast(1)
+            } else {
+                0
+            }
             val neededGroups = Math.max(this.maxGroups, 32)
             if (fecPackets.size < neededGroups) {
                 fecPackets = Array(neededGroups) { ByteArray(1300) }
                 fecLengths = IntArray(neededGroups)
                 fecReceived = BooleanArray(neededGroups)
+                groupReceivedCount = IntArray(neededGroups)
             } else {
                 java.util.Arrays.fill(fecLengths, 0, neededGroups, 0)
                 java.util.Arrays.fill(fecReceived, 0, neededGroups, false)
+                java.util.Arrays.fill(groupReceivedCount, 0, neededGroups, 0)
             }
             this.fecCount = 0
             this.fecRecoveredCount = 0
@@ -102,43 +121,39 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         fun getExpectedFragLength(index: Int): Int {
             return if (index < totalFragments - 1) 1300 else frameSize - (totalFragments - 1) * 1300
         }
+
+        fun getGroupExpectedCount(groupId: Int): Int {
+            if (maxGroups <= 0 || groupId < 0 || groupId >= totalFragments) return 0
+            return (totalFragments - groupId + maxGroups - 1) / maxGroups
+        }
     }
-    
+
     private class SequencerSlot {
         var isOccupied: Boolean = false
         var seq: Int = -1
-        var frameSize: Int = 0
-        var isKeyframe: Boolean = false
-        var isCodecConfig: Boolean = false
-        var isHevc: Boolean = false
-        var timestampMs: Long = 0L
         var readyTimeMs: Long = 0L
-        var frameBytes: ByteArray = ByteArray(0)
+        var fb: FrameBuffer? = null
 
-        fun copyFrom(fb: FrameBuffer, now: Long) {
+        fun attach(fb: FrameBuffer, now: Long) {
             this.isOccupied = true
             this.seq = fb.seq
-            this.frameSize = fb.frameSize
-            this.isKeyframe = (fb.flags.toInt() and 1) != 0
-            this.isCodecConfig = (fb.flags.toInt() and 2) != 0
-            this.isHevc = (fb.flags.toInt() and 4) != 0
-            this.timestampMs = fb.timestampMs
             this.readyTimeMs = now
-            if (this.frameBytes.size < fb.frameSize) {
-                this.frameBytes = ByteArray(Math.max(fb.frameSize, 256 * 1024))
-            }
-            System.arraycopy(fb.frameBytes, 0, this.frameBytes, 0, fb.frameSize)
+            this.fb = fb
         }
 
         fun clear() {
             this.isOccupied = false
             this.seq = -1
+            this.fb = null
         }
     }
 
-    private val SEQUENCER_SIZE = 64
+    private val SEQUENCER_SIZE = 128
+    private val SEQUENCER_MASK = SEQUENCER_SIZE - 1
     private val sequencerSlots = Array(SEQUENCER_SIZE) { SequencerSlot() }
     private var nextExpectedSeq = -1
+    private var highestSeenSeq = -1
+    private var lastCleanupTimeMs = 0L
     private var sequencerCount = 0
 
     private val frameBuffers = HashMap<Int, FrameBuffer>()
@@ -148,71 +163,105 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     private val fecScratchBuf = ByteBuffer.wrap(fecScratch).order(ByteOrder.nativeOrder())
     private var reusableAudioBuf = ByteArray(4096)
 
-    private fun obtainFrameBuffer(seq: Int, totalFragments: Int, frameSize: Int, timestampMs: Long, flags: Byte, fecGroupSize: Int): FrameBuffer {
+    private fun obtainFrameBuffer(
+        seq: Int,
+        totalFragments: Int,
+        frameSize: Int,
+        timestampMs: Long,
+        flags: Byte,
+        fecGroupSize: Int,
+        explicitGroups: Int
+    ): FrameBuffer {
         val fb = frameBufferPool.poll() ?: FrameBuffer()
-        fb.init(seq, totalFragments, frameSize, timestampMs, flags, fecGroupSize)
+        fb.init(seq, totalFragments, frameSize, timestampMs, flags, fecGroupSize, explicitGroups)
         return fb
     }
 
     private fun recycleFrameBuffer(fb: FrameBuffer) {
         frameBufferPool.offer(fb)
     }
-    
+
+    private fun clearAllPendingState() {
+        lastAssembledSeq = -1
+        nextExpectedSeq = -1
+        highestSeenSeq = -1
+        sequencerCount = 0
+        for (slot in sequencerSlots) {
+            slot.fb?.let { recycleFrameBuffer(it) }
+            slot.clear()
+        }
+        for (fbItem in frameBuffers.values) {
+            recycleFrameBuffer(fbItem)
+        }
+        frameBuffers.clear()
+    }
+
     override fun start(port: Int) {
         if (isListening) return
         isListening = true
-        
-        kotlin.concurrent.thread(name = "UdpReceiverThread") {
+
+        receiverThread = kotlin.concurrent.thread(name = "UdpReceiverThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             try {
                 val s = DatagramSocket(null)
                 s.reuseAddress = true
+                s.soTimeout = 25
                 s.bind(java.net.InetSocketAddress(listenPort))
                 socket = s
-                socket?.receiveBufferSize = 16 * 1024 * 1024
-                AppLogger.i(TAG, "UDP Receiver listening on port $listenPort (rcvBuf=${socket?.receiveBufferSize}, Interleaved FEC Enabled)")
-                
+                s.receiveBufferSize = 16 * 1024 * 1024
+                AppLogger.i(TAG, "UDP Receiver listening on port $listenPort (rcvBuf=${s.receiveBufferSize}, Interleaved FEC Enabled)")
+
                 val buffer = ByteArray(2000)
                 val dp = DatagramPacket(buffer, buffer.size)
-                
+
                 while (isListening) {
-                    dp.length = buffer.size
-                    socket?.receive(dp)
+                    try {
+                        dp.length = buffer.size
+                        s.receive(dp)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        val now = System.currentTimeMillis()
+                        if (highestSeenSeq >= 0) {
+                            cleanOldFrames(highestSeenSeq, now)
+                        } else {
+                            flushSequencer(now)
+                        }
+                        continue
+                    }
                     val length = dp.length
-                    
-                    lastSenderAddress = dp.address
-                    lastSenderPort = dp.port
-                    
+
                     if (length >= PacketProtocol.HEADER_SIZE) {
                         if (PacketProtocol.isStreamStopPacket(buffer, length)) {
                             AppLogger.i(TAG, "Received STREAM_STOP packet via UDP")
                             onStreamStop?.invoke()
-                            // Clear state
-                            lastAssembledSeq = -1
-                            nextExpectedSeq = -1
-                            sequencerCount = 0
-                            for (slot in sequencerSlots) slot.clear()
-                            for (fb in frameBuffers.values) {
-                                recycleFrameBuffer(fb)
+                            clearAllPendingState()
+                            continue
+                        }
+                        val probe = PacketProtocol.readProbeSequence(buffer, length)
+                        if (probe != null) {
+                            if (!probe.isReply && !probe.isIdrRequest) {
+                                val reply = PacketProtocol.buildPingReplyPacket(probe.seq, probe.echoedNanos)
+                                s.send(DatagramPacket(reply, reply.size, dp.address, dp.port))
                             }
-                            frameBuffers.clear()
                             continue
                         }
                     }
 
                     if (length < 28) continue
-                    
+
                     val magic = ((buffer[0].toInt() and 0xFF) shl 24) or
                                 ((buffer[1].toInt() and 0xFF) shl 16) or
                                 ((buffer[2].toInt() and 0xFF) shl 8) or
                                 (buffer[3].toInt() and 0xFF)
                     if (magic != 0x55445056) continue
-                    
+
+                    lastSenderAddress = dp.address
+                    lastSenderPort = dp.port
+
                     val seq = ((buffer[4].toInt() and 0xFF) shl 24) or
                               ((buffer[5].toInt() and 0xFF) shl 16) or
                               ((buffer[6].toInt() and 0xFF) shl 8) or
                               (buffer[7].toInt() and 0xFF)
-                    
+
                     val ts = ((buffer[8].toLong() and 0xFFL) shl 56) or
                              ((buffer[9].toLong() and 0xFFL) shl 48) or
                              ((buffer[10].toLong() and 0xFFL) shl 40) or
@@ -221,7 +270,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                              ((buffer[13].toLong() and 0xFFL) shl 16) or
                              ((buffer[14].toLong() and 0xFFL) shl 8) or
                              (buffer[15].toLong() and 0xFFL)
-                    
+
                     val flags = buffer[16]
                     val fragIndex = ((buffer[17].toInt() and 0xFF) shl 8) or (buffer[18].toInt() and 0xFF)
                     val totalFragments = ((buffer[19].toInt() and 0xFF) shl 8) or (buffer[20].toInt() and 0xFF)
@@ -229,10 +278,8 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                                     ((buffer[22].toInt() and 0xFF) shl 16) or
                                     ((buffer[23].toInt() and 0xFF) shl 8) or
                                     (buffer[24].toInt() and 0xFF)
-                    
-                    val isKeyframe = (flags.toInt() and 1) != 0
+
                     val isCodecConfig = (flags.toInt() and 2) != 0
-                    val isHevc = (flags.toInt() and 4) != 0
                     val isFec = (flags.toInt() and 8) != 0
                     val isAudio = (flags.toInt() and 16) != 0
                     val isAudioConfig = (flags.toInt() and 32) != 0
@@ -254,10 +301,10 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                         }
                         continue
                     }
-                    
+
                     totalBytesReceived += length
                     windowBytesReceived += length
-                    
+
                     if (isAudio) {
                         val payloadSize = length - 28
                         if (payloadSize > 0) {
@@ -265,8 +312,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                                 reusableAudioBuf = ByteArray(Math.max(payloadSize, 4096))
                             }
                             System.arraycopy(buffer, 28, reusableAudioBuf, 0, payloadSize)
-                            val payload = reusableAudioBuf.copyOf(payloadSize)
-                            onAudioFrame?.invoke(payload, isAudioConfig, ts)
+                            onAudioFrame?.invoke(reusableAudioBuf, payloadSize, isAudioConfig, ts)
                             tickStats()
                         }
                         continue
@@ -274,21 +320,13 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
 
                     // Bounds check for safety against corrupt UDP packets
                     if (totalFragments <= 0 || totalFragments > 2000) continue
-                    if (fragIndex < 0 || fragIndex >= totalFragments) continue
                     if (frameSize <= 0 || frameSize > 16 * 1024 * 1024) continue
-                    
+
                     if (seq <= lastAssembledSeq) {
-                        val isRestart = (lastAssembledSeq - seq > 500)
+                        val isRestart = (lastAssembledSeq - seq > 50) || (isCodecConfig && seq <= 5 && lastAssembledSeq > 5)
                         if (isRestart) {
                             AppLogger.w(TAG, "Sequence reset detected: old=$lastAssembledSeq new=$seq")
-                            lastAssembledSeq = -1
-                            nextExpectedSeq = -1
-                            sequencerCount = 0
-                            for (slot in sequencerSlots) slot.clear()
-                            for (fbItem in frameBuffers.values) {
-                                recycleFrameBuffer(fbItem)
-                            }
-                            frameBuffers.clear()
+                            clearAllPendingState()
                         } else {
                             val existing = frameBuffers[seq]
                             if (existing == null || existing.isCompleted) {
@@ -297,15 +335,27 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                         }
                     }
 
+                    // Skip duplicate packets for frames already completed & waiting in sequencerSlots
+                    val pendingSlot = sequencerSlots[seq and SEQUENCER_MASK]
+                    if (pendingSlot.isOccupied && pendingSlot.seq == seq) {
+                        continue
+                    }
+
                     var fb = frameBuffers[seq]
+                    val now = System.currentTimeMillis()
                     if (fb == null) {
                         val fecGroupSize = if ((buffer[25].toInt() and 0xFF) > 0) (buffer[25].toInt() and 0xFF) else 8
-                        fb = obtainFrameBuffer(seq, totalFragments, frameSize, ts, flags, fecGroupSize)
+                        val explicitGroups = buffer[26].toInt() and 0xFF
+                        fb = obtainFrameBuffer(seq, totalFragments, frameSize, ts, flags, fecGroupSize, explicitGroups)
                         frameBuffers[seq] = fb
-                        cleanOldFrames(seq)
+                        if (seq > highestSeenSeq) highestSeenSeq = seq
+                        cleanOldFrames(highestSeenSeq, now)
+                    } else if (now - lastCleanupTimeMs >= 20L) {
+                        cleanOldFrames(highestSeenSeq, now)
                     }
-                    fb.lastUpdate = System.currentTimeMillis()
-                    
+                    fb.lastUpdate = now
+
+                    var touchedGroupId = -1
                     if (isFec) {
                         val groupId = fragIndex
                         if (groupId in 0 until fb.maxGroups && !fb.fecReceived[groupId]) {
@@ -314,20 +364,27 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
                             fb.fecLengths[groupId] = fecLen
                             fb.fecReceived[groupId] = true
                             fb.fecCount++
+                            touchedGroupId = groupId
                         }
                     } else {
+                        if (fragIndex < 0 || fragIndex >= fb.totalFragments) continue
                         val offset = fragIndex * 1300
                         val dataLen = length - 28
-                        if (fragIndex < fb.totalFragments && !fb.receivedFragments[fragIndex]) {
+                        if (!fb.receivedFragments[fragIndex]) {
                             if (offset + dataLen <= fb.frameBytes.size) {
                                 System.arraycopy(buffer, 28, fb.frameBytes, offset, dataLen)
                                 fb.receivedFragments[fragIndex] = true
                                 fb.receivedDataCount++
+                                if (fb.maxGroups > 0) {
+                                    val g = fragIndex % fb.maxGroups
+                                    fb.groupReceivedCount[g]++
+                                    touchedGroupId = g
+                                }
                             }
                         }
                     }
-                    
-                    checkAndAssemble(fb)
+
+                    checkAndAssemble(fb, touchedGroupId)
                     tickStats()
                 }
             } catch (e: Exception) {
@@ -348,7 +405,7 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         val s = socket ?: return
         val addr = lastSenderAddress ?: return
         val now = System.currentTimeMillis()
-        if (now - lastKeyframeRequestTime < 100) return
+        if (now - lastKeyframeRequestTime < 600L || now - lastKeyframeReceivedTime < 350L) return
         lastKeyframeRequestTime = now
         val idrReq = ByteArray(22)
         idrReq[0] = PacketProtocol.MAGIC_0
@@ -361,11 +418,11 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
         } catch (_: Exception) {}
     }
 
-    private fun cleanOldFrames(currentSeq: Int) {
+    private fun cleanOldFrames(currentSeq: Int, now: Long = System.currentTimeMillis()) {
+        lastCleanupTimeMs = now
         val iter = frameBuffers.entries.iterator()
-        val now = System.currentTimeMillis()
         var hadDrop = false
-        val maxSeqAge = if (jitterBufferMs > 100) 150 else 30
+        val maxSeqAge = if (jitterBufferMs > 100) 150 else 45
         val maxTimeAgeMs = if (jitterBufferMs > 100) 2000L else 1000L
         while (iter.hasNext()) {
             val entry = iter.next()
@@ -385,98 +442,101 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
             sendKeyframeRequest()
         }
     }
-    
-    private fun checkAndAssemble(fb: FrameBuffer) {
+
+    private fun checkAndAssemble(fb: FrameBuffer, touchedGroupId: Int) {
         if (fb.isCompleted) return
-        
-        // Try Interleaved FEC recovery (frag k mapped to k % m == groupId)
+
+        // O(1) Interleaved FEC recovery: only inspect the specific group touched by this packet
         val m = fb.maxGroups
-        if (fb.receivedDataCount < fb.totalFragments && fb.fecCount > 0 && m > 0) {
-            val frameBuf = ByteBuffer.wrap(fb.frameBytes).order(ByteOrder.nativeOrder())
-            
-            for (groupId in 0 until m) {
-                if (!fb.fecReceived[groupId]) continue
-
-                var missingCount = 0
-                var missingIdx = -1
-
-                var k = groupId
-                while (k < fb.totalFragments) {
-                    if (!fb.receivedFragments[k]) {
-                        missingCount++
-                        missingIdx = k
-                    }
-                    k += m
-                }
-                
-                if (missingCount == 1) {
-                    // Recover missing fragment using reusable scratch buffer with 64-bit fast Long XOR
-                    val fecPayload = fb.fecPackets[groupId]
-                    val fecLen = fb.fecLengths[groupId]
-                    System.arraycopy(fecPayload, 0, fecScratch, 0, fecLen)
-                    
-                    var j = groupId
-                    while (j < fb.totalFragments) {
-                        if (j != missingIdx && fb.receivedFragments[j]) {
-                            val fragOffset = j * 1300
-                            val fragLen = fb.getExpectedFragLength(j)
-                            val longsCount = fragLen ushr 3
-                            for (l in 0 until longsCount) {
-                                val pos = l shl 3
-                                fecScratchBuf.putLong(pos, fecScratchBuf.getLong(pos) xor frameBuf.getLong(fragOffset + pos))
-                            }
-                            val remStart = longsCount shl 3
-                            for (b in remStart until fragLen) {
-                                fecScratch[b] = (fecScratch[b].toInt() xor fb.frameBytes[fragOffset + b].toInt()).toByte()
-                            }
+        if (fb.receivedDataCount < fb.totalFragments && m > 0 && touchedGroupId in 0 until m) {
+            if (fb.fecReceived[touchedGroupId]) {
+                val expectedInGroup = fb.getGroupExpectedCount(touchedGroupId)
+                if (fb.groupReceivedCount[touchedGroupId] == expectedInGroup - 1) {
+                    var missingIdx = -1
+                    var k = touchedGroupId
+                    while (k < fb.totalFragments) {
+                        if (!fb.receivedFragments[k]) {
+                            missingIdx = k
+                            break
                         }
-                        j += m
+                        k += m
                     }
-                    
-                    val expectedLen = fb.getExpectedFragLength(missingIdx)
-                    val copyLen = Math.min(expectedLen, fecLen)
-                    val missingOffset = missingIdx * 1300
-                    if (missingOffset + copyLen <= fb.frameBytes.size) {
-                        System.arraycopy(fecScratch, 0, fb.frameBytes, missingOffset, copyLen)
-                        fb.receivedFragments[missingIdx] = true
-                        fb.receivedDataCount++
-                        fb.fecRecoveredCount++
-                        totalFecRecovered++
-                        windowFecRecovered++
-                        AppLogger.i(TAG, "[FEC] Interleaved recovered missing frag $missingIdx/${fb.totalFragments} for Frame #${fb.seq} (Group $groupId/$m)")
+                    if (missingIdx >= 0) {
+                        val frameBuf = fb.frameNativeBuf
+                        val fecPayload = fb.fecPackets[touchedGroupId]
+                        val fecLen = fb.fecLengths[touchedGroupId]
+                        System.arraycopy(fecPayload, 0, fecScratch, 0, fecLen)
+
+                        var j = touchedGroupId
+                        while (j < fb.totalFragments) {
+                            if (j != missingIdx && fb.receivedFragments[j]) {
+                                val fragOffset = j * 1300
+                                val fragLen = fb.getExpectedFragLength(j)
+                                val longsCount = fragLen ushr 3
+                                for (l in 0 until longsCount) {
+                                    val pos = l shl 3
+                                    fecScratchBuf.putLong(pos, fecScratchBuf.getLong(pos) xor frameBuf.getLong(fragOffset + pos))
+                                }
+                                val remStart = longsCount shl 3
+                                for (b in remStart until fragLen) {
+                                    fecScratch[b] = (fecScratch[b].toInt() xor fb.frameBytes[fragOffset + b].toInt()).toByte()
+                                }
+                            }
+                            j += m
+                        }
+
+                        val expectedLen = fb.getExpectedFragLength(missingIdx)
+                        val copyLen = Math.min(expectedLen, fecLen)
+                        val missingOffset = missingIdx * 1300
+                        if (missingOffset + copyLen <= fb.frameBytes.size) {
+                            System.arraycopy(fecScratch, 0, fb.frameBytes, missingOffset, copyLen)
+                            fb.receivedFragments[missingIdx] = true
+                            fb.receivedDataCount++
+                            fb.groupReceivedCount[touchedGroupId]++
+                            fb.fecRecoveredCount++
+                            totalFecRecovered++
+                            windowFecRecovered++
+                            AppLogger.i(TAG, "[FEC] Interleaved recovered missing frag $missingIdx/${fb.totalFragments} for Frame #${fb.seq} (Group $touchedGroupId/$m)")
+                        }
                     }
                 }
             }
         }
-        
+
         if (fb.receivedDataCount == fb.totalFragments) {
             onFrameCompleted(fb)
         }
     }
-    
+
     private fun onFrameCompleted(fb: FrameBuffer) {
         fb.isCompleted = true
-        val isCodecConfig = (fb.flags.toInt() and 2) != 0
-        if (isCodecConfig) {
-            val isKeyframe = (fb.flags.toInt() and 1) != 0
-            val isHevc = (fb.flags.toInt() and 4) != 0
-            val assembledBytes = fb.frameBytes.copyOf(fb.frameSize)
-            lastAssembledSeq = fb.seq
-            onFrameAssembled?.invoke(assembledBytes, isKeyframe, isCodecConfig, isHevc, fb.timestampMs, fb.seq)
-            return
-        }
-
+        frameBuffers.remove(fb.seq)
         val now = System.currentTimeMillis()
-        val slotIdx = fb.seq and (SEQUENCER_SIZE - 1)
-        val slot = sequencerSlots[slotIdx]
-        if (!slot.isOccupied) {
-            sequencerCount++
-        }
-        slot.copyFrom(fb, now)
 
         if (nextExpectedSeq == -1 || Math.abs(fb.seq - nextExpectedSeq) > 100) {
             nextExpectedSeq = fb.seq
         }
+
+        val slotIdx = fb.seq and SEQUENCER_MASK
+        val slot = sequencerSlots[slotIdx]
+        if (slot.isOccupied) {
+            if (slot.seq == fb.seq) {
+                recycleFrameBuffer(fb)
+                return
+            }
+            // Flush or recycle old unconsumed slot before reusing ring position
+            if (slot.seq - nextExpectedSeq >= 0) {
+                nextExpectedSeq = slot.seq
+                flushSequencer(now)
+            }
+            if (slot.isOccupied) {
+                slot.fb?.let { recycleFrameBuffer(it) }
+                slot.clear()
+                sequencerCount--
+            }
+        }
+        slot.attach(fb, now)
+        sequencerCount++
 
         flushSequencer(now)
     }
@@ -486,11 +546,10 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
 
         // 1. Dispatch contiguous ascending sequence without wait
         while (true) {
-            val slotIdx = nextExpectedSeq and (SEQUENCER_SIZE - 1)
+            val slotIdx = nextExpectedSeq and SEQUENCER_MASK
             val slot = sequencerSlots[slotIdx]
             if (slot.isOccupied && slot.seq == nextExpectedSeq) {
                 dispatchSlot(slot)
-                slot.clear()
                 sequencerCount--
                 nextExpectedSeq++
             } else {
@@ -500,38 +559,62 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
 
         if (sequencerCount == 0) return
 
-        // 2. Timeout check on oldest waiting frame to avoid stall on truly dropped frames
-        val maxWaitMs = if (jitterBufferMs > 100) 40L else 12L
+        // 2. Clean stale slots and find the lowest seq >= nextExpectedSeq in ascending seq order
+        val maxWaitMs = if (jitterBufferMs > 100) 80L else 30L
+        var minSlot: SequencerSlot? = null
         for (i in 0 until SEQUENCER_SIZE) {
             val slot = sequencerSlots[i]
-            if (slot.isOccupied) {
-                val waitTime = now - slot.readyTimeMs
-                if (waitTime > maxWaitMs || (slot.seq - nextExpectedSeq > 20)) {
-                    nextExpectedSeq = slot.seq
-                    while (true) {
-                        val curIdx = nextExpectedSeq and (SEQUENCER_SIZE - 1)
-                        val curSlot = sequencerSlots[curIdx]
-                        if (curSlot.isOccupied && curSlot.seq == nextExpectedSeq) {
-                            dispatchSlot(curSlot)
-                            curSlot.clear()
-                            sequencerCount--
-                            nextExpectedSeq++
-                        } else {
-                            break
-                        }
+            if (!slot.isOccupied) continue
+            val delta = slot.seq - nextExpectedSeq
+            if (delta < 0) {
+                slot.fb?.let { recycleFrameBuffer(it) }
+                slot.clear()
+                sequencerCount--
+                continue
+            }
+            if (minSlot == null || slot.seq < minSlot.seq) {
+                minSlot = slot
+            }
+        }
+
+        if (minSlot != null) {
+            val waitTime = now - minSlot.readyTimeMs
+            val isPriorityWaiting = minSlot.fb?.let { (it.flags.toInt() and 3) != 0 } == true
+            if (waitTime > maxWaitMs || (minSlot.seq - nextExpectedSeq > 32) || (isPriorityWaiting && waitTime > 12L)) {
+                nextExpectedSeq = minSlot.seq
+                while (true) {
+                    val curIdx = nextExpectedSeq and SEQUENCER_MASK
+                    val curSlot = sequencerSlots[curIdx]
+                    if (curSlot.isOccupied && curSlot.seq == nextExpectedSeq) {
+                        dispatchSlot(curSlot)
+                        sequencerCount--
+                        nextExpectedSeq++
+                    } else {
+                        break
                     }
-                    break
                 }
             }
         }
     }
 
     private fun dispatchSlot(slot: SequencerSlot) {
-        totalReceivedFrames++
-        windowReceivedFrames++
-        lastAssembledSeq = slot.seq
-        val assembledBytes = slot.frameBytes.copyOf(slot.frameSize)
-        onFrameAssembled?.invoke(assembledBytes, slot.isKeyframe, slot.isCodecConfig, slot.isHevc, slot.timestampMs, slot.seq)
+        val fb = slot.fb
+        if (fb != null) {
+            val isKeyframe = (fb.flags.toInt() and 1) != 0
+            val isCodecConfig = (fb.flags.toInt() and 2) != 0
+            val isHevc = (fb.flags.toInt() and 4) != 0
+            if (!isCodecConfig) {
+                totalReceivedFrames++
+                windowReceivedFrames++
+            }
+            if (isKeyframe) {
+                lastKeyframeReceivedTime = System.currentTimeMillis()
+            }
+            lastAssembledSeq = fb.seq
+            onFrameAssembled?.invoke(fb.frameBytes, fb.frameSize, isKeyframe, isCodecConfig, isHevc, fb.timestampMs, fb.seq)
+            recycleFrameBuffer(fb)
+        }
+        slot.clear()
     }
     
     private fun tickStats() {
@@ -573,13 +656,16 @@ class UdpFecReceiver(private val listenPort: Int) : IReceiver {
     
     override fun stop() {
         isListening = false
+        val threadRef = receiverThread
+        threadRef?.interrupt()
         try {
             socket?.close()
-        } catch (e: Exception) {}
+        } catch (_: Exception) {}
         socket = null
-        frameBuffers.clear()
-        nextExpectedSeq = -1
-        sequencerCount = 0
-        for (slot in sequencerSlots) slot.clear()
+        try {
+            threadRef?.join(500L)
+        } catch (_: Exception) {}
+        receiverThread = null
+        clearAllPendingState()
     }
 }

@@ -53,44 +53,6 @@ object PacketProtocol {
     const val DISCOVERY_ACK_PREFIX = "QUEST_CAST_RECEIVER_ACK:"
     const val DISCOVERY_BEACON_PREFIX = "QUEST_CAST_BEACON:"
 
-    fun buildPacket(
-        buffer: ByteArray,
-        offset: Int,
-        payloadSize: Int,
-        frameSeq: Int,
-        timestampMs: Long,
-        packetIndex: Short,
-        totalPackets: Short,
-        isKeyframe: Boolean,
-        isCodecConfig: Boolean,
-        isHevc: Boolean,
-        isAudio: Boolean = false
-    ): ByteArray {
-        val totalLength = HEADER_SIZE + payloadSize
-        val packet = ByteArray(totalLength)
-        val bb = ByteBuffer.wrap(packet)
-
-        bb.put(MAGIC_0)
-        bb.put(MAGIC_1)
-        bb.put(VERSION)
-
-        var flags: Byte = 0
-        if (isKeyframe) flags = (flags.toInt() or FLAG_KEYFRAME.toInt()).toByte()
-        if (isCodecConfig) flags = (flags.toInt() or FLAG_CODEC_CONFIG.toInt()).toByte()
-        if (isHevc) flags = (flags.toInt() or FLAG_CODEC_HEVC.toInt()).toByte()
-        if (isAudio) flags = (flags.toInt() or FLAG_AUDIO.toInt()).toByte()
-        bb.put(flags)
-
-        bb.putInt(frameSeq)
-        bb.putLong(timestampMs)
-        bb.putShort(packetIndex)
-        bb.putShort(totalPackets)
-        bb.putShort(payloadSize.toShort())
-
-        System.arraycopy(buffer, offset, packet, HEADER_SIZE, payloadSize)
-        return packet
-    }
-
     /**
      * Build a sender-initiated RTT probe. The 8 byte payload carries the
      * monotonic send timestamp (nanos since some arbitrary origin) so the
@@ -249,63 +211,5 @@ object PacketProtocol {
         bb.putInt(rttMs.coerceAtLeast(0))
         bb.putInt(lossPercentX100.coerceIn(0, 10000))
         return packet
-    }
-
-    class ParsedPacket(
-        val frameSeq: Int,
-        val timestampMs: Long,
-        val packetIndex: Int,
-        val totalPackets: Int,
-        val isKeyframe: Boolean,
-        val isCodecConfig: Boolean,
-        val isHevc: Boolean,
-        val isAudio: Boolean,
-        val payloadSize: Int,
-        val payloadOffset: Int
-    )
-
-    fun parsePacket(data: ByteArray, length: Int): ParsedPacket? {
-        if (length < HEADER_SIZE) return null
-        if (data[0] != MAGIC_0 || data[1] != MAGIC_1) return null
-
-        val flags = data[3].toInt() and 0xFF
-
-        val isKeyframe = (flags and FLAG_KEYFRAME.toInt()) != 0
-        val isCodecConfig = (flags and FLAG_CODEC_CONFIG.toInt()) != 0
-        val isHevc = (flags and FLAG_CODEC_HEVC.toInt()) != 0
-        val isAudio = (flags and FLAG_AUDIO.toInt()) != 0
-
-        val frameSeq = ((data[4].toInt() and 0xFF) shl 24) or
-                       ((data[5].toInt() and 0xFF) shl 16) or
-                       ((data[6].toInt() and 0xFF) shl 8) or
-                       (data[7].toInt() and 0xFF)
-
-        val timestampMs = ((data[8].toLong() and 0xFFL) shl 56) or
-                          ((data[9].toLong() and 0xFFL) shl 48) or
-                          ((data[10].toLong() and 0xFFL) shl 40) or
-                          ((data[11].toLong() and 0xFFL) shl 32) or
-                          ((data[12].toLong() and 0xFFL) shl 24) or
-                          ((data[13].toLong() and 0xFFL) shl 16) or
-                          ((data[14].toLong() and 0xFFL) shl 8) or
-                          (data[15].toLong() and 0xFFL)
-
-        val packetIndex = ((data[16].toInt() and 0xFF) shl 8) or (data[17].toInt() and 0xFF)
-        val totalPackets = ((data[18].toInt() and 0xFF) shl 8) or (data[19].toInt() and 0xFF)
-        val payloadSize = ((data[20].toInt() and 0xFF) shl 8) or (data[21].toInt() and 0xFF)
-
-        if (length < HEADER_SIZE + payloadSize) return null
-
-        return ParsedPacket(
-            frameSeq = frameSeq,
-            timestampMs = timestampMs,
-            packetIndex = packetIndex,
-            totalPackets = totalPackets,
-            isKeyframe = isKeyframe,
-            isCodecConfig = isCodecConfig,
-            isHevc = isHevc,
-            isAudio = isAudio,
-            payloadSize = payloadSize,
-            payloadOffset = HEADER_SIZE
-        )
     }
 }

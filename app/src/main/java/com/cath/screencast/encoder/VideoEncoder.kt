@@ -70,7 +70,10 @@ class VideoEncoder(
 
     fun start() {
         try {
-            logSystemEncoders()
+            if (!hasLoggedEncoders) {
+                hasLoggedEncoders = true
+                logSystemEncoders()
+            }
 
             val width = if (overrideWidth > 0) overrideWidth else if (config.resolution.width > 0) config.resolution.width else 1920
             val height = if (overrideHeight > 0) overrideHeight else if (config.resolution.height > 0) config.resolution.height else 1080
@@ -193,13 +196,13 @@ class VideoEncoder(
 
     private fun startEncodeLoop() {
         encoderThread = thread(start = true, name = "QuestVideoEncoderThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
             val bufferInfo = MediaCodec.BufferInfo()
             var tempBuffer = ByteArray(512 * 1024)
             var totalOutputFrames = 0
             var lastLogTime = System.currentTimeMillis()
 
-            AppLogger.i(TAG, "Encoder loop thread running at URGENT_DISPLAY priority...")
+            AppLogger.i(TAG, "Encoder loop thread running at DISPLAY priority...")
 
             while (isEncoding) {
                 try {
@@ -370,5 +373,7 @@ class VideoEncoder(
 
     companion object {
         private const val TAG = "VideoEncoder"
+        @Volatile
+        private var hasLoggedEncoders = false
     }
 }

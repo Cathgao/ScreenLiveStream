@@ -66,6 +66,7 @@ class QuestSenderService : Service() {
     private var lastRotation = 0
     private var currentEncoderWidth = 0
     private var currentEncoderHeight = 0
+    private var sessionStartNs = 0L
     private var displayListener: DisplayManager.DisplayListener? = null
 
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
@@ -145,7 +146,7 @@ class QuestSenderService : Service() {
             AppLogger.e(TAG, "Cannot start streaming: Invalid resultCode ($resultCode) or null resultData")
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun getRealDisplayMetrics(): Pair<Int, Int> {
@@ -163,7 +164,7 @@ class QuestSenderService : Service() {
     private fun getDisplayRotation(): Int {
         val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
-        return display?.rotation ?: Display.DEFAULT_DISPLAY
+        return display?.rotation ?: android.view.Surface.ROTATION_0
     }
 
     private fun computeEffectiveResolution(config: StreamConfig, screenWidth: Int, screenHeight: Int): Pair<Int, Int> {
@@ -250,6 +251,9 @@ class QuestSenderService : Service() {
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
         if (projection == null) {
             AppLogger.e(TAG, "MediaProjection is null! Permission denied or token expired.")
+            stopStreaming()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
             return
         }
         mediaProjection = projection
@@ -310,17 +314,18 @@ class QuestSenderService : Service() {
             // ~6 windows after start(); avgRttMs is the steady-state
             // value the user actually wants to see on the HUD.
             val publishedRttMs = if (stats.avgRttMs > 0) stats.avgRttMs else stats.lastRttMs
+            val publishedLoss = if (config.protocol == TransportProtocol.TCP) 0f else stats.lossPercent
             onStatsUpdate?.invoke(
                 StreamStats(
                     isStreaming = true,
                     isReceiving = true,
                     latencyMs = publishedRttMs.toLong(),
-                    lossNetworkPercent = 0f,
+                    lossNetworkPercent = publishedLoss,
                     statsTimestampMs = System.currentTimeMillis()
                 )
             )
-            // Broadcast rolling RTT and 0.0% loss (TCP is loss-free) to receiver HUD
-            currentStreamer.sendStatsBeacon(publishedRttMs, 0f)
+            // Broadcast rolling RTT and network loss to receiver HUD
+            currentStreamer.sendStatsBeacon(publishedRttMs, publishedLoss)
         }
         rttProbe.start(config.targetIp, config.targetPort)
 
@@ -334,19 +339,15 @@ class QuestSenderService : Service() {
             defaultDisplay?.refreshRate?.toInt() ?: 90
         }
 
-        // Apply Resolution & FPS to System Properties for Quest
-        setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
-        setSystemProperty("debug.oculus.capture.width", effWidth.toString())
-        setSystemProperty("debug.oculus.capture.height", effHeight.toString())
-        setSystemProperty("debug.oculus.fullRateCapture", "1")
-        if (config.frameRate > 0) {
-            setSystemProperty("debug.oculus.capture.fps", effFps.toString())
+        // Apply Resolution & FPS to System Properties for Quest (off main thread)
+        if (DeviceUtils.isQuestDevice) {
+            applyQuestCapturePropertiesAsync(config, effWidth, effHeight, effFps)
         }
-        setSystemProperty("debug.oculus.capture.bitrate", (config.bitrateKbps * 1000).toString())
 
         AppLogger.i(TAG, "Stream parameters computed: $effWidth x $effHeight @ $effFps FPS (Screen: ${screenWidth}x${screenHeight}, Rotation: $lastRotation)")
 
-        val sessionStartNs = System.nanoTime()
+        val startNs = System.nanoTime()
+        sessionStartNs = startNs
 
         val enc = VideoEncoder(
             config = config,
@@ -355,7 +356,7 @@ class QuestSenderService : Service() {
             overrideHeight = effHeight,
             overrideFps = effFps,
             context = this,
-            streamStartRealNs = sessionStartNs
+            streamStartRealNs = startNs
         )
         enc.start()
         encoder = enc
@@ -367,11 +368,11 @@ class QuestSenderService : Service() {
             val audioEnc = AudioEncoder(
                 mediaProjection = projection,
                 tcpStreamer = currentStreamer,
-                streamStartRealNs = sessionStartNs
+                streamStartRealNs = startNs
             )
             audioEnc.start()
             audioEncoder = audioEnc
-            AppLogger.i(TAG, "Internal AudioEncoder started with unified session start anchor: $sessionStartNs")
+            AppLogger.i(TAG, "Internal AudioEncoder started with unified session start anchor: $startNs")
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to start internal AudioEncoder", e)
         }
@@ -379,6 +380,9 @@ class QuestSenderService : Service() {
         val surface = enc.inputSurface
         if (surface == null) {
             AppLogger.e(TAG, "Encoder inputSurface is null! Cannot create VirtualDisplay.")
+            stopStreaming()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
             return
         }
 
@@ -386,13 +390,17 @@ class QuestSenderService : Service() {
         defaultDisplay?.getRealMetrics(dm)
         val densityDpi = if (dm.densityDpi > 0) dm.densityDpi else resources.displayMetrics.densityDpi
 
-        AppLogger.i(TAG, "Creating VirtualDisplay with resolution $effWidth x $effHeight, DPI $densityDpi")
+        if (config.frameRate > 0) {
+            applySurfaceFrameRate(surface, config.frameRate)
+        }
+
+        AppLogger.i(TAG, "Creating VirtualDisplay with resolution $effWidth x $effHeight, DPI $densityDpi, targetFps=${config.frameRate}")
         virtualDisplay = projection.createVirtualDisplay(
             "Quest3ScreenCast",
             effWidth,
             effHeight,
             densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             surface,
             null,
             null
@@ -453,6 +461,7 @@ class QuestSenderService : Service() {
         encoder = null
         currentEncoderWidth = 0
         currentEncoderHeight = 0
+        sessionStartNs = 0L
 
         try {
             streamer?.sendStreamStopSignal()
@@ -544,7 +553,8 @@ class QuestSenderService : Service() {
             overrideWidth = effWidth,
             overrideHeight = effHeight,
             overrideFps = effFps,
-            context = this
+            context = this,
+            streamStartRealNs = sessionStartNs
         )
         try {
             enc.start()
@@ -569,13 +579,17 @@ class QuestSenderService : Service() {
         defaultDisplay?.getRealMetrics(dm)
         val densityDpi = if (dm.densityDpi > 0) dm.densityDpi else resources.displayMetrics.densityDpi
 
+        if (config.frameRate > 0) {
+            applySurfaceFrameRate(surface, config.frameRate)
+        }
+
         if (virtualDisplay == null) {
             virtualDisplay = projection.createVirtualDisplay(
                 "Quest3ScreenCast",
                 effWidth,
                 effHeight,
                 densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 surface,
                 null,
                 null
@@ -644,21 +658,55 @@ class QuestSenderService : Service() {
             .build()
     }
 
+    private fun applySurfaceFrameRate(surface: android.view.Surface, targetFps: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && targetFps > 0) {
+            try {
+                surface.setFrameRate(
+                    targetFps.toFloat(),
+                    android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
+                )
+                AppLogger.i(TAG, "Applied Surface.setFrameRate($targetFps Hz) to cap VirtualDisplay mirror load.")
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "Failed to set Surface frame rate to $targetFps: ${e.message}")
+            }
+        }
+    }
+
+    private fun applyQuestCapturePropertiesAsync(config: StreamConfig, effWidth: Int, effHeight: Int, effFps: Int) {
+        kotlin.concurrent.thread(name = "QuestPropSetter") {
+            setSystemProperty("debug.oculus.screenCaptureEye", config.eyeCrop.sysPropValue.toString())
+            setSystemProperty("debug.oculus.capture.width", effWidth.toString())
+            setSystemProperty("debug.oculus.capture.height", effHeight.toString())
+            setSystemProperty("debug.oculus.fullRateCapture", "1")
+            if (config.frameRate > 0) {
+                setSystemProperty("debug.oculus.capture.fps", effFps.toString())
+            }
+            setSystemProperty("debug.oculus.capture.bitrate", (config.bitrateKbps * 1000).toString())
+        }
+    }
+
     private fun setSystemProperty(key: String, value: String) {
         try {
-            val process = Runtime.getRuntime().exec("setprop $key $value")
-            process.waitFor()
-            AppLogger.i(TAG, "Successfully executed setprop for $key: $value")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Failed to execute setprop. Attempting reflection fallback for $key.", e)
-            try {
-                val clazz = Class.forName("android.os.SystemProperties")
-                val setMethod = clazz.getMethod("set", String::class.java, String::class.java)
-                setMethod.invoke(null, key, value)
-                AppLogger.i(TAG, "Successfully set $key via reflection: $value")
-            } catch (ex: Exception) {
-                AppLogger.e(TAG, "Reflection fallback failed for $key", ex)
+            val clazz = Class.forName("android.os.SystemProperties")
+            val setMethod = clazz.getMethod("set", String::class.java, String::class.java)
+            setMethod.invoke(null, key, value)
+            AppLogger.i(TAG, "Successfully set $key via reflection: $value")
+            return
+        } catch (_: Exception) {
+        }
+        var process: Process? = null
+        try {
+            process = Runtime.getRuntime().exec(arrayOf("setprop", key, value))
+            val exitCode = process.waitFor()
+            if (exitCode == 0) {
+                AppLogger.i(TAG, "Successfully executed setprop for $key: $value")
+            } else {
+                AppLogger.w(TAG, "setprop $key=$value exited with code $exitCode")
             }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Failed to set system property $key=$value: ${e.message}")
+        } finally {
+            process?.destroy()
         }
     }
 

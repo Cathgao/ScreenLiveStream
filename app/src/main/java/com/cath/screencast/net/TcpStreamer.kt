@@ -37,6 +37,9 @@ class TcpStreamer : IStreamer {
 
     @Volatile
     private var isConnected = false
+    private val socketLock = Object()
+    @Volatile
+    private var needSendCachedConfig = false
     private var connectThread: Thread? = null
     private var sendThread: Thread? = null
 
@@ -71,6 +74,48 @@ class TcpStreamer : IStreamer {
         taskPool.offer(task)
     }
 
+    private fun writeCachedConfigsLocked(dos: DataOutputStream) {
+        val audioCfg = cachedAudioCodecConfig
+        if (audioCfg != null) {
+            try {
+                SessionLog.i(TAG, "TCP connected: sending cached audio CodecConfig ($cachedAudioCodecConfigSize bytes)")
+                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
+                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
+                dos.writeByte(PacketProtocol.VERSION.toInt())
+                dos.writeByte((PacketProtocol.FLAG_AUDIO.toInt() or PacketProtocol.FLAG_CODEC_CONFIG.toInt()))
+                dos.writeInt(audioSeqCounter++)
+                dos.writeLong(0L)
+                dos.writeInt(cachedAudioCodecConfigSize)
+                dos.write(audioCfg, 0, cachedAudioCodecConfigSize)
+                dos.flush()
+            } catch (e: Exception) {
+                SessionLog.w(TAG, "Error sending cached audio CodecConfig: ${e.message}")
+            }
+        }
+
+        val videoCfg = cachedVideoCodecConfig
+        if (videoCfg != null) {
+            try {
+                SessionLog.i(TAG, "TCP connected: sending cached video CodecConfig ($cachedVideoCodecConfigSize bytes)")
+                var flags = PacketProtocol.FLAG_CODEC_CONFIG.toInt()
+                if (cachedVideoCodecConfigCodec == VideoCodec.H265) {
+                    flags = flags or PacketProtocol.FLAG_CODEC_HEVC.toInt()
+                }
+                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
+                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
+                dos.writeByte(PacketProtocol.VERSION.toInt())
+                dos.writeByte(flags)
+                dos.writeInt(videoSeqCounter++)
+                dos.writeLong(0L)
+                dos.writeInt(cachedVideoCodecConfigSize)
+                dos.write(videoCfg, 0, cachedVideoCodecConfigSize)
+                dos.flush()
+            } catch (e: Exception) {
+                SessionLog.w(TAG, "Error sending cached video CodecConfig: ${e.message}")
+            }
+        }
+    }
+
     override fun start(targetIp: String, port: Int) {
         stop()
         this.targetIp = targetIp
@@ -81,7 +126,8 @@ class TcpStreamer : IStreamer {
         connectThread = thread(start = true, name = "TcpStreamerConnectThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
             while (isConnected) {
-                if (socket == null || socket?.isClosed == true || socket?.isConnected == false) {
+                val currentSock = socket
+                if (currentSock == null || currentSock.isClosed || !currentSock.isConnected) {
                     try {
                         SessionLog.i(TAG, "Connecting TCP stream to $targetIp:$targetPort...")
                         val s = Socket()
@@ -89,73 +135,56 @@ class TcpStreamer : IStreamer {
                         s.sendBufferSize = 4 * 1024 * 1024
                         s.connect(InetSocketAddress(targetIp, targetPort), 3000)
                         val dos = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 512 * 1024))
-                        socket = s
-                        dataOutputStream = dos
+                        synchronized(socketLock) {
+                            if (!isConnected) {
+                                try { s.close() } catch (_: Exception) {}
+                                return@thread
+                            }
+                            socket = s
+                            dataOutputStream = dos
+                            needSendCachedConfig = true
+                            socketLock.notifyAll()
+                        }
                         SessionLog.i(TAG, "TCP Streamer connected successfully to $targetIp:$targetPort (sndBuf=${s.sendBufferSize})")
-
-                        // Immediately send cached Audio CodecConfig if available
-                        val audioCfg = cachedAudioCodecConfig
-                        if (audioCfg != null) {
-                            try {
-                                SessionLog.i(TAG, "TCP connected: sending cached audio CodecConfig (${cachedAudioCodecConfigSize} bytes)")
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte((PacketProtocol.FLAG_AUDIO.toInt() or PacketProtocol.FLAG_CODEC_CONFIG.toInt()))
-                                dos.writeInt(audioSeqCounter++)
-                                dos.writeLong(0L)
-                                dos.writeInt(cachedAudioCodecConfigSize)
-                                dos.write(audioCfg, 0, cachedAudioCodecConfigSize)
-                                dos.flush()
-                            } catch (e: Exception) {
-                                SessionLog.w(TAG, "Error sending cached audio CodecConfig: ${e.message}")
-                            }
-                        }
-
-                        // Immediately send cached Video CodecConfig if available
-                        val videoCfg = cachedVideoCodecConfig
-                        if (videoCfg != null) {
-                            try {
-                                SessionLog.i(TAG, "TCP connected: sending cached video CodecConfig (${cachedVideoCodecConfigSize} bytes)")
-                                var flags = PacketProtocol.FLAG_CODEC_CONFIG.toInt()
-                                if (cachedVideoCodecConfigCodec == VideoCodec.H265) {
-                                    flags = flags or PacketProtocol.FLAG_CODEC_HEVC.toInt()
-                                }
-                                dos.writeByte(PacketProtocol.MAGIC_0.toInt())
-                                dos.writeByte(PacketProtocol.MAGIC_1.toInt())
-                                dos.writeByte(PacketProtocol.VERSION.toInt())
-                                dos.writeByte(flags)
-                                dos.writeInt(videoSeqCounter++)
-                                dos.writeLong(0L)
-                                dos.writeInt(cachedVideoCodecConfigSize)
-                                dos.write(videoCfg, 0, cachedVideoCodecConfigSize)
-                                dos.flush()
-                            } catch (e: Exception) {
-                                SessionLog.w(TAG, "Error sending cached video CodecConfig: ${e.message}")
-                            }
-                        }
                     } catch (e: Exception) {
                         SessionLog.w(TAG, "TCP connection to $targetIp:$targetPort failed: ${e.message}, retrying in 1s")
                         closeSocketQuietly()
-                        try { Thread.sleep(1000) } catch (_: Exception) {}
+                        try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
                     }
                 } else {
-                    try { Thread.sleep(1000) } catch (_: Exception) {}
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
                 }
             }
         }
 
         sendThread = thread(start = true, name = "TcpStreamerSendThread") {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
             val headerData = ByteArray(20)
             val headerBuf = java.nio.ByteBuffer.wrap(headerData)
 
             while (isConnected) {
                 try {
+                    // Wait until socket is ready so queued initial frames / CodecConfigs are not discarded during connect handshake
+                    var dos = dataOutputStream
+                    while (isConnected && dos == null) {
+                        synchronized(socketLock) {
+                            dos = dataOutputStream
+                            if (isConnected && dos == null) {
+                                socketLock.wait(200L)
+                                dos = dataOutputStream
+                            }
+                        }
+                    }
+                    if (!isConnected || dos == null) break
+
                     val task = taskQueue.take()
-                    val dos = dataOutputStream
-                    if (dos != null) {
+                    val activeDos = dataOutputStream
+                    if (activeDos != null) {
                         try {
+                            if (needSendCachedConfig) {
+                                needSendCachedConfig = false
+                                writeCachedConfigsLocked(activeDos)
+                            }
                             if (task.isStreamStop) {
                                 val flags = PacketProtocol.FLAG_STREAM_STOP
                                 headerBuf.clear()
@@ -166,8 +195,8 @@ class TcpStreamer : IStreamer {
                                 headerBuf.putInt(0)
                                 headerBuf.putLong(0L)
                                 headerBuf.putInt(0)
-                                dos.write(headerData, 0, 20)
-                                dos.flush()
+                                activeDos.write(headerData, 0, 20)
+                                activeDos.flush()
                             } else if (task.isBeacon) {
                                 val flags = PacketProtocol.FLAG_PING_STATS
                                 headerBuf.clear()
@@ -178,11 +207,11 @@ class TcpStreamer : IStreamer {
                                 headerBuf.putInt(0)
                                 headerBuf.putLong(0L)
                                 headerBuf.putInt(8)
-                                dos.write(headerData, 0, 20)
+                                activeDos.write(headerData, 0, 20)
                                 val lossBp = (task.lossPercent * 100f).toInt().coerceIn(0, 10000)
-                                dos.writeInt(task.rttMs)
-                                dos.writeInt(lossBp)
-                                dos.flush()
+                                activeDos.writeInt(task.rttMs)
+                                activeDos.writeInt(lossBp)
+                                activeDos.flush()
                             } else if (task.isAudio) {
                                 val frameSeq = audioSeqCounter++
                                 var flags: Byte = PacketProtocol.FLAG_AUDIO
@@ -196,11 +225,11 @@ class TcpStreamer : IStreamer {
                                 headerBuf.putInt(frameSeq)
                                 headerBuf.putLong(task.timestampMs)
                                 headerBuf.putInt(task.size)
-                                dos.write(headerData, 0, 20)
+                                activeDos.write(headerData, 0, 20)
                                 if (task.size > 0) {
-                                    dos.write(task.data, 0, task.size)
+                                    activeDos.write(task.data, 0, task.size)
                                 }
-                                dos.flush()
+                                activeDos.flush()
                             } else {
                                 val frameSeq = videoSeqCounter++
                                 if (frameSeq <= 5) {
@@ -219,11 +248,11 @@ class TcpStreamer : IStreamer {
                                 headerBuf.putInt(frameSeq)
                                 headerBuf.putLong(task.timestampMs)
                                 headerBuf.putInt(task.size)
-                                dos.write(headerData, 0, 20)
+                                activeDos.write(headerData, 0, 20)
                                 if (task.size > 0) {
-                                    dos.write(task.data, 0, task.size)
+                                    activeDos.write(task.data, 0, task.size)
                                 }
-                                dos.flush()
+                                activeDos.flush()
                             }
                         } catch (e: Exception) {
                             SessionLog.e(TAG, "Error writing frame over TCP", e)
@@ -241,11 +270,13 @@ class TcpStreamer : IStreamer {
     }
 
     private fun closeSocketQuietly() {
-        // Close socket FIRST to unblock any pending writes/flushes.
-        try { socket?.close() } catch (_: Exception) {}
-        try { dataOutputStream?.close() } catch (_: Exception) {}
-        dataOutputStream = null
-        socket = null
+        synchronized(socketLock) {
+            try { socket?.close() } catch (_: Exception) {}
+            try { dataOutputStream?.close() } catch (_: Exception) {}
+            dataOutputStream = null
+            socket = null
+            socketLock.notifyAll()
+        }
     }
 
     override fun sendFrame(
@@ -347,24 +378,32 @@ class TcpStreamer : IStreamer {
 
     override fun stop() {
         isConnected = false
-        connectThread?.interrupt()
+        synchronized(socketLock) {
+            socketLock.notifyAll()
+        }
+        val connectThreadRef = connectThread
+        connectThreadRef?.interrupt()
         connectThread = null
-        sendThread?.interrupt()
         val sendThreadRef = sendThread
+        sendThreadRef?.interrupt()
+        closeSocketQuietly()
         if (sendThreadRef != null && sendThreadRef.isAlive) {
             try {
                 sendThreadRef.join(2_000L)
                 if (sendThreadRef.isAlive) {
-                    SessionLog.w(TAG, "TcpStreamer sendThread did not terminate within 2s; closing socket anyway")
+                    SessionLog.w(TAG, "TcpStreamer sendThread did not terminate within 2s")
                 }
             } catch (_: InterruptedException) {
-                // Caller interrupted; proceed with cleanup.
             } catch (e: Exception) {
                 SessionLog.w(TAG, "Error joining TcpStreamer sendThread: ${e.message}")
             }
         }
+        if (connectThreadRef != null && connectThreadRef.isAlive) {
+            try {
+                connectThreadRef.join(1_000L)
+            } catch (_: Exception) {}
+        }
         sendThread = null
-        closeSocketQuietly()
         taskQueue.clear()
     }
 

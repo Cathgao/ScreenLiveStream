@@ -12,10 +12,12 @@
 #   public *;
 #}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Preserve line numbers for readable release crash stack traces while hiding original filenames.
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep enum values/valueOf used dynamically in intent/discovery parsing
+-keepclassmembers enum com.cath.screencast.model.* {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}

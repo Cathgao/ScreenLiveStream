@@ -156,10 +156,14 @@ class LanDiscovery(private val context: Context? = null) {
                                 pingMs = rtt
                             )
                             discoveredDevices[senderIp] = device
+                            evictStaleDevices(System.currentTimeMillis())
                             onDevicesUpdated?.invoke(discoveredDevices.values.toList())
                         }
                     } catch (e: Exception) {
                         // Socket timeout or receive error
+                        if (evictStaleDevices(System.currentTimeMillis())) {
+                            onDevicesUpdated?.invoke(discoveredDevices.values.toList())
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -320,7 +324,21 @@ class LanDiscovery(private val context: Context? = null) {
         releaseMulticastLock()
     }
 
+    private fun evictStaleDevices(now: Long): Boolean {
+        var removed = false
+        val iter = discoveredDevices.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (now - entry.value.lastSeenMs > DEVICE_STALE_TIMEOUT_MS) {
+                iter.remove()
+                removed = true
+            }
+        }
+        return removed
+    }
+
     companion object {
         private const val TAG = "LanDiscovery"
+        private const val DEVICE_STALE_TIMEOUT_MS = 10_000L
     }
 }

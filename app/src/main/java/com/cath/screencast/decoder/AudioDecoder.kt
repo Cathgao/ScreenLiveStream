@@ -68,6 +68,8 @@ class AudioDecoder {
 
     private val taskQueue = ArrayBlockingQueue<DecodeTask>(500)
     private val taskPool = ConcurrentLinkedQueue<DecodeTask>()
+    @Volatile
+    private var lastQueuedTimestampMs: Long = -1L
 
     private fun obtainTask(minSize: Int): DecodeTask {
         val task = taskPool.poll() ?: DecodeTask()
@@ -334,7 +336,13 @@ class AudioDecoder {
 
     private fun stopDrainThread() {
         isDraining = false
-        drainThread?.interrupt()
+        val threadRef = drainThread
+        threadRef?.interrupt()
+        if (threadRef != null && threadRef.isAlive && Thread.currentThread() != threadRef) {
+            try {
+                threadRef.join(1_000L)
+            } catch (_: InterruptedException) {}
+        }
         drainThread = null
     }
 
@@ -344,27 +352,31 @@ class AudioDecoder {
         feedThread = thread(start = true, name = "AudioDecoderFeedThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             val targetJitterMs = if (jitterBufferMs > 0) jitterBufferMs else 25
+            val isLowLatency = targetJitterMs <= 50
 
             while (isFeeding) {
                 try {
                     if (isPrebuffering) {
-                        val prebufferStartNs = System.nanoTime()
+                        var firstSeenWallNs = 0L
                         while (isFeeding && isPrebuffering) {
                             if (feedAnchorWallTimeNs > 0L && feedAnchorPtsMs >= 0L) {
                                 isPrebuffering = false
                                 break
                             }
-                            if (taskQueue.isEmpty()) {
+                            val first = taskQueue.peek()
+                            if (first == null) {
                                 Thread.sleep(2)
                                 continue
                             }
-                            val first = taskQueue.peek()
-                            val last = taskQueue.lastOrNull()
-                            val accumulatedMs = if (first != null && last != null) (last.timestampMs - first.timestampMs) else 0L
-                            val elapsedMs = (System.nanoTime() - prebufferStartNs) / 1_000_000L
+                            if (firstSeenWallNs == 0L) {
+                                firstSeenWallNs = System.nanoTime()
+                            }
+                            val tailTs = lastQueuedTimestampMs
+                            val accumulatedMs = if (tailTs >= first.timestampMs) (tailTs - first.timestampMs) else 0L
+                            val elapsedMs = (System.nanoTime() - firstSeenWallNs) / 1_000_000L
 
-                            val isReady = if (targetJitterMs <= 50) {
-                                accumulatedMs >= targetJitterMs || taskQueue.size >= 2
+                            val isReady = if (isLowLatency) {
+                                accumulatedMs >= targetJitterMs || elapsedMs >= targetJitterMs
                             } else {
                                 accumulatedMs >= targetJitterMs || (elapsedMs >= targetJitterMs + 500L && accumulatedMs >= 100L)
                             }
@@ -372,7 +384,7 @@ class AudioDecoder {
                             if (isReady) {
                                 isPrebuffering = false
                                 feedAnchorWallTimeNs = System.nanoTime()
-                                feedAnchorPtsMs = first?.timestampMs ?: 0L
+                                feedAnchorPtsMs = first.timestampMs
                                 AppLogger.i(TAG, "Audio prebuffering complete (${taskQueue.size} tasks, span=${accumulatedMs}ms, target=${targetJitterMs}ms). Starting smooth paced audio playback.")
                                 break
                             }
@@ -448,16 +460,31 @@ class AudioDecoder {
 
     private fun stopFeedThread() {
         isFeeding = false
-        feedThread?.interrupt()
+        val threadRef = feedThread
+        threadRef?.interrupt()
+        if (threadRef != null && threadRef.isAlive && Thread.currentThread() != threadRef) {
+            try {
+                threadRef.join(1_000L)
+            } catch (_: InterruptedException) {}
+        }
         feedThread = null
     }
 
-    fun decodeFrame(frameBytes: ByteArray, isCodecConfig: Boolean, timestampMs: Long = 0L) {
+    private fun equalsSlice(a: ByteArray?, b: ByteArray, size: Int): Boolean {
+        if (a == null || a.size != size) return false
+        for (i in 0 until size) {
+            if (a[i] != b[i]) return false
+        }
+        return true
+    }
+
+    fun decodeFrame(frameBytes: ByteArray, frameSize: Int, isCodecConfig: Boolean, timestampMs: Long = 0L) {
+        if (frameSize <= 0 || frameSize > frameBytes.size) return
         if (isCodecConfig) {
-            val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(frameBytes)
+            val configChanged = !equalsSlice(lastCodecConfigData, frameBytes, frameSize)
             if (!isDecoderReady || configChanged) {
-                AppLogger.i(TAG, "Initializing/restarting audio decoder with new CodecConfig, size: ${frameBytes.size}")
-                start(codecConfigData = frameBytes)
+                AppLogger.i(TAG, "Initializing/restarting audio decoder with new CodecConfig, size: $frameSize")
+                start(codecConfigData = frameBytes.copyOf(frameSize))
             }
             return
         }
@@ -470,28 +497,18 @@ class AudioDecoder {
 
         // Audio queue buffer cap: 15 frames (~300ms) in low latency, 500 frames (~10.6s) in large buffer mode
         val maxQueueLimit = if (isLowLatencyMode) 15 else 500
-        var droppedCount = 0
         while (taskQueue.size > maxQueueLimit) {
-            val dropped = taskQueue.poll()
-            if (dropped != null) {
-                recycleTask(dropped)
-                droppedCount++
-            }
-        }
-        if (droppedCount > 0 && isLowLatencyMode) {
-            try {
-                audioTrack?.pause()
-                audioTrack?.flush()
-                audioTrack?.play()
-            } catch (_: Exception) {}
+            val dropped = taskQueue.poll() ?: break
+            recycleTask(dropped)
         }
 
-        val task = obtainTask(frameBytes.size)
-        System.arraycopy(frameBytes, 0, task.data, 0, frameBytes.size)
-        task.size = frameBytes.size
+        val task = obtainTask(frameSize)
+        System.arraycopy(frameBytes, 0, task.data, 0, frameSize)
+        task.size = frameSize
         task.isCodecConfig = isCodecConfig
         task.timestampMs = timestampMs
 
+        lastQueuedTimestampMs = timestampMs
         if (!taskQueue.offer(task)) {
             AppLogger.w(TAG, "Audio decoder queue full! Dropping audio frame.")
             recycleTask(task)

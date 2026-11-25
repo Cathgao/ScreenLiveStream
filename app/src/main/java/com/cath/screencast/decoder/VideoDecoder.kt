@@ -10,6 +10,7 @@ import com.cath.screencast.log.AppLogger
 import com.cath.screencast.model.VideoCodec
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.concurrent.thread
 
@@ -67,6 +68,8 @@ class VideoDecoder {
 
     private val taskQueue = ArrayBlockingQueue<DecodeTask>(400) // Max 400 frames in queue (~3.5-5.5 sec)
     private val taskPool = ConcurrentLinkedQueue<DecodeTask>()
+    @Volatile
+    private var lastQueuedTimestampMs: Long = -1L
 
     private fun obtainTask(minSize: Int): DecodeTask {
         val task = taskPool.poll() ?: DecodeTask()
@@ -84,7 +87,7 @@ class VideoDecoder {
 
     fun notifyReferenceLost() {
         val now = System.currentTimeMillis()
-        if (now - lastIdrRequestTime < 400L) return
+        if (now - lastIdrRequestTime < 800L) return
         lastIdrRequestTime = now
         // Request IDR Keyframe instantly from sender without dropping all subsequent frames
         AppLogger.w(TAG, "Reference loss / gap detected. Requesting IDR Keyframe from sender.")
@@ -138,12 +141,12 @@ class VideoDecoder {
                 format.setInteger("low-latency", 1)
             } catch (_: Exception) {}
 
-            if (codecConfigData != null && codecConfigData.isNotEmpty()) {
+            if (configData != null && configData.isNotEmpty()) {
                 if (isHevc) {
-                    format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
-                    AppLogger.d(TAG, "Configuring HEVC decoder with csd-0 size: ${codecConfigData.size}")
+                    format.setByteBuffer("csd-0", ByteBuffer.wrap(configData))
+                    AppLogger.d(TAG, "Configuring HEVC decoder with csd-0 size: ${configData.size}")
                 } else {
-                    val (sps, pps) = extractSpsAndPps(codecConfigData)
+                    val (sps, pps) = extractSpsAndPps(configData)
                     if (sps != null) {
                         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
                     }
@@ -151,7 +154,7 @@ class VideoDecoder {
                         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
                     }
                     if (sps == null && pps == null) {
-                        format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfigData))
+                        format.setByteBuffer("csd-0", ByteBuffer.wrap(configData))
                     }
                 }
             }
@@ -178,29 +181,27 @@ class VideoDecoder {
      */
     private fun createBestDecoder(mimeType: String): Pair<MediaCodec, String> {
         return try {
-            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
-            val candidateInfos = mutableListOf<MediaCodecInfo>()
-
-            for (info in codecList.codecInfos) {
-                if (info.isEncoder) continue
-                val supportsType = info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }
-                if (supportsType) {
-                    candidateInfos.add(info)
+            val sortedNames = cachedDecoderNames.getOrPut(mimeType) {
+                val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+                val candidateInfos = mutableListOf<MediaCodecInfo>()
+                for (info in codecList.codecInfos) {
+                    if (info.isEncoder) continue
+                    if (info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }) {
+                        candidateInfos.add(info)
+                    }
                 }
+                candidateInfos
+                    .sortedWith { c1, c2 -> getDecoderPriority(c1) - getDecoderPriority(c2) }
+                    .map { it.name }
             }
 
-            // Sort candidates by priority score (lowest = best)
-            val sortedCandidates = candidateInfos.sortedWith { c1, c2 ->
-                getDecoderPriority(c1) - getDecoderPriority(c2)
-            }
-
-            for (info in sortedCandidates) {
+            for (name in sortedNames) {
                 try {
-                    val codec = MediaCodec.createByCodecName(info.name)
-                    AppLogger.i(TAG, "Selected Video Decoder candidate: '${info.name}' (Priority: ${getDecoderPriority(info)})")
-                    return Pair(codec, info.name)
+                    val codec = MediaCodec.createByCodecName(name)
+                    AppLogger.i(TAG, "Selected Video Decoder candidate: '$name'")
+                    return Pair(codec, name)
                 } catch (e: Exception) {
-                    AppLogger.w(TAG, "Failed to instantiate decoder '${info.name}', trying next: ${e.message}")
+                    AppLogger.w(TAG, "Failed to instantiate decoder '$name', trying next: ${e.message}")
                 }
             }
 
@@ -288,8 +289,8 @@ class VideoDecoder {
         return Pair(sps, pps)
     }
 
-    private fun containsParameterSets(data: ByteArray, isHevc: Boolean): Boolean {
-        val len = data.size
+    private fun containsParameterSets(data: ByteArray, length: Int, isHevc: Boolean): Boolean {
+        val len = length.coerceAtMost(data.size)
         var i = 0
         while (i < len - 2) {
             var startCodeLen = 0
@@ -320,6 +321,14 @@ class VideoDecoder {
             }
         }
         return false
+    }
+
+    private fun equalsSlice(a: ByteArray?, b: ByteArray, size: Int): Boolean {
+        if (a == null || a.size != size) return false
+        for (i in 0 until size) {
+            if (a[i] != b[i]) return false
+        }
+        return true
     }
 
     private fun startDrainThread(mc: MediaCodec) {
@@ -370,7 +379,13 @@ class VideoDecoder {
 
     private fun stopDrainThread() {
         isDraining = false
-        drainThread?.interrupt()
+        val threadRef = drainThread
+        threadRef?.interrupt()
+        if (threadRef != null && threadRef.isAlive && Thread.currentThread() != threadRef) {
+            try {
+                threadRef.join(1_000L)
+            } catch (_: InterruptedException) {}
+        }
         drainThread = null
     }
 
@@ -380,6 +395,7 @@ class VideoDecoder {
         feedThread = thread(start = true, name = "VideoDecoderFeedThread") {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val targetJitterMs = if (jitterBufferMs > 0) jitterBufferMs else 25
+            val isLowLatency = targetJitterMs <= 50
             var isPrebuffering = true
             var anchorWallTimeNs = 0L
             var anchorPtsMs = -1L
@@ -387,19 +403,22 @@ class VideoDecoder {
             while (isFeeding) {
                 try {
                     if (isPrebuffering) {
-                        val prebufferStartNs = System.nanoTime()
+                        var firstSeenWallNs = 0L
                         while (isFeeding && isPrebuffering) {
-                            if (taskQueue.isEmpty()) {
+                            val first = taskQueue.peek()
+                            if (first == null) {
                                 Thread.sleep(2)
                                 continue
                             }
-                            val first = taskQueue.peek()
-                            val last = taskQueue.lastOrNull()
-                            val accumulatedMs = if (first != null && last != null) (last.timestampMs - first.timestampMs) else 0L
-                            val elapsedMs = (System.nanoTime() - prebufferStartNs) / 1_000_000L
+                            if (firstSeenWallNs == 0L) {
+                                firstSeenWallNs = System.nanoTime()
+                            }
+                            val tailTs = lastQueuedTimestampMs
+                            val accumulatedMs = if (tailTs >= first.timestampMs) (tailTs - first.timestampMs) else 0L
+                            val elapsedMs = (System.nanoTime() - firstSeenWallNs) / 1_000_000L
 
-                            val isReady = if (targetJitterMs <= 50) {
-                                accumulatedMs >= targetJitterMs || taskQueue.size >= 2
+                            val isReady = if (isLowLatency) {
+                                accumulatedMs >= targetJitterMs || elapsedMs >= targetJitterMs
                             } else {
                                 accumulatedMs >= targetJitterMs || (elapsedMs >= targetJitterMs + 500L && accumulatedMs >= 100L)
                             }
@@ -407,7 +426,7 @@ class VideoDecoder {
                             if (isReady) {
                                 isPrebuffering = false
                                 anchorWallTimeNs = System.nanoTime()
-                                anchorPtsMs = first?.timestampMs ?: -1L
+                                anchorPtsMs = first.timestampMs
                                 onPlaybackAnchorSet?.invoke(anchorWallTimeNs, anchorPtsMs)
                                 AppLogger.i(TAG, "Video prebuffering complete (${taskQueue.size} frames, span=${accumulatedMs}ms, target=${targetJitterMs}ms). Starting smooth paced playback.")
                                 break
@@ -429,17 +448,22 @@ class VideoDecoder {
                             anchorWallTimeNs = System.nanoTime()
                             onPlaybackAnchorSet?.invoke(anchorWallTimeNs, anchorPtsMs)
                         } else {
+                            // Gentle clock-drift compensation in low-latency mode if backlog grows
+                            if (isLowLatency && taskQueue.size > 5) {
+                                anchorWallTimeNs -= 1_000_000L
+                            }
                             val targetTimeNs = anchorWallTimeNs + relPtsMs * 1_000_000L
                             val now = System.nanoTime()
                             val waitNs = targetTimeNs - now
+                            val lateThresholdNs = if (isLowLatency) -40_000_000L else -150_000_000L
                             if (waitNs > 0) {
                                 val waitMs = waitNs / 1_000_000L
                                 val waitRemainderNs = (waitNs % 1_000_000L).toInt()
                                 if (waitMs > 0 || waitRemainderNs > 0) {
                                     Thread.sleep(waitMs, waitRemainderNs)
                                 }
-                            } else if (waitNs < -150_000_000L) {
-                                // If fell behind by >150ms, advance wall clock anchor to catch up immediately
+                            } else if (waitNs < lateThresholdNs) {
+                                // Advance wall clock anchor to catch up cleanly
                                 anchorWallTimeNs = now - relPtsMs * 1_000_000L
                             }
                         }
@@ -479,8 +503,9 @@ class VideoDecoder {
                             AppLogger.e(TAG, "Error decoding frame seq=${task.seq}", e)
                             notifyReferenceLost()
                         }
+                    } finally {
+                        recycleTask(task)
                     }
-                    recycleTask(task)
                 } catch (e: InterruptedException) {
                     break
                 }
@@ -490,20 +515,36 @@ class VideoDecoder {
 
     private fun stopFeedThread() {
         isFeeding = false
-        feedThread?.interrupt()
+        val threadRef = feedThread
+        threadRef?.interrupt()
+        if (threadRef != null && threadRef.isAlive && Thread.currentThread() != threadRef) {
+            try {
+                threadRef.join(1_000L)
+            } catch (_: InterruptedException) {}
+        }
         feedThread = null
     }
 
-    fun decodeFrame(frameBytes: ByteArray, isKeyframe: Boolean, isCodecConfig: Boolean, isHevc: Boolean, timestampMs: Long, seq: Int) {
+    fun decodeFrame(
+        frameBytes: ByteArray,
+        frameSize: Int,
+        isKeyframe: Boolean,
+        isCodecConfig: Boolean,
+        isHevc: Boolean,
+        timestampMs: Long,
+        seq: Int
+    ) {
         val codecType = if (isHevc) VideoCodec.H265 else VideoCodec.H264
         val surf = targetSurface ?: return
+        if (frameSize <= 0 || frameSize > frameBytes.size) return
 
         if (isCodecConfig) {
-            val configChanged = lastCodecConfigData == null || !lastCodecConfigData!!.contentEquals(frameBytes)
-            lastCodecConfigData = frameBytes
+            val configChanged = !equalsSlice(lastCodecConfigData, frameBytes, frameSize)
             if (!isDecoderReady || currentCodec != codecType || configChanged) {
-                AppLogger.i(TAG, "Initializing decoder with CodecConfig, size: ${frameBytes.size}")
-                start(surf, isHevc, frameBytes)
+                val configCopy = frameBytes.copyOf(frameSize)
+                lastCodecConfigData = configCopy
+                AppLogger.i(TAG, "Initializing decoder with CodecConfig, size: $frameSize")
+                start(surf, isHevc, configCopy)
             }
             return
         }
@@ -514,8 +555,9 @@ class VideoDecoder {
 
         if (lastTimestampMs != -1L && timestampMs < lastTimestampMs - 1000) {
             AppLogger.i(TAG, "Timestamp reset detected (old=$lastTimestampMs, new=$timestampMs). Restarting decoder.")
+            val savedConfig = lastCodecConfigData
             stop()
-            start(surf, isHevc, lastCodecConfigData)
+            start(surf, isHevc, savedConfig)
         }
         lastTimestampMs = timestampMs
 
@@ -561,16 +603,16 @@ class VideoDecoder {
             notifyReferenceLost()
         }
 
-        val needsConfig = isKeyframe && lastCodecConfigData != null && !containsParameterSets(frameBytes, isHevc)
+        val needsConfig = isKeyframe && lastCodecConfigData != null && !containsParameterSets(frameBytes, frameSize, isHevc)
         val configBytes = if (needsConfig) lastCodecConfigData else null
-        val totalSize = (configBytes?.size ?: 0) + frameBytes.size
+        val totalSize = (configBytes?.size ?: 0) + frameSize
 
         val task = obtainTask(totalSize)
         if (configBytes != null) {
             System.arraycopy(configBytes, 0, task.data, 0, configBytes.size)
-            System.arraycopy(frameBytes, 0, task.data, configBytes.size, frameBytes.size)
+            System.arraycopy(frameBytes, 0, task.data, configBytes.size, frameSize)
         } else {
-            System.arraycopy(frameBytes, 0, task.data, 0, frameBytes.size)
+            System.arraycopy(frameBytes, 0, task.data, 0, frameSize)
         }
         task.size = totalSize
         task.isKeyframe = isKeyframe
@@ -579,6 +621,7 @@ class VideoDecoder {
         task.timestampMs = timestampMs
         task.seq = seq
 
+        lastQueuedTimestampMs = timestampMs
         if (!taskQueue.offer(task)) {
             AppLogger.w(TAG, "Video decoder task queue full! Dropping frame seq=$seq and requesting IDR.")
             recycleTask(task)
@@ -628,6 +671,7 @@ class VideoDecoder {
 
     companion object {
         private const val TAG = "VideoDecoder"
+        private val cachedDecoderNames = ConcurrentHashMap<String, List<String>>()
     }
 }
 

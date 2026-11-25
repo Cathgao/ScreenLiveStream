@@ -11,12 +11,16 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentLinkedQueue
 
 object AppLogger {
     private const val MAX_LOG_COUNT = 3000
-    private val logQueue = ConcurrentLinkedQueue<String>()
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val logQueue = ArrayDeque<String>(MAX_LOG_COUNT)
+    private val logLock = Any()
+    private val dateFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat {
+            return SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+        }
+    }
 
     fun d(tag: String, message: String, throwable: Throwable? = null) {
         if (throwable != null) {
@@ -59,24 +63,29 @@ object AppLogger {
     }
 
     private fun appendLog(level: String, tag: String, message: String) {
-        val timestamp = synchronized(dateFormat) { dateFormat.format(Date()) }
+        val timestamp = dateFormat.get()!!.format(Date())
         val entry = "[$timestamp] [$level/$tag] $message"
-        logQueue.add(entry)
-        while (logQueue.size > MAX_LOG_COUNT) {
-            logQueue.poll()
+        synchronized(logLock) {
+            if (logQueue.size >= MAX_LOG_COUNT) {
+                logQueue.removeFirst()
+            }
+            logQueue.addLast(entry)
         }
     }
 
     fun getLogs(): List<String> {
-        return logQueue.toList()
+        synchronized(logLock) {
+            return logQueue.toList()
+        }
     }
 
     fun exportLogs(context: Context): String {
         val fileNameFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-        val formattedFileNameDate = synchronized(fileNameFormat) { fileNameFormat.format(Date()) }
+        val now = Date()
+        val formattedFileNameDate = fileNameFormat.format(now)
         val fileName = "screen_cast_log_${formattedFileNameDate}.txt"
         val logList = getLogs()
-        val exportTimeStr = synchronized(dateFormat) { dateFormat.format(Date()) }
+        val exportTimeStr = dateFormat.get()!!.format(now)
         val content = StringBuilder().apply {
             append("==================================================\n")
             append("QuestCast Diagnostics Log Export\n")
